@@ -1475,6 +1475,326 @@ async function main(): Promise<void> {
     assert.ok(!code.includes("Math.random"), "oráculo de tip não pode conter RNG");
   });
 
+  // ---------------------------------------------------------------------------
+  // [13] INTENÇÕES DE EXECUÇÃO — IDEMPOTÊNCIA (S4)
+  // ---------------------------------------------------------------------------
+  console.log("\n[13] Intenções de execução (idempotência de ação econômica)");
+
+  await test("a intenção nasce sem assinatura e com tentativa 1", async () => {
+    const { createExecutionIntent } = await import("../src/executionIntent.js");
+    const intent = createExecutionIntent(
+      { positionId: "pos_1", mint: "So11111111111111111111111111111111111111112", token: "ABC", side: "exit" },
+      { now: () => "2026-01-01T00:00:00.000Z", randomSuffix: () => "abc123" }
+    );
+    assert.equal(intent.state, "created");
+    assert.equal(intent.attempt, 1);
+    assert.equal(intent.signature, null);
+    assert.equal(intent.lastValidBlockHeight, null);
+    assert.equal(intent.supersedesIntentId, null);
+    assert.equal(intent.createdAt, "2026-01-01T00:00:00.000Z");
+    assert.ok(intent.id.startsWith("intent_exit_pos_1_"));
+  });
+
+  await test("transições ilegais são RECUSADAS (created → confirmed, terminal reutilizado)", async () => {
+    const { createExecutionIntent, advanceIntent } = await import("../src/executionIntent.js");
+    const base = createExecutionIntent({ positionId: "p", mint: "m", token: "T", side: "exit" });
+
+    const pulo = advanceIntent(base, "confirmed");
+    assert.equal(pulo.ok, false, "não se pode confirmar uma intenção que nunca foi assinada/enviada");
+
+    const signed = advanceIntent(base, "signed", { signature: "sig1", blockhash: "bh", lastValidBlockHeight: 100 }, "assinada");
+    assert.equal(signed.ok, true);
+    // Assinada SEM "submitted" registrado pode ter chegado (queda entre assinar e gravar):
+    // o boot descobre pela cadeia, então esta transição precisa ser permitida.
+    const confirmadaSemEnvio = advanceIntent((signed as any).intent, "confirmed", { confirmationLevel: "confirmed" }, "boot: cadeia confirmou");
+    assert.equal(confirmadaSemEnvio.ok, true);
+    const confirmed = advanceIntent((signed as any).intent, "confirmed", { confirmationLevel: "processed" }, "ok");
+    assert.equal(confirmed.ok, true);
+    const reuse = advanceIntent((confirmed as any).intent, "submitted");
+    assert.equal(reuse.ok, false, "estado terminal não é reutilizado: cria-se intenção nova");
+    assert.ok(!reuse.ok && /termina/.test(reuse.reason));
+  });
+
+  await test("histórico registra cada transição (auditoria)", async () => {
+    const { createExecutionIntent, advanceIntent } = await import("../src/executionIntent.js");
+    let intent = createExecutionIntent({ positionId: "p", mint: "m", token: "T", side: "exit" });
+    intent = (advanceIntent(intent, "signed", {}, "assinada") as any).intent;
+    intent = (advanceIntent(intent, "submitted", {}, "enviada") as any).intent;
+    assert.equal(intent.history.length, 2);
+    assert.deepEqual(intent.history.map((h: any) => `${h.from}->${h.to}`), ["created->signed", "signed->submitted"]);
+  });
+
+  await test("trava de voo único bloqueia o mesmo lado e libera o outro", async () => {
+    const { createExecutionIntent, advanceIntent, findBlockingIntent } = await import("../src/executionIntent.js");
+    const a = createExecutionIntent({ positionId: "pos_9", mint: "m", token: "T", side: "exit" });
+    assert.equal(findBlockingIntent([a], "pos_9", "exit")?.id, a.id);
+    assert.equal(findBlockingIntent([a], "pos_9", "entry"), null, "lado diferente não é bloqueado");
+    assert.equal(findBlockingIntent([a], "pos_10", "exit"), null);
+
+    const done = (advanceIntent(a, "failed", { lastError: "x" }, "falhou") as any).intent;
+    assert.equal(findBlockingIntent([done], "pos_9", "exit"), null, "intenção terminal não bloqueia");
+  });
+
+  await test("decideRetry: evidência vem ANTES da conveniência", async () => {
+    const { createExecutionIntent, advanceIntent, decideRetry } = await import("../src/executionIntent.js");
+    let intent = createExecutionIntent({ positionId: "p", mint: "m", token: "T", side: "exit" });
+    intent = (advanceIntent(intent, "signed", { signature: "sig", blockhash: "bh", lastValidBlockHeight: 200 }, "a") as any).intent;
+    intent = (advanceIntent(intent, "submitted", {}, "b") as any).intent;
+
+    // 1. Já confirmada: nada é reenviado.
+    const confirmedIntent = (advanceIntent(intent, "confirmed", { confirmationLevel: "finalized" }, "c") as any).intent;
+    const stop = decideRetry(confirmedIntent, { currentBlockHeight: 500, signatureStatus: null, hasSignedBytes: true });
+    assert.equal(stop.action, "stop_confirmed");
+
+    // 2. Erro de execução na cadeia: reconstruir é seguro.
+    const err = decideRetry(intent, {
+      currentBlockHeight: 250,
+      signatureStatus: { found: true, err: { InstructionError: [0, "Custom"] }, confirmationStatus: null },
+      hasSignedBytes: true,
+    });
+    assert.equal(err.action, "rebuild");
+    assert.ok(/ERRO de execução/.test((err as any).reason));
+
+    // 3. Cadeia já executou: pare, com o nível declarado.
+    const landed = decideRetry(intent, {
+      currentBlockHeight: 250,
+      signatureStatus: { found: true, err: null, confirmationStatus: "processed" },
+      hasSignedBytes: true,
+    });
+    assert.equal(landed.action, "stop_confirmed");
+    assert.equal((landed as any).level, "processed");
+
+    // 4. Expiração PROVADA por altura: única justificativa para reconstruir sem erro.
+    const expired = decideRetry(intent, {
+      currentBlockHeight: 201,
+      signatureStatus: { found: false, err: null, confirmationStatus: null },
+      hasSignedBytes: true,
+    });
+    assert.equal(expired.action, "rebuild");
+    assert.ok(/expirado/i.test((expired as any).reason));
+
+    // 5. Sem prova de expiração, com bytes em memória: REENVIAR os mesmos bytes.
+    const rebroadcast = decideRetry(intent, {
+      currentBlockHeight: 199,
+      signatureStatus: { found: false, err: null, confirmationStatus: null },
+      hasSignedBytes: true,
+    });
+    assert.equal(rebroadcast.action, "rebroadcast");
+
+    // 6. Sem prova, sem bytes (restart): ESPERAR. Reconstruir aqui duplicaria a ação.
+    const wait = decideRetry(intent, {
+      currentBlockHeight: 199,
+      signatureStatus: { found: false, err: null, confirmationStatus: null },
+      hasSignedBytes: false,
+    });
+    assert.equal(wait.action, "wait");
+    assert.ok(/duplicar/.test((wait as any).reason));
+
+    // 7. RPC não respondeu (null) NÃO é resposta negativa: nunca rebuild.
+    const semResposta = decideRetry(intent, { currentBlockHeight: null, signatureStatus: null, hasSignedBytes: true });
+    assert.notEqual(semResposta.action, "rebuild");
+
+    // 8. Durable nonce não expira: altura maior NÃO autoriza reconstruir.
+    const nonce = decideRetry(intent, {
+      currentBlockHeight: 9999,
+      signatureStatus: { found: false, err: null, confirmationStatus: null },
+      hasSignedBytes: false,
+      usesDurableNonce: true,
+    });
+    assert.equal(nonce.action, "wait");
+    assert.ok(/nonce/i.test((nonce as any).reason));
+
+    // 9. Nunca assinada: não existe duplicata possível.
+    const virgem = createExecutionIntent({ positionId: "p2", mint: "m", token: "T", side: "exit" });
+    const primeira = decideRetry(virgem, { currentBlockHeight: 10, signatureStatus: null, hasSignedBytes: false });
+    assert.equal(primeira.action, "rebuild");
+  });
+
+  await test("rebuild encadeia a intenção anterior (nada é apagado)", async () => {
+    const { createExecutionIntent } = await import("../src/executionIntent.js");
+    const primeira = createExecutionIntent({ positionId: "p", mint: "m", token: "T", side: "exit" });
+    const segunda = createExecutionIntent({
+      positionId: "p",
+      mint: "m",
+      token: "T",
+      side: "exit",
+      attempt: 2,
+      supersedesIntentId: primeira.id,
+    });
+    assert.equal(segunda.attempt, 2);
+    assert.equal(segunda.supersedesIntentId, primeira.id, "a tentativa nova aponta para a que substitui");
+  });
+
+  await test("o módulo não persiste nem transporta bytes assinados (regressão)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = fs.readFileSync(path.join(repoRoot, "src", "executionIntent.ts"), "utf8");
+    const code = src
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    assert.ok(!/wireTransaction\s*:/.test(code), "os bytes assinados não podem ser campo do registro");
+    assert.ok(!code.includes("serialize()"), "o módulo não serializa transação");
+    assert.ok(!code.includes("signTransaction"), "o módulo não assina");
+  });
+
+  // ---------------------------------------------------------------------------
+  // [14] RECONCILIAÇÃO POSIÇÃO × CADEIA (POSITION_DESYNC)
+  // ---------------------------------------------------------------------------
+  console.log("\n[14] Reconciliação posição × carteira (POSITION_DESYNC)");
+
+  const MINT_A = "So11111111111111111111111111111111111111112";
+  const MINT_B = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const MINT_C = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+  const NOW = Date.parse("2026-01-01T01:00:00.000Z");
+  const posAberta = (mint: string, over: Record<string, unknown> = {}) => ({
+    id: `pos_${mint.slice(0, 4)}`,
+    token: "TKN",
+    mint,
+    sizeSol: 0.1,
+    status: "open",
+    mode: "live",
+    timeOpened: new Date(NOW - 10 * 60_000).toISOString(),
+    ...over,
+  });
+
+  await test("saldo presente → in_sync (sem alarme)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta(MINT_A)],
+      holdings: [{ mint: MINT_A, rawAmount: 1_000_000, decimals: 6 }],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.phantom, 0);
+    assert.equal(report.summary.critical, 0);
+    assert.equal(report.findings[0].verdict, "in_sync");
+    assert.equal(report.snapshotAvailable, true);
+  });
+
+  await test("posição aberta sem token na carteira → phantom_position (crítico)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta(MINT_A)],
+      holdings: [{ mint: MINT_B, rawAmount: 500, decimals: 6 }],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.phantom, 1);
+    const f = report.findings.find((x) => x.verdict === "phantom_position")!;
+    assert.equal(f.severity, "critical");
+    assert.ok(/NÃO vender/.test(f.recommendedAction), "a ação recomendada não pode sugerir vender o que não existe");
+  });
+
+  await test("dentro da janela de tolerância NÃO é fantasma (entrada pode não ter confirmado)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta(MINT_A, { timeOpened: new Date(NOW - 30_000).toISOString() })],
+      holdings: [],
+      nowMs: NOW,
+      options: { minAgeMs: 120_000 },
+    });
+    assert.equal(report.summary.phantom, 0);
+    assert.equal(report.findings[0].verdict, "too_young");
+  });
+
+  await test("sem leitura de carteira → unknown, NUNCA fantasma", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({ positions: [posAberta(MINT_A)], holdings: null, nowMs: NOW });
+    assert.equal(report.summary.phantom, 0);
+    assert.equal(report.snapshotAvailable, false);
+    assert.ok(report.snapshotNote && /indisponível/.test(report.snapshotNote));
+    assert.ok(report.findings.every((f) => f.verdict === "unknown"));
+  });
+
+  await test("posição paper e quarentenada não são comparadas com a cadeia", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [
+        posAberta(MINT_A, { mode: "paper" }),
+        posAberta(MINT_B, { status: "quarantined" }),
+      ],
+      holdings: [],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.phantom, 0);
+    assert.equal(report.summary.skipped, 2);
+    assert.equal(report.summary.checkedPositions, 0);
+  });
+
+  await test("poeira residual não conta como posição detida", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta(MINT_A)],
+      holdings: [{ mint: MINT_A, rawAmount: 1, decimals: 6 }],
+      nowMs: NOW,
+      options: { dustToleranceRaw: 1 },
+    });
+    assert.equal(report.summary.phantom, 1, "1 unidade base com tolerância 1 é poeira, não posição");
+  });
+
+  await test("achei que vendi mas ainda tenho token → closed_but_holding (crítico)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [],
+      closedMints: [{ mint: MINT_C, token: "ANTIGO", closedAt: "2026-01-01T00:30:00.000Z" }],
+      holdings: [{ mint: MINT_C, rawAmount: 42_000, decimals: 9 }],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.closedButHolding, 1);
+    const f = report.findings.find((x) => x.verdict === "closed_but_holding")!;
+    assert.equal(f.severity, "critical");
+    assert.ok(/explorador/.test(f.recommendedAction));
+  });
+
+  await test("token do operador que o bot nunca tocou NÃO é reportado (sem ruído)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [],
+      closedMints: [],
+      holdings: [{ mint: MINT_B, rawAmount: 999_999_999, decimals: 6 }],
+      nowMs: NOW,
+    });
+    assert.equal(report.findings.length, 0);
+    assert.equal(report.summary.closedButHolding, 0);
+  });
+
+  await test("mint inválido é pulado sem sequer consultar a carteira", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta("nao-e-pubkey!")],
+      holdings: [],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.skipped, 1);
+    assert.equal(report.summary.phantom, 0);
+  });
+
+  await test("resumo descreve a ausência de leitura em vez de inventar zero", async () => {
+    const { reconcilePositionDesync, describeDesyncReport } = await import("../src/positionDesync.js");
+    const semLeitura = reconcilePositionDesync({ positions: [posAberta(MINT_A)], holdings: null, nowMs: NOW });
+    assert.ok(/não comparadas/.test(describeDesyncReport(semLeitura)));
+    const comLeitura = reconcilePositionDesync({
+      positions: [posAberta(MINT_A)],
+      holdings: [{ mint: MINT_A, rawAmount: 10, decimals: 6 }],
+      nowMs: NOW,
+    });
+    assert.ok(/comparadas/.test(describeDesyncReport(comLeitura)));
+  });
+
+  await test("regressão: o servidor usa a trava de voo único nos DOIS caminhos de saída", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const ocorrencias = serverSrc.match(/findBlockingIntent\(dbStore\.getIntents\(\)/g) ?? [];
+    assert.equal(ocorrencias.length, 2, "saída automática E fechamento manual precisam da trava");
+    assert.ok(
+      serverSrc.includes("supersedeIntent(") && serverSrc.includes("decideExitRetry("),
+      "a política de retry por evidência precisa estar aplicada"
+    );
+    assert.ok(
+      serverSrc.includes("blockedIntentWarned"),
+      "a trava não pode gerar commit em disco a cada ciclo"
+    );
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

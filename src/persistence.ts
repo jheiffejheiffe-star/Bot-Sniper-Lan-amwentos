@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import type { ExecutionIntentRecord } from "./executionIntent.js";
 
 const isServer = typeof window === "undefined";
 
@@ -66,6 +67,18 @@ export interface DBPosition {
   lastExitAttemptAt?: string;
   lastPriceAlertAt?: number;
   priceTelemetry?: { status: string; lastAttemptAt: string };
+  /**
+   * Resultado da última reconciliação posição × cadeia (`src/positionDesync.ts`).
+   * Gravado para que a divergência seja AUDITÁVEL depois do ciclo que a detectou —
+   * log em memória some, o banco fica.
+   */
+  desyncState?: "in_sync" | "phantom_position" | "untracked_exposure" | "closed_but_holding" | "too_young" | "unknown";
+  desyncReason?: string;
+  desyncCheckedAt?: string;
+  /** Quantas confirmações independentes de fantasma já foram obtidas (histerese). */
+  phantomConfirmations?: number;
+  /** Intenção de execução que originou/gerencia esta posição (rastreabilidade). */
+  executionIntentId?: string | null;
 }
 
 export interface DBOperationalState {
@@ -116,6 +129,8 @@ class TransactionalStore {
     state: DBOperationalState;
     settings: DBSettings;
     logs: DBLog[];
+    /** Intenções de execução (idempotência). NUNCA contêm bytes assinados. */
+    intents: ExecutionIntentRecord[];
     schemaVersion: number;
     transactionCount: number;
   };
@@ -140,7 +155,8 @@ class TransactionalStore {
         pm2State: "online"
       },
       logs: [],
-      schemaVersion: 4,
+      intents: [],
+      schemaVersion: 5,
       transactionCount: 0
     };
 
@@ -234,6 +250,17 @@ class TransactionalStore {
         console.log("[Database Migration] Completed upgrade to Schema v4. Structured Logging tables initialized.");
       }
       
+      if (parsed.schemaVersion < 5) {
+        console.log(`[Database Migration] Outdated schema version ${parsed.schemaVersion} detected. Upgrading to Schema v5...`);
+        // Intenções de execução: array vazio é o estado correto de um banco que nunca
+        // registrou intenção. Nada é inferido/retro-preenchido — inventar intenção para
+        // histórico antigo criaria rastreabilidade falsa.
+        parsed.intents = Array.isArray(parsed.intents) ? parsed.intents : [];
+        parsed.schemaVersion = 5;
+        this.commit(parsed);
+        console.log("[Database Migration] Completed upgrade to Schema v5. Execution intents table initialized.");
+      }
+
       this.data = parsed;
       console.log(`[Database Engine] Loaded state from disk successfully. Version: v${this.data.schemaVersion}. Transaction commits: ${this.data.transactionCount}`);
     } catch (err: any) {
@@ -356,6 +383,42 @@ class TransactionalStore {
     this.commit(this.data);
   }
 
+  // Execution Intents Repository (idempotência de ação econômica)
+  public getIntents(): ExecutionIntentRecord[] {
+    if (!this.data.intents) this.data.intents = [];
+    return this.data.intents;
+  }
+
+  /**
+   * Grava/atualiza uma intenção. Persistir ANTES de assinar é o que dá sentido ao
+   * registro: uma intenção que só existe depois do envio não serve para impedir o
+   * segundo envio.
+   */
+  public saveIntent(intent: ExecutionIntentRecord): void {
+    if (!this.data.intents) this.data.intents = [];
+    const idx = this.data.intents.findIndex((i) => i.id === intent.id);
+    if (idx !== -1) {
+      this.data.intents[idx] = intent;
+    } else {
+      this.data.intents.unshift(intent);
+      // Retenção: as 200 mais recentes. Histórico de intenções é auditoria, não estado
+      // ativo — mas as NÃO TERMINAIS nunca são descartadas (ver compactIntents).
+      if (this.data.intents.length > 200) {
+        const terminal = this.data.intents.filter((i) => i.state === "confirmed" || i.state === "failed" || i.state === "expired");
+        const nonTerminal = this.data.intents.filter((i) => i.state !== "confirmed" && i.state !== "failed" && i.state !== "expired");
+        this.data.intents = [...nonTerminal, ...terminal.slice(0, Math.max(0, 200 - nonTerminal.length))];
+      }
+    }
+    this.commit(this.data);
+  }
+
+  /** Intenções não terminais (as que impedem uma segunda ação na mesma posição/lado). */
+  public getActiveIntents(): ExecutionIntentRecord[] {
+    return this.getIntents().filter(
+      (i) => i.state !== "confirmed" && i.state !== "failed" && i.state !== "expired"
+    );
+  }
+
   // Structured Logging Repository
   public getLogs(): DBLog[] {
     return this.data.logs || [];
@@ -423,6 +486,8 @@ class TransactionalStore {
       tradesCount: this.data.trades.length,
       positionsCount: this.data.positions.length,
       logsCount: (this.data.logs || []).length,
+      intentsCount: (this.data.intents || []).length,
+      activeIntentsCount: this.getActiveIntents().length,
       path: this.dbPath,
       // MÉTRICAS REAIS (auditoria): "EXCELLENT" e 0.12ms eram constantes hardcoded exibidas
       // como se fossem medição. health agora deriva da razão de commits com falha; a latência

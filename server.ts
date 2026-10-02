@@ -50,6 +50,21 @@ import {
   type RpcConfirmation,
   type JitoConfirmationStatus,
 } from "./src/jitoStatus.js";
+import {
+  advanceIntent,
+  createExecutionIntent,
+  decideRetry,
+  findBlockingIntent,
+  type ExecutionIntentRecord,
+  type RetryDecision,
+  type SignatureObservation,
+} from "./src/executionIntent.js";
+import {
+  reconcilePositionDesync,
+  describeDesyncReport,
+  type DesyncReport,
+  type Holding,
+} from "./src/positionDesync.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
 import { compareStrategies, DEFAULT_STRATEGIES } from "./src/replay.js";
 import bs58 from "bs58";
@@ -567,6 +582,8 @@ const exitLocks = new Set<string>();
 
 /** Avisos de posição inválida: 1 por posição, para não inundar o log a cada 3s. */
 const invalidPositionWarned = new Set<string>();
+/** Intenções de saída bloqueadas já avisadas (evita commit em disco a cada ciclo). */
+const blockedIntentWarned = new Set<string>();
 
 /**
  * ORÁCULO DE TIP (S3).
@@ -824,6 +841,96 @@ app.get("/api/replay", (req, res) => {
  * contagem otimista que esta auditoria remove. Para auditoria, use
  * `GET /api/positions?include=quarantined`.
  */
+/**
+ * GET /api/positions/desync — estado da reconciliação POSIÇÃO × CADEIA.
+ *
+ * Devolve o último relatório (com a IDADE declarada) e o estado por posição. Não
+ * dispara reconciliação: expor um GET que gasta RPC permitiria a qualquer cliente
+ * consumir a cota de RPC. A execução é periódica e no boot.
+ */
+app.get("/api/positions/desync", (_req, res) => {
+  const positions = dbStore.getPositions();
+  const marked = positions
+    .filter((p: any) => p.desyncState && p.desyncState !== "in_sync")
+    .map((p: any) => ({
+      id: p.id,
+      token: p.token,
+      mint: p.mint,
+      mode: p.mode ?? null,
+      status: p.status ?? null,
+      sizeSol: p.sizeSol ?? null,
+      desyncState: p.desyncState,
+      desyncReason: p.desyncReason ?? null,
+      desyncCheckedAt: p.desyncCheckedAt ?? null,
+      phantomConfirmations: p.phantomConfirmations ?? 0,
+    }));
+
+  const ageMs = lastDesyncReport ? Date.now() - Date.parse(lastDesyncReport.at) : null;
+  return res.json({
+    lastRunAt: lastDesyncReport?.at ?? null,
+    trigger: lastDesyncReport?.trigger ?? null,
+    ageMs,
+    stale: ageMs === null ? true : ageMs > DESYNC_INTERVAL_MS * 3,
+    intervalMs: DESYNC_INTERVAL_MS,
+    minAgeMs: DESYNC_MIN_AGE_MS,
+    snapshotAvailable: lastDesyncReport?.report.snapshotAvailable ?? null,
+    snapshotNote: lastDesyncReport?.report.snapshotNote ?? null,
+    summary: lastDesyncReport?.report.summary ?? null,
+    findings: (lastDesyncReport?.report.findings ?? []).filter((f) => f.severity !== "info"),
+    markedPositions: marked,
+    note:
+      "Nada é fechado, apagado ou quarentenado por esta reconciliação: divergências são MARCADAS aqui e " +
+      "decididas pelo operador. `snapshotAvailable: false` significa que não houve leitura de carteira — " +
+      "e não que a carteira está vazia.",
+  });
+});
+
+/**
+ * GET /api/execution-intents — intenções de execução (idempotência) e o que está travado.
+ *
+ * Uma intenção não terminal explica por que uma posição não está sendo fechada: a trava
+ * de voo único impede uma segunda assinatura até haver evidência sobre a primeira.
+ */
+app.get("/api/execution-intents", (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50) || 50));
+  const intents = dbStore.getIntents();
+  const active = intents.filter(
+    (i) => i.state !== "confirmed" && i.state !== "failed" && i.state !== "expired"
+  );
+  return res.json({
+    count: intents.length,
+    activeCount: active.length,
+    active: active.map((i) => ({
+      id: i.id,
+      positionId: i.positionId,
+      token: i.token,
+      mint: i.mint,
+      side: i.side,
+      state: i.state,
+      attempt: i.attempt,
+      signature: i.signature,
+      lastValidBlockHeight: i.lastValidBlockHeight,
+      supersedesIntentId: i.supersedesIntentId,
+      updatedAt: i.updatedAt,
+      lastError: i.lastError,
+    })),
+    recent: intents.slice(0, limit).map((i) => ({
+      id: i.id,
+      side: i.side,
+      state: i.state,
+      attempt: i.attempt,
+      positionId: i.positionId,
+      signature: i.signature,
+      confirmationLevel: i.confirmationLevel,
+      updatedAt: i.updatedAt,
+    })),
+    note:
+      "Uma intenção não terminal (created/signed/submitted) BLOQUEIA nova assinatura na mesma posição/lado: " +
+      "reenviar os mesmos bytes é idempotente, reconstruir sem prova de expiração pode duplicar a ação. " +
+      "Os bytes assinados nunca são persistidos.",
+  });
+});
+
 app.get("/api/positions", (req, res) => {
   const includeQuarantined = String(req.query.include ?? "") === "quarantined";
   const positions = dbStore.getPositions();
@@ -871,6 +978,21 @@ app.post("/api/positions/close", async (req, res) => {
     return res.status(409).json({ error: "Esta posição já está em processo de fechamento ou já foi liquidada." });
   }
 
+  /**
+   * TRAVA DE VOO ÚNICO (S4) — o fechamento manual tem a MESMA exposição do automático:
+   * o loop abaixo reconstrói e re-assina até 3 vezes. Sem esta trava, um timeout de
+   * confirmação na tentativa 1 pode produzir uma SEGUNDA venda válida na tentativa 2.
+   */
+  const manualBlockingIntent = findBlockingIntent(dbStore.getIntents(), pos.id, "exit");
+  if (manualBlockingIntent) {
+    return res.status(409).json({
+      error:
+        `Já existe uma intenção de SAÍDA não resolvida para esta posição (${manualBlockingIntent.id}, ` +
+        `estado ${manualBlockingIntent.state}). Uma nova assinatura poderia duplicar a venda; ` +
+        `aguarde a resolução por status/expiração.`,
+    });
+  }
+
   // Acquire lock and set status immediately to EXIT_PENDING
   exitLocks.add(pos.id);
   pos.status = "exit_pending";
@@ -878,6 +1000,11 @@ app.post("/api/positions/close", async (req, res) => {
 
   const triggerTime = Date.now();
   const correlationId = `corr_pos_manual_${pos.id}_${Date.now()}`;
+
+  /** Intenção persistida ANTES de assinar (sobrevive a crash entre assinar e confirmar). */
+  let manualExitIntent = persistIntent(
+    createExecutionIntent({ positionId: pos.id, mint: pos.mint, token: pos.token, side: "exit" })
+  );
   
   dbStore.saveLog({
     timestamp: new Date().toISOString(),
@@ -940,9 +1067,46 @@ app.post("/api/positions/close", async (req, res) => {
     let finalSlot = 0;
     let confirmed = false;
     let quoteData: any = null;
+    let manualConfirmationLevel: "processed" | "confirmed" | "finalized" = "confirmed";
+    let previousManualAttempt:
+      | { transaction: VersionedTransaction; blockhash: string; lastValidBlockHeight: number; signature: string }
+      | null = null;
+    let rebroadcastOnly = false;
 
     // Retry loop with Adaptive Slippage (max 3 retries)
     for (let attempt = 0; attempt < 3; attempt++) {
+      rebroadcastOnly = false;
+      if (previousManualAttempt) {
+        const { decision, slot } = await decideExitRetry(manualExitIntent, previousManualAttempt);
+        if (decision.action === "stop_confirmed") {
+          confirmed = true;
+          signature = previousManualAttempt.signature;
+          finalSlot = slot ?? 0;
+          manualExitIntent = advanceIntentOrKeep(
+            manualExitIntent,
+            "confirmed",
+            { confirmationLevel: decision.level },
+            `manual, tentativa ${attempt + 1}: ${decision.reason}`
+          );
+          break;
+        }
+        if (decision.action === "rebuild") {
+          const terminal = decision.reason.includes("ERRO de execução") ? "failed" : "expired";
+          manualExitIntent = supersedeIntent(manualExitIntent, terminal, decision.reason);
+        } else if (decision.action === "rebroadcast") {
+          rebroadcastOnly = true;
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          continue;
+        }
+        dbStore.saveLog({
+          timestamp: new Date().toISOString(),
+          level: "WARN",
+          component: "JITO_BUNDLE",
+          message: `[INTENTS] Fechamento manual (tentativa ${attempt + 1}): ${decision.action} — ${decision.reason}`,
+          correlationId,
+        });
+      }
       try {
         // Read user-configured base slippage (default 1.5% = 150 bps)
         const baseSlippageBps = pos.slippageBps || 150;
@@ -977,15 +1141,36 @@ app.post("/api/positions/close", async (req, res) => {
           currentSlippageBps
         );
 
-        const transaction = await JupiterIntegration.buildSwapTransaction(
-          quoteData,
-          walletPublicKey.toBase58()
-        );
+        let transaction: VersionedTransaction;
+        let blockhash: string;
+        let lastValidBlockHeight: number;
+        let alreadySigned = false;
 
-        const { blockhash } = await globalConnection.getLatestBlockhash("processed");
+        if (rebroadcastOnly && previousManualAttempt) {
+          transaction = previousManualAttempt.transaction;
+          blockhash = previousManualAttempt.blockhash;
+          lastValidBlockHeight = previousManualAttempt.lastValidBlockHeight;
+          alreadySigned = true;
+        } else {
+          transaction = await JupiterIntegration.buildSwapTransaction(
+            quoteData,
+            walletPublicKey.toBase58()
+          );
+          const latest = await runWithRpcFailover(async (conn) => await conn.getLatestBlockhash("processed"));
+          blockhash = latest.blockhash;
+          lastValidBlockHeight = latest.lastValidBlockHeight;
+        }
 
         const jitoRes = await executeWithDecryptedKeypair(async (keypair) => {
-          transaction.sign([keypair]);
+          if (!alreadySigned) {
+            transaction.sign([keypair]);
+            manualExitIntent = advanceIntentOrKeep(
+              manualExitIntent,
+              "signed",
+              { signature: bs58.encode(transaction.signatures[0]), blockhash, lastValidBlockHeight },
+              `manual, tentativa ${attempt + 1}: assinada (ainda não transmitida)`
+            );
+          }
           return await jitoSender.submitBundle([transaction], keypair, jitoTip, blockhash, {
             capitalCommittedSol: pos.sizeSol,
             maxTipBps: Number(process.env.MAX_TIP_BPS ?? 50),
@@ -999,6 +1184,13 @@ app.post("/api/positions/close", async (req, res) => {
         }
 
         signature = bs58.encode(transaction.signatures[0]);
+        previousManualAttempt = { transaction, blockhash, lastValidBlockHeight, signature };
+        manualExitIntent = advanceIntentOrKeep(
+          manualExitIntent,
+          "submitted",
+          { signature, blockhash, lastValidBlockHeight },
+          `manual, tentativa ${attempt + 1}: aceita pelo block engine`
+        );
 
         // Poll confirmation
         const confirmTimeout = 30000;
@@ -1014,6 +1206,8 @@ app.post("/api/positions/close", async (req, res) => {
             }
             if (status.value.confirmationStatus === "confirmed" || status.value.confirmationStatus === "processed") {
               confirmed = true;
+              manualConfirmationLevel =
+                status.value.confirmationStatus === "processed" ? "processed" : "confirmed";
               finalSlot = status.context.slot;
               break;
             }
@@ -1039,6 +1233,14 @@ app.post("/api/positions/close", async (req, res) => {
     if (!confirmed || !signature || !quoteData) {
       throw new Error("Transação manual enviada ao Jito mas não foi confirmada pelo RPC da Solana dentro de todas as tentativas.");
     }
+
+    manualExitIntent = advanceIntentOrKeep(
+      manualExitIntent,
+      "confirmed",
+      { confirmationLevel: manualConfirmationLevel, signature },
+      `manual: confirmada no nível ${manualConfirmationLevel}`
+    );
+    blockedIntentWarned.delete(manualExitIntent.id);
 
     const outSol = parseFloat(quoteData.outAmount) / 1e9;
     const latencyMs = Date.now() - triggerTime;
@@ -1113,6 +1315,31 @@ app.post("/api/positions/close", async (req, res) => {
      */
     const latencyMs = Date.now() - triggerTime;
     const errorMessage = err?.message || String(err);
+
+    /**
+     * INTENÇÃO NO FECHAMENTO MANUAL — mesma regra do automático: `created` (nada foi
+     * assinado) é terminal; `signed`/`submitted` podem ter chegado e NÃO são terminais,
+     * então a trava de voo único continua valendo até haver evidência.
+     */
+    if (manualExitIntent.state === "created") {
+      manualExitIntent = advanceIntentOrKeep(
+        manualExitIntent,
+        "failed",
+        { lastError: errorMessage },
+        "manual: falha antes da assinatura (nada transmitido)"
+      );
+    } else {
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "CRITICAL",
+        component: "JITO_BUNDLE",
+        message:
+          `[INTENTS] Fechamento manual de $${pos.token}: intenção ${manualExitIntent.id} permanece no estado ` +
+          `"${manualExitIntent.state}" (${errorMessage.slice(0, 140)}). A posição volta para OPEN e uma NOVA ` +
+          `assinatura fica bloqueada até haver evidência — é isso que impede duplicar a venda.`,
+        correlationId,
+      });
+    }
 
     pos.status = "open";
     (pos as any).exitAttempts = ((pos as any).exitAttempts || 0) + 1;
@@ -1779,7 +2006,10 @@ app.post("/api/simulate-snipe", restrictToDev, async (req, res) => {
       status: (isSuccess ? "success" : isRugToken ? "blacklisted" : "failed") as any,
       block: 278913000 + Math.floor(Math.random() * 1000),
       tipSol: parseFloat(priorityTip || "0.001"),
-      route: isRugToken ? "Mempool Trap Triggered" : jupiterRouted ? "Jupiter Router v6 (REAL-TIME)" : (route || "Raydium v4")
+      route: isRugToken ? "Mempool Trap Triggered" : jupiterRouted ? "Jupiter Router v6 (REAL-TIME)" : (route || "Raydium v4"),
+      /** Simulação de endpoint: nunca contar como execução real em relatório de PnL. */
+      mode: "paper" as const,
+      signature: null,
     };
 
     dbStore.saveLog({
@@ -1836,7 +2066,15 @@ app.post("/api/simulate-snipe", restrictToDev, async (req, res) => {
       trailingStopActive: false,
       trailingStopOffsetPercent: 2.5, // 2.5%
       highestPrice: entryPrice,
-      timeOpened: new Date().toLocaleTimeString()
+      timeOpened: new Date().toLocaleTimeString(),
+      /**
+       * MARCADO COMO PAPER (S4). Este caminho é um SIMULADOR: preço de entrada é
+       * `Math.random()`, bloco é aleatório. Sem esta marca, a posição era tratada como
+       * LIVE pelo gerenciador — e em modo LIVE isso poderia assinar uma VENDA REAL de um
+       * token que o bot nunca comprou, a partir de um número inventado.
+       */
+      mode: "paper" as const,
+      priceSource: "endpoint de simulação (preço aleatório — NÃO é mercado)",
     };
     dbStore.savePosition(newPos);
   }
@@ -3372,6 +3610,379 @@ async function runShadowEntry(mint: string, sizeSol: number, tokenName: string):
   });
 }
 
+// ============================================================================
+// S4 — INTENÇÕES DE EXECUÇÃO (idempotência) E RECONCILIAÇÃO POSIÇÃO × CADEIA
+// ============================================================================
+
+/** Intervalo entre reconciliações de carteira. Piso de 15s: RPC não é gratuito. */
+const DESYNC_INTERVAL_MS = Math.max(15_000, Number(process.env.HFT_DESYNC_INTERVAL_MS ?? 60_000));
+/**
+ * Idade mínima para uma posição poder ser considerada fantasma. Sem esta janela, uma
+ * entrada recém-disparada (ainda não confirmada) seria marcada como inexistente.
+ */
+const DESYNC_MIN_AGE_MS = Math.max(0, Number(process.env.HFT_DESYNC_MIN_AGE_MS ?? 120_000));
+
+/** Último relatório de reconciliação (memória: some no restart, o banco mantém o estado). */
+let lastDesyncReport: { report: DesyncReport; at: string; trigger: string } | null = null;
+/** Controle do intervalo entre reconciliações (evita leitura de carteira por ciclo). */
+let lastDesyncRunAt = 0;
+
+/** Lê o status de UMA assinatura, com failover de RPC. `null` = não foi possível perguntar. */
+async function observeSignatureStatus(
+  signature: string
+): Promise<{ observation: SignatureObservation | null; slot: number | null }> {
+  try {
+    const res = await runWithRpcFailover(async (conn) =>
+      await conn.getSignatureStatus(signature, { searchTransactionHistory: false })
+    );
+    if (!res || !res.value) {
+      // O RPC respondeu e NÃO conhece a assinatura. Em cache recente isso significa
+      // "não vi", que não é o mesmo que "não aconteceu" — quem decide é `decideRetry`.
+      return { observation: { found: false, err: null, confirmationStatus: null }, slot: res?.context?.slot ?? null };
+    }
+    const level = res.value.confirmationStatus;
+    return {
+      observation: {
+        found: true,
+        err: res.value.err ?? null,
+        confirmationStatus:
+          level === "processed" || level === "confirmed" || level === "finalized" ? level : null,
+      },
+      slot: res.value.slot ?? res.context?.slot ?? null,
+    };
+  } catch (err: any) {
+    console.warn(`[Intents] Falha ao consultar a assinatura ${signature.slice(0, 12)}...: ${err.message}`);
+    return { observation: null, slot: null };
+  }
+}
+
+/** Altura de bloco atual. `null` = não medido (e sem medição não há prova de expiração). */
+async function readCurrentBlockHeight(): Promise<number | null> {
+  try {
+    return await runWithRpcFailover(async (conn) => await conn.getBlockHeight("confirmed"));
+  } catch (err: any) {
+    console.warn(`[Intents] Não foi possível ler a altura de bloco: ${err.message}`);
+    return null;
+  }
+}
+
+function persistIntent(intent: ExecutionIntentRecord): ExecutionIntentRecord {
+  dbStore.saveIntent(intent);
+  return intent;
+}
+
+function advanceIntentOrKeep(
+  intent: ExecutionIntentRecord,
+  to: ExecutionIntentRecord["state"],
+  patch: Parameters<typeof advanceIntent>[2],
+  reason: string
+): ExecutionIntentRecord {
+  const res = advanceIntent(intent, to, patch, reason);
+  if (!res.ok) {
+    // Transição inválida NÃO é silenciada: ela indica estado inconsistente, e seguir
+    // adiante com estado inconsistente é como o bot passa a mentir para si mesmo.
+    console.error(`[Intents] Transição recusada para ${intent.id}: ${res.reason}`);
+    return persistIntent({ ...intent, lastError: `transição recusada: ${res.reason}`, updatedAt: new Date().toISOString() });
+  }
+  return persistIntent(res.intent);
+}
+
+/**
+ * RECUPERAÇÃO DE INTENÇÕES NO BOOT — só pergunta à cadeia, nunca assina nem envia.
+ *
+ * Cenário que isto resolve: o processo morre entre ASSINAR e confirmar (deploy, OOM,
+ * SIGKILL). No restart, `exit_pending` é revertido para `open` — mas a transação pode
+ * ter entrado. Sem esta função, o bot consideraria a venda não feita e (pior) ficaria
+ * livre para assinar uma SEGUNDA venda. Aqui a única ação é observar.
+ */
+async function recoverActiveIntents(): Promise<void> {
+  let active: ExecutionIntentRecord[] = [];
+  try {
+    active = dbStore.getActiveIntents();
+  } catch (err: any) {
+    console.error(`[Intents] Não foi possível ler intenções ativas: ${err.message}`);
+    return;
+  }
+  if (active.length === 0) return;
+
+  console.warn(`[Intents] ${active.length} intenção(ões) não terminal(is) encontrada(s) no boot. Consultando a cadeia (somente leitura)...`);
+
+  for (const intent of active) {
+    if (!intent.signature) {
+      // Morreu entre persistir "created" e assinar: NADA foi transmitido (assinatura é
+      // pré-requisito de transmissão). É seguro liberar o caminho.
+      advanceIntentOrKeep(intent, "failed", { lastError: "processo interrompido antes de assinar: nada foi enviado" }, "boot: sem assinatura");
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "WARN",
+        component: "JITO_BUNDLE",
+        message:
+          `[INTENTS] Intenção ${intent.id} (${intent.side}) foi interrompida antes de assinar. ` +
+          `Nenhuma transação foi transmitida — caminho liberado para nova tentativa.`,
+        correlationId: `corr_intent_${intent.id}`,
+      });
+      continue;
+    }
+
+    const { observation, slot } = await observeSignatureStatus(intent.signature);
+    const height = await readCurrentBlockHeight();
+    const decision = decideRetry(intent, {
+      currentBlockHeight: height,
+      signatureStatus: observation,
+      // Após restart, os bytes assinados NÃO existem mais (nunca vão para disco).
+      hasSignedBytes: false,
+    });
+
+    if (decision.action === "stop_confirmed") {
+      advanceIntentOrKeep(intent, "confirmed", { confirmationLevel: decision.level }, `boot: ${decision.reason}`);
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "CRITICAL",
+        component: "JITO_BUNDLE",
+        message:
+          `[INTENTS] Intenção ${intent.id} (${intent.side} de $${intent.token}) JÁ EXECUTOU na cadeia ` +
+          `(assinatura ${intent.signature.slice(0, 12)}..., nível ${decision.level ?? "desconhecido"}, slot ${slot ?? "?"}). ` +
+          `O estado local da posição ${intent.positionId} pode estar DESATUALIZADO: confirme no explorador. ` +
+          `A reconciliação POSITION_DESYNC vai comparar carteira × banco no próximo ciclo.`,
+        correlationId: `corr_intent_${intent.id}`,
+      });
+      continue;
+    }
+
+    if (decision.action === "rebuild") {
+      advanceIntentOrKeep(
+        intent,
+        observation?.found && observation.err ? "failed" : "expired",
+        { lastError: decision.reason, confirmationLevel: null },
+        `boot: ${decision.reason}`
+      );
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "WARN",
+        component: "JITO_BUNDLE",
+        message:
+          `[INTENTS] Intenção ${intent.id} encerrada sem execução (${decision.reason}). ` +
+          `Uma nova tentativa pode ser construída com segurança.`,
+        correlationId: `corr_intent_${intent.id}`,
+      });
+      continue;
+    }
+
+    // "wait": não há evidência suficiente. A intenção CONTINUA ativa e a trava de voo
+    // único impede uma segunda assinatura na mesma posição/lado.
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "WARN",
+      component: "JITO_BUNDLE",
+      message:
+        `[INTENTS] Intenção ${intent.id} (${intent.side} de $${intent.token}) segue NÃO RESOLVIDA: ${decision.reason} ` +
+        `A posição fica bloqueada para nova saída até haver evidência — reconstruir aqui poderia duplicar a ação.`,
+      correlationId: `corr_intent_${intent.id}`,
+    });
+  }
+}
+
+/**
+ * Decide o que fazer antes de uma nova tentativa de saída. Reúne observação da
+ * assinatura + altura de bloco e aplica `decideRetry` (regra: reenviar os mesmos bytes
+ * é idempotente; reconstruir só com prova de que a anterior não pode entrar).
+ */
+async function decideExitRetry(
+  intent: ExecutionIntentRecord,
+  previous: { signature: string } | null
+): Promise<{ decision: RetryDecision; slot: number | null }> {
+  if (!previous) {
+    return { decision: { action: "rebuild", reason: "primeira tentativa: nada foi assinado ainda" }, slot: null };
+  }
+  const { observation, slot } = await observeSignatureStatus(previous.signature);
+  const height = await readCurrentBlockHeight();
+  const decision = decideRetry(intent, {
+    currentBlockHeight: height,
+    signatureStatus: observation,
+    hasSignedBytes: true,
+  });
+  return { decision, slot };
+}
+
+/** Inicia a nova intenção que substitui uma anterior provadamente incapaz de entrar. */
+function supersedeIntent(
+  intent: ExecutionIntentRecord,
+  terminalState: "failed" | "expired",
+  reason: string
+): ExecutionIntentRecord {
+  const closed = advanceIntentOrKeep(intent, terminalState, { lastError: reason }, reason);
+  return persistIntent(
+    createExecutionIntent(
+      {
+        positionId: closed.positionId,
+        mint: closed.mint,
+        token: closed.token,
+        side: closed.side,
+        attempt: closed.attempt + 1,
+        supersedesIntentId: closed.id,
+      },
+      {}
+    )
+  );
+}
+
+/**
+ * Leitura ÚNICA das contas de token da carteira (um `getParsedTokenAccountsByOwner`).
+ * `null` = falha de leitura; nunca "sem tokens".
+ */
+async function fetchWalletHoldings(owner: PublicKey): Promise<Holding[] | null> {
+  if (!globalConnection) return null;
+  const programIds = [PROGRAMS.TOKEN_PROGRAM, PROGRAMS.TOKEN_2022_PROGRAM];
+  const holdings = new Map<string, Holding>();
+  for (const programId of programIds) {
+    try {
+      const res = await runWithRpcFailover(async (conn) =>
+        await conn.getParsedTokenAccountsByOwner(owner, { programId: new PublicKey(programId) })
+      );
+      for (const item of res.value ?? []) {
+        const info = (item as any)?.account?.data?.parsed?.info;
+        const mint = info?.mint;
+        if (typeof mint !== "string") continue;
+        const raw = Number(info?.tokenAmount?.amount ?? 0);
+        const entry: Holding = {
+          mint,
+          rawAmount: Number.isFinite(raw) ? raw : 0,
+          decimals: Number(info?.tokenAmount?.decimals ?? 0) || 0,
+          tokenAccount: item.pubkey?.toBase58?.(),
+        };
+        const current = holdings.get(mint);
+        if (!current || entry.rawAmount > current.rawAmount) holdings.set(mint, entry);
+      }
+    } catch (err: any) {
+      /**
+       * ATENÇÃO: os DOIS programas precisam responder. Se um falha, o snapshot está
+       * incompleto e um token legítimo poderia parecer ausente → falso fantasma.
+       * Devolver `null` é a resposta honesta: "não consegui ler", nunca "não há tokens".
+       */
+      console.warn(`[Desync] Falha ao ler contas de token (${programId.slice(0, 6)}...): ${err.message}`);
+      return null;
+    }
+  }
+  return [...holdings.values()];
+}
+
+/**
+ * Segunda leitura, DIRIGIDA ao mint, antes de marcar uma posição como fantasma.
+ * Marcar uma posição saudável como inexistente é caro (ela sai da gestão de risco),
+ * então a confirmação dupla é obrigatória. `null` = não confirmado.
+ */
+async function confirmNoTokensForMint(owner: PublicKey, mint: string): Promise<boolean | null> {
+  if (!globalConnection) return null;
+  try {
+    const res = await runWithRpcFailover(async (conn) =>
+      await conn.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(mint) })
+    );
+    const total = (res.value ?? []).reduce((acc: number, item: any) => {
+      const raw = Number(item?.account?.data?.parsed?.info?.tokenAmount?.amount ?? 0);
+      return acc + (Number.isFinite(raw) ? raw : 0);
+    }, 0);
+    return total === 0;
+  } catch (err: any) {
+    console.warn(`[Desync] Confirmação dirigida do mint ${mint.slice(0, 8)}... falhou: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Executa a reconciliação POSITION_DESYNC: estado local × carteira. NÃO fecha, NÃO
+ * apaga e NÃO quarentena nada: marca a divergência no registro da posição, registra
+ * evidência e deixa a decisão para o operador (mesmo princípio do S0).
+ */
+async function runDesyncReconciliation(trigger: string): Promise<DesyncReport | null> {
+  try {
+    if (!globalConnection) return null;
+    const positions = dbStore.getPositions();
+    const managed = positions.filter(
+      (p: any) => p.mode !== "paper" && p.status !== "quarantined" && p.status !== "closed"
+    );
+    if (managed.length === 0) return null;
+
+    const owner = getActiveWalletPublicKey();
+    const holdings = await fetchWalletHoldings(owner);
+
+    // Mints que o bot acredita TER ENCERRADO: saídas live com sucesso no histórico de
+    // trades. Serve para "achei que vendi mas ainda tenho token".
+    const closedMints = dbStore
+      .getTrades()
+      .filter((t) => t.mode === "live" && t.status === "success")
+      .map((t) => ({ mint: t.mint, token: t.token, closedAt: t.time ?? null }));
+
+    const report = reconcilePositionDesync({
+      positions: positions as any,
+      closedMints,
+      holdings,
+      nowMs: Date.now(),
+      options: { minAgeMs: DESYNC_MIN_AGE_MS },
+    });
+
+    const nowIso = new Date().toISOString();
+    for (const f of report.findings) {
+      if (f.verdict === "in_sync" || f.verdict === "too_young" || !f.positionId) continue;
+      const pos = positions.find((p: any) => p.id === f.positionId);
+      if (!pos) continue;
+
+      if (f.verdict === "phantom_position") {
+        /**
+         * Confirmação dupla ANTES de marcar. Uma leitura errada (nó atrasado, RPC
+         * degradado) marcaria uma posição real como inexistente e a tiraria da gestão
+         * de risco — trocar um problema de dados por um problema de capital.
+         */
+        const confirmed = await confirmNoTokensForMint(owner, pos.mint);
+        if (confirmed !== true) {
+          pos.desyncState = "unknown";
+          pos.desyncReason =
+            `Saldo zero no snapshot, mas a confirmação dirigida ${confirmed === null ? "falhou (sem leitura)" : "encontrou saldo"}. ` +
+            `Não classificado como fantasma.`;
+          pos.desyncCheckedAt = nowIso;
+          dbStore.savePosition(pos);
+          continue;
+        }
+        pos.phantomConfirmations = (pos.phantomConfirmations || 0) + 1;
+        pos.desyncState = "phantom_position";
+        pos.desyncReason = f.evidence;
+        pos.desyncCheckedAt = nowIso;
+        dbStore.savePosition(pos);
+        dbStore.saveLog({
+          timestamp: nowIso,
+          level: "CRITICAL",
+          component: "RISK_ENGINE",
+          message:
+            `[POSITION_DESYNC] ${pos.token ?? pos.id} está ABERTA no banco e a carteira NÃO tem o token ` +
+            `(duas leituras independentes concordam). Evidência: ${f.evidence} ` +
+            `Ação: confirme no explorador e decida (quarentenar/pausar). Esta posição NÃO será gerida ` +
+            `(não há o que vender) e nada foi alterado no estado além da marcação.`,
+          correlationId: `corr_desync_${pos.id}_${Date.now()}`,
+        });
+        continue;
+      }
+
+      pos.desyncState = f.verdict as any;
+      pos.desyncReason = f.evidence;
+      pos.desyncCheckedAt = nowIso;
+      dbStore.savePosition(pos);
+      dbStore.saveLog({
+        timestamp: nowIso,
+        level: f.severity === "critical" ? "CRITICAL" : "WARN",
+        component: "RISK_ENGINE",
+        message: `[POSITION_DESYNC] ${f.verdict}${f.token ? ` em ${f.token}` : ""}: ${f.evidence} ${f.interpretation} Ação: ${f.recommendedAction}`,
+        correlationId: `corr_desync_${f.positionId ?? "global"}_${Date.now()}`,
+      });
+    }
+
+    lastDesyncReport = { report, at: nowIso, trigger };
+    console.log(`[Desync] ${describeDesyncReport(report)} (disparo: ${trigger})`);
+    return report;
+  } catch (err: any) {
+    console.error(`[Desync] Reconciliação falhou: ${err.message}`);
+    return null;
+  }
+}
+
 /**
  * RECONCILIADOR DE ESTADO DE SAÍDA — resolve posições presas em `exit_pending`.
  *
@@ -3497,6 +4108,20 @@ async function startAutonomousPositionManager(): Promise<void> {
       const positions = dbStore.getPositions();
       const openPositions = positions.filter(p => p.status === "open" || !p.status);
 
+      /**
+       * RECONCILIAÇÃO PERIÓDICA POSIÇÃO × CADEIA (S4). Roda no máximo a cada
+       * DESYNC_INTERVAL_MS e só quando existe posição gerível — uma leitura de carteira
+       * por ciclo, não uma por posição.
+       */
+      const nowMs = Date.now();
+      if (
+        openPositions.some((p: any) => p.mode !== "paper") &&
+        nowMs - lastDesyncRunAt >= DESYNC_INTERVAL_MS
+      ) {
+        lastDesyncRunAt = nowMs;
+        await runDesyncReconciliation("periódica");
+      }
+
       if (openPositions.length === 0) {
         continue;
       }
@@ -3533,6 +4158,17 @@ async function startAutonomousPositionManager(): Promise<void> {
           }
           continue;
         }
+        /**
+         * FANTASMA CONFIRMADO: o banco diz aberta, duas leituras independentes da
+         * carteira dizem que o token não existe. Gerir isso é gastar RPC para calcular
+         * stop/alvo de um ativo inexistente — e, pior, um gatilho poderia tentar vender
+         * zero e derrubar o circuit breaker, escondendo as falhas reais. Não é fechada
+         * nem apagada: fica marcada e visível em GET /api/positions/desync.
+         */
+        if ((pos as any).desyncState === "phantom_position") {
+          continue;
+        }
+
         if (!pos.mint || !isValidPubkey(pos.mint)) {
           if (!invalidPositionWarned.has(pos.id)) {
             invalidPositionWarned.add(pos.id);
@@ -3889,10 +4525,48 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     return;
   }
 
+  /**
+   * TRAVA DE VOO ÚNICO (S4). Antes de qualquer assinatura, verifica se já existe uma
+   * intenção de SAÍDA não terminal para esta posição. Se existe, NÃO se assina outra:
+   * duas transações válidas para a mesma venda podem vender duas vezes.
+   *
+   * A saída legítima para uma intenção travada é EVIDÊNCIA (expiração provada por altura
+   * de bloco ou erro de execução na cadeia), aplicada por `recoverActiveIntents()`.
+   */
+  const blockingIntent = findBlockingIntent(dbStore.getIntents(), pos.id, "exit");
+  if (blockingIntent) {
+    if (blockedIntentWarned.has(blockingIntent.id)) {
+      console.warn(`[Intents] Saída de ${pos.id} continua bloqueada por ${blockingIntent.id} (${blockingIntent.state}).`);
+      return;
+    }
+    blockedIntentWarned.add(blockingIntent.id);
+    console.warn(
+      `[Intents] Saída de ${pos.id} bloqueada: intenção ${blockingIntent.id} segue em estado "${blockingIntent.state}" ` +
+        `(assinatura ${blockingIntent.signature?.slice(0, 12) ?? "nenhuma"}). Não se assina uma segunda venda sem prova de que a primeira não pode entrar.`
+    );
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "WARN",
+      component: "RISK_ENGINE",
+      message:
+        `[INTENTS] Saída de $${pos.token} NÃO iniciada: já existe intenção não resolvida ` +
+        `(${blockingIntent.id}, estado ${blockingIntent.state}). Um segundo envio poderia duplicar a venda. ` +
+        `Aguarde a resolução por status/expiração.`,
+      correlationId,
+    });
+    return;
+  }
+
   // Acquire Lock and set status to EXIT_PENDING immediately
   exitLocks.add(pos.id);
   pos.status = "exit_pending";
   dbStore.savePosition(pos);
+
+  // Intenção persistida ANTES de assinar. É o registro que sobrevive a um crash entre
+  // assinar e confirmar — e o que impede uma segunda assinatura no restart.
+  let exitIntent = persistIntent(
+    createExecutionIntent({ positionId: pos.id, mint: pos.mint, token: pos.token, side: "exit" })
+  );
 
   const triggerTime = Date.now();
   
@@ -3953,9 +4627,88 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     let finalSlot = 0;
     let confirmed = false;
     let quoteData: any = null;
+    let observedConfirmationLevel: "processed" | "confirmed" | "finalized" = "confirmed";
+
+    /**
+     * Tentativa anterior mantida em MEMÓRIA — os bytes assinados nunca vão para disco
+     * (transação assinada é dinheiro em movimento; quem a tem pode transmiti-la).
+     */
+    let previousExitAttempt:
+      | { transaction: VersionedTransaction; blockhash: string; lastValidBlockHeight: number; signature: string }
+      | null = null;
+    /** true quando a política decidiu REENVIAR os mesmos bytes (nada é reconstruído). */
+    let rebroadcastOnly = false;
 
     // Retry loop with Adaptive Slippage (max 3 retries)
     for (let jitoAttempt = 0; jitoAttempt < 3; jitoAttempt++) {
+      /**
+       * POLÍTICA DE RETRY (S4). Antes de reconstruir a transação, pergunta-se à cadeia:
+       * reenviar os MESMOS bytes é idempotente (a runtime deduplica por message hash);
+       * reconstruir cria uma transação NOVA (blockhash novo) que pode entrar junto com a
+       * anterior. Só se reconstrói com prova de que a anterior não pode mais entrar.
+       */
+      rebroadcastOnly = false;
+      if (previousExitAttempt) {
+        const { decision, slot } = await decideExitRetry(exitIntent, previousExitAttempt);
+
+        if (decision.action === "stop_confirmed") {
+          confirmed = true;
+          signature = previousExitAttempt.signature;
+          finalSlot = slot ?? 0;
+          trace.mark("confirmed");
+          exitIntent = advanceIntentOrKeep(
+            exitIntent,
+            "confirmed",
+            { confirmationLevel: decision.level },
+            `tentativa ${jitoAttempt + 1}: ${decision.reason}`
+          );
+          dbStore.saveLog({
+            timestamp: new Date().toISOString(),
+            level: "WARN",
+            component: "JITO_BUNDLE",
+            message:
+              `[INTENTS] Saída de $${pos.token} JÁ ESTAVA na cadeia (${decision.reason}). Nenhuma nova transação ` +
+              `foi construída — a intenção ${exitIntent.id} foi encerrada como confirmada (nível ${decision.level ?? "?"}).`,
+            correlationId,
+          });
+          break;
+        }
+
+        if (decision.action === "rebuild") {
+          dbStore.saveLog({
+            timestamp: new Date().toISOString(),
+            level: "WARN",
+            component: "JITO_BUNDLE",
+            message:
+              `[INTENTS] Reconstrução AUTORIZADA por evidência (tentativa ${jitoAttempt + 1}): ${decision.reason}`,
+            correlationId,
+          });
+          const terminal = decision.reason.includes("ERRO de execução") ? "failed" : "expired";
+          exitIntent = supersedeIntent(exitIntent, terminal, decision.reason);
+        } else if (decision.action === "rebroadcast") {
+          rebroadcastOnly = true;
+          dbStore.saveLog({
+            timestamp: new Date().toISOString(),
+            level: "WARN",
+            component: "JITO_BUNDLE",
+            message:
+              `[INTENTS] Reenvio dos MESMOS bytes assinados (tentativa ${jitoAttempt + 1}): ${decision.reason}`,
+            correlationId,
+          });
+        } else {
+          // "wait": não há evidência. Nenhuma transação nova; aguarda o próximo ciclo.
+          dbStore.saveLog({
+            timestamp: new Date().toISOString(),
+            level: "WARN",
+            component: "JITO_BUNDLE",
+            message: `[INTENTS] Saída de $${pos.token} aguardando evidência (nenhuma transação nova): ${decision.reason}`,
+            correlationId,
+          });
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          continue;
+        }
+      }
+
       try {
         // Read user-configured base slippage (default 1.5% = 150 bps)
         const baseSlippageBps = pos.slippageBps || 150;
@@ -3976,29 +4729,68 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
           correlationId
         });
 
-        // 3. Cotação (host configurado + retry com backoff) e 4. construção do swap.
-        quoteData = await fetchJupiterQuoteWithRetry(
-          pos.mint,
-          "So11111111111111111111111111111111111111112",
-          rawAmount,
-          currentSlippageBps
-        );
-        trace.mark("built");
+        // 3–4. Cotação e construção — OU reaproveitamento dos MESMOS bytes assinados.
+        let transaction: VersionedTransaction;
+        let blockhash: string;
+        let lastValidBlockHeight: number;
+        let alreadySigned = false;
 
-        const transaction = await fetchJupiterSwapWithRetry(quoteData, walletPublicKey.toBase58());
+        if (rebroadcastOnly && previousExitAttempt) {
+          transaction = previousExitAttempt.transaction;
+          blockhash = previousExitAttempt.blockhash;
+          lastValidBlockHeight = previousExitAttempt.lastValidBlockHeight;
+          alreadySigned = true;
+          dbStore.saveLog({
+            timestamp: new Date().toISOString(),
+            level: "INFO",
+            component: "JITO_BUNDLE",
+            message:
+              `[INTENTS] Reenviando a MESMA transação assinada (assinatura ${previousExitAttempt.signature.slice(0, 12)}...). ` +
+              `Nenhuma recotação, nenhuma nova assinatura: reenvio dos mesmos bytes é idempotente na Solana.`,
+            correlationId
+          });
+        } else {
+          quoteData = await fetchJupiterQuoteWithRetry(
+            pos.mint,
+            "So11111111111111111111111111111111111111112",
+            rawAmount,
+            currentSlippageBps
+          );
+          trace.mark("built");
 
-        dbStore.saveLog({
-          timestamp: new Date().toISOString(),
-          level: "INFO",
-          component: "JITO_BUNDLE",
-          message: `[KMS Private Signer] Assinando transação de swap e autorizando Jito Tip de ${jitoTip} SOL via Vault Isolado.`,
-          correlationId
-        });
+          transaction = await fetchJupiterSwapWithRetry(quoteData, walletPublicKey.toBase58());
 
-        const { blockhash } = await runWithRpcFailover(async (conn) => await conn.getLatestBlockhash("processed"));
-        
+          dbStore.saveLog({
+            timestamp: new Date().toISOString(),
+            level: "INFO",
+            component: "JITO_BUNDLE",
+            message: `[KMS Private Signer] Assinando transação de swap e autorizando Jito Tip de ${jitoTip} SOL via Vault Isolado.`,
+            correlationId
+          });
+
+          const latest = await runWithRpcFailover(async (conn) => await conn.getLatestBlockhash("processed"));
+          blockhash = latest.blockhash;
+          // Sem lastValidBlockHeight não existe prova de expiração — e sem prova de
+          // expiração a política de retry NUNCA autoriza reconstruir.
+          lastValidBlockHeight = latest.lastValidBlockHeight;
+        }
+
         const jitoRes = await executeWithDecryptedKeypair(async (keypair) => {
-          transaction.sign([keypair]);
+          if (!alreadySigned) {
+            transaction.sign([keypair]);
+            const signedSignature = bs58.encode(transaction.signatures[0]);
+            /**
+             * PERSISTIR ANTES DE TRANSMITIR. Se o processo morrer entre assinar e enviar,
+             * a assinatura fica registrada e o próximo boot CONSULTA o status (nunca
+             * reconstrói às cegas). Os bytes assinados NÃO são gravados.
+             */
+            exitIntent = advanceIntentOrKeep(
+              exitIntent,
+              "signed",
+              { signature: signedSignature, blockhash, lastValidBlockHeight },
+              `tentativa ${jitoAttempt + 1}: transação assinada (ainda não transmitida)`
+            );
+          }
           trace.mark("signed");
           const submitted = await jitoSender.submitBundle([transaction], keypair, jitoTip, blockhash, {
             capitalCommittedSol: pos.sizeSol,
@@ -4015,11 +4807,19 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
         }
 
         signature = bs58.encode(transaction.signatures[0]);
+        // Tentativa corrente guardada em MEMÓRIA para permitir reenvio dos mesmos bytes.
+        previousExitAttempt = { transaction, blockhash, lastValidBlockHeight, signature };
+        exitIntent = advanceIntentOrKeep(
+          exitIntent,
+          "submitted",
+          { signature, blockhash, lastValidBlockHeight },
+          `tentativa ${jitoAttempt + 1}: aceita pelo block engine`
+        );
         dbStore.saveLog({
           timestamp: new Date().toISOString(),
           level: "INFO",
           component: "JITO_BUNDLE",
-          message: `[Jito Bundle Exit] Bundle enviado (Tentativa ${jitoAttempt + 1}/3). ID Jito: ${jitoRes.bundleId}. Assinatura: ${signature}. Aguardando confirmação...`,
+          message: `[Jito Bundle Exit] Bundle enviado (Tentativa ${jitoAttempt + 1}/3, intenção ${exitIntent.id}). ID Jito: ${jitoRes.bundleId}. Assinatura: ${signature}. Aguardando confirmação...`,
           correlationId
         });
 
@@ -4036,6 +4836,15 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
             }
             if (status.value.confirmationStatus === "confirmed" || status.value.confirmationStatus === "processed") {
               confirmed = true;
+              /**
+               * NÍVEL DE CONFIRMAÇÃO registrado literalmente. `processed` é inclusão
+               * otimista: a venda foi aceita em bloco, mas ainda pode ser revertida.
+               * A posição tem de ser dada como vendida de qualquer forma (não fazer isso
+               * reabriria a porta para uma SEGUNDA venda), e o nível fica gravado para
+               * auditoria — e não como "confirmado" genérico.
+               */
+              observedConfirmationLevel =
+                status.value.confirmationStatus === "processed" ? "processed" : "confirmed";
               finalSlot = status.context.slot;
               trace.mark("confirmed");
               break;
@@ -4060,6 +4869,27 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
 
     if (!confirmed || !signature || !quoteData) {
       throw new Error("Transação enviada ao Jito mas não foi confirmada pelo RPC da Solana dentro de todas as tentativas.");
+    }
+
+    // Intenção encerrada como CONFIRMADA, com o nível realmente observado.
+    exitIntent = advanceIntentOrKeep(
+      exitIntent,
+      "confirmed",
+      { confirmationLevel: observedConfirmationLevel, signature },
+      `confirmada no nível ${observedConfirmationLevel}`
+    );
+    blockedIntentWarned.delete(exitIntent.id);
+    if (observedConfirmationLevel === "processed") {
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "WARN",
+        component: "JITO_BUNDLE",
+        message:
+          `[INTENTS] Saída de $${pos.token} vista como PROCESSED (inclusão otimista, NÃO finalizada). ` +
+          `A posição é dada como vendida para não reabrir segunda venda; a assinatura ${signature} fica registrada ` +
+          `para verificação posterior.`,
+        correlationId,
+      });
     }
 
     // 5. Encerramento da posição (SÓ DEPOIS da confirmação on-chain)
@@ -4162,6 +4992,34 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     // Falha de saída TAMBÉM é resultado: a trilha parcial mostra em que estágio o
     // caminho parou (cotação / construção / assinatura / envio / confirmação).
     telemetry.record(trace.toRecord("failed"));
+
+    /**
+     * ESTADO DA INTENÇÃO NA FALHA — decidido pelo que se SABE, não pelo que se espera:
+     *   - `created`: nada foi assinado → nada poderia ter sido transmitido → terminal.
+     *   - `signed` : assinada, envio NÃO confirmado → pode ter chegado. NÃO é terminal:
+     *                a trava de voo único impede uma segunda assinatura até haver prova.
+     *   - `submitted`: enviada → mesma regra, com evidência de envio.
+     */
+    if (exitIntent.state === "created") {
+      exitIntent = advanceIntentOrKeep(
+        exitIntent,
+        "failed",
+        { lastError: errorMessage },
+        "falha antes da assinatura: nenhuma transação poderia ter sido transmitida"
+      );
+    } else {
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "CRITICAL",
+        component: "JITO_BUNDLE",
+        message:
+          `[INTENTS] Intenção ${exitIntent.id} (saída de $${pos.token}) permanece NÃO RESOLVIDA no estado ` +
+          `"${exitIntent.state}" após erro: ${errorMessage.slice(0, 160)}. ` +
+          `A posição volta para OPEN, mas uma NOVA assinatura está bloqueada até haver evidência ` +
+          `(isso impede duplicar a venda). Resolução: status/expiração (automática no próximo boot) ou intervenção do operador.`,
+        correlationId,
+      });
+    }
 
     pos.status = "open"; // Reverte EXIT_PENDING: a posição AINDA EXISTE e ainda tem risco.
     (pos as any).exitAttempts = ((pos as any).exitAttempts || 0) + 1;
@@ -4353,7 +5211,18 @@ async function startServer() {
 
     // Start ETAPA 11 Autonomous Position Manager Daemon
     // Reconcilia posições presas em EXIT_PENDING antes de retomar a gestão de risco.
+    /**
+     * ORDEM IMPORTA: primeiro pergunta-se à cadeia o que aconteceu com as intenções que
+     * ficaram abertas (processo morto entre assinar e confirmar); só depois o estado
+     * local `exit_pending` é revertido. Reverter antes seria afirmar "não vendeu" sem
+     * nenhuma evidência.
+     */
+    await recoverActiveIntents();
     await reconcileStuckExits();
+    await runDesyncReconciliation("boot");
+    // O boot já reconciliou: o próximo ciclo periódico conta a partir daqui, sem repetir
+    // a leitura de carteira segundos depois de subir.
+    lastDesyncRunAt = Date.now();
 
     startAutonomousPositionManager().catch((err) => {
       console.error("[Autonomous Position Manager] Daemon start failed:", err.message);

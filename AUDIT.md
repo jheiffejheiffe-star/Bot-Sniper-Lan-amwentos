@@ -739,3 +739,140 @@ GET /api/jito/bundle-status?id=… → verdict "unknown" com as duas falhas de c
   reconciliação nunca rodou contra um bundle de verdade. Ela está pronta para ser usada em S4/S5.
 - `getBundleStatuses` cobre ~300 slots enraizados e o inflight cobre 5 minutos: bundle antigo volta
   `null`/`Invalid`, e isso NÃO é falha — está escrito na resposta do endpoint.
+
+
+---
+
+## Adendo 6 (2026-10-02) — S4: intenção de execução (idempotência) e reconciliador `POSITION_DESYNC`
+
+### C34 — o retry RECONSTRUÍA a transação: o vetor de execução dupla
+
+Os DOIS loops de saída (automático e fechamento manual) reconstruíam e re-assinavam a
+transação em cada uma das 3 tentativas: nova cotação, nova montagem e **novo
+`getLatestBlockhash`**. O laço tratava "não confirmei em 30s" como "não aconteceu" e ia
+direto para a tentativa seguinte.
+
+O problema é a diferença entre reenviar e reconstruir:
+
+| Operação | Efeito |
+|---|---|
+| **Reenviar** os mesmos bytes assinados | Mesma mensagem e mesma assinatura. A runtime deduplica por *message hash*: a transação não pode ser processada duas vezes. Idempotente. |
+| **Reconstruir** (blockhash novo) | Mensagem e assinatura DIFERENTES. Para a cadeia é uma transação nova. As duas ficam válidas enquanto seus blockhashes valerem — e as duas podem entrar em bloco. |
+
+A própria orientação de produção da Solana aponta isso: uma transação reconstruída tem
+nova assinatura, então a idempotência precisa ser preservada NA APLICAÇÃO; e um `null` no
+cache recente de status de assinatura é **inconclusivo** (~150 slots), não uma resposta
+negativa. Ou seja: o timeout de 30s não era evidência de nada, e o código o usava como se
+fosse permissão para criar uma segunda transação válida de venda.
+
+**Correção — intenção de execução (`src/executionIntent.ts`) + política de retry.**
+
+Cada saída agora tem uma INTENÇÃO persistida **antes de assinar**, com `signature`,
+`blockhash` e `lastValidBlockHeight` gravados no instante em que existem. A decisão de
+retry passa a ser por evidência, nesta ordem:
+
+| Evidência | Decisão |
+|---|---|
+| Cadeia reportou ERRO de execução para a assinatura | `rebuild` — aquela transação executou e falhou, não pode voltar |
+| Cadeia reporta a assinatura como `processed`/`confirmed`/`finalized` | `stop_confirmed` — a ação ocorreu; registra o nível |
+| Altura atual > `lastValidBlockHeight` | `rebuild` — blockhash provadamente expirado |
+| Nada conclusivo, bytes em memória | `rebroadcast` — reenvia os MESMOS bytes |
+| Nada conclusivo, sem os bytes (restart) | `wait` — **não reconstrói**; consultar é a única ação honesta |
+| Durable nonce | `wait` — nonce durável não expira por blockhash, a regra de expiração não se aplica |
+
+Sem `lastValidBlockHeight` não existe prova de expiração — e sem prova, a política NUNCA
+autoriza reconstruir. Era exatamente esse número que o código não capturava.
+
+**Trava de voo único.** Só pode existir UMA intenção não terminal por posição+lado. O
+caminho autônomo recusa e registra (uma vez, não a cada 3s); o fechamento manual devolve
+`409` antes de qualquer assinatura. A situação "assinada mas não sei se chegou" agora
+BLOQUEIA a segunda assinatura — é o comportamento certo: preferir uma posição travada a
+vender duas vezes.
+
+**Recuperação no boot.** `recoverActiveIntents()` roda ANTES de `reconcileStuckExits()` e
+só PERGUNTA à cadeia (nenhuma assinatura, nenhum envio). Um intent `created` (morreu antes
+de assinar) é encerrado — nada foi transmitido, é seguro. Um intent com assinatura fica com
+o desfecho que a cadeia indicar; sem resposta, permanece ATIVO e bloqueando.
+
+**Nível de confirmação literal.** `processed` (inclusão otimista, ainda revertível) é
+gravado como `processed`, não como "confirmado". A posição é dada como vendida — não fazer
+isso reabriria a porta para uma segunda venda — e a assinatura fica registrada para
+verificação.
+
+**O que NUNCA vai para o disco:** os bytes assinados. Uma transação assinada é dinheiro em
+movimento (quem a possui pode transmiti-la); ela vive apenas em memória e é o que permite o
+`rebroadcast`. O que é persistido basta para CONSULTAR o desfecho na cadeia. Há teste de
+regressão proibindo `wireTransaction`, `serialize()` e assinatura dentro do módulo.
+
+### C35 — posição fantasma e exposição não rastreada
+
+Toda a gestão de risco assumia, sem verificar, que o banco descrevia a carteira:
+
+- **fantasma**: banco diz `open`, carteira não tem o token → o bot calcula stop/alvo de um
+  ativo que não existe e, no gatilho, tenta vender zero (falha de saída → circuit breaker →
+  ruído que esconde as falhas reais);
+- **exposição não rastreada**: carteira tem o token e o bot não a considera posição →
+  ativo sem stop, sem alvo, sem ninguém olhando.
+
+Novo `src/positionDesync.ts` (puro) + reconciliação no boot e a cada
+`HFT_DESYNC_INTERVAL_MS` (default 60s, piso 15s) + `GET /api/positions/desync`. Uma leitura
+de carteira por ciclo (`getParsedTokenAccountsByOwner` para Token program **e** Token-2022),
+não uma por posição.
+
+Regras de honestidade (todas com teste):
+
+1. **Falha de leitura ≠ desvio.** Sem snapshot, o veredito é `unknown`. "Não consegui ver" não é "a carteira está vazia".
+2. **Janela de tolerância** (`HFT_DESYNC_MIN_AGE_MS`, default 120s): entrada recém-disparada pode não ter confirmado; um falso positivo aqui tiraria uma posição saudável da gestão.
+3. **Paper/quarentenada nunca são comparadas** com a cadeia (simulação não tem token on-chain).
+4. **Exposição não rastreada só para mints que o BOT tocou** — tokens do operador na carteira não geram alarme. Alarme com ruído é alarme ignorado.
+5. **Confirmação dupla antes de marcar fantasma**: se o snapshot agregado não vê o mint, uma segunda leitura DIRIGIDA ao mint precisa concordar. Uma leitura errada retiraria uma posição real da gestão de risco — trocar um problema de dados por um de capital.
+6. **Marcar, não corrigir**: nada é fechado, apagado ou quarentenado por esta camada (mesmo princípio do S0). A posição marcada deixa de ser gerida (não há o que vender) e a decisão fica com o operador.
+
+Também corrigido no mesmo eixo: o endpoint de simulação criava posições `open` **sem campo
+`mode`**, e o gerenciador as tratava como LIVE — um preço `Math.random()` poderia, em modo
+LIVE, acionar uma VENDA REAL de um token que o bot nunca comprou. Passaram a ser gravadas
+como `mode: "paper"` com `priceSource` explícito (o restante daquele caminho de simulação
+segue na lista de fabricações a remover).
+
+### Estado verificado
+
+```
+npm run lint  → exit 0
+npm run test  → 82/82 (novos grupos [13] intenções e [14] reconciliação)
+```
+
+Verificação ao vivo (servidor reiniciado; sandbox SEM egress, resultado esperado):
+
+```
+[Intents] 1 intenção(ões) não terminal(is) encontrada(s) no boot. Consultando a cadeia (somente leitura)...
+[Intents] Falha ao consultar a assinatura 5j7s6NiJS3JA...: fetch failed
+[Intents] Não foi possível ler a altura de bloco: fetch failed
+[Desync] Falha ao ler contas de token (Tokenk...): fetch failed
+[Desync] Reconciliação sem snapshot de carteira: 1 posição(ões) não comparadas. (disparo: boot)
+
+GET /api/execution-intents   → activeCount: 1, state "signed" — a intenção NÃO foi encerrada sem
+                               evidência (encerrar aqui liberaria uma segunda assinatura)
+GET /api/positions/desync    → snapshotAvailable: false, phantom: 0, unknown: 1,
+                               note: "nenhum veredito de desvio foi emitido"
+```
+
+O cenário do teste ao vivo foi montado com um banco local de FIXTURE (uma posição `live`,
+uma intenção `signed`), removido em seguida: o banco operacional deste sandbox é gitignored e
+descartável, e a fixture nunca foi comitada.
+
+### O que continua NÃO verificado (declarado, não escondido)
+
+- **Nenhum bundle real foi enviado** (não existe caminho de entrada on-chain), então o ciclo
+  completo de intenção — assinar → enviar → confirmar → `rebroadcast` — nunca rodou contra a
+  cadeia. O que está testado é a MATRIZ DE DECISÃO, com observações injetadas.
+- **A expiração por altura nunca foi exercitada de verdade**: depende de `getBlockHeight` +
+  `lastValidBlockHeight` de um RPC saudável. No primeiro uso real, confira nos logs se o
+  `rebuild` cita as duas alturas antes de confiar na política.
+- **A confirmação dupla do fantasma nunca viu uma carteira real** (sem egress). Se você abrir
+  o bot em uma VPS com RPC, o primeiro `GET /api/positions/desync` é a prova que falta.
+- A trava de voo único vale **por processo**: duas instâncias do bot na mesma carteira não
+  enxergam a intenção uma da outra. Idempotência entre processos exige guarda NA CADEIA, que
+  este trabalho não implementa.
+- Nota de ambiente: este workspace não persiste `node_modules/`, arquivos gitignored
+  (`hft_operational_db.json`, `data/`) nem o ponteiro local da branch entre sessões. O código
+  e o histórico vêm do remoto; dados de runtime sempre começam vazios aqui.
