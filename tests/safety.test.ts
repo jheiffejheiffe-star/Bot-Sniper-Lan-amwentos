@@ -776,6 +776,68 @@ async function main(): Promise<void> {
     if (prevNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = prevNodeEnv;
   });
 
+  /* ------------------------------------------------------------------ */
+  console.log("\n[10] Reconexão de WebSocket e honestidade do estado de detecção");
+
+  await test("backoff de reconexão WS cresce e satura (não há storm de 1 tentativa/s)", async () => {
+    const { wsBackoffDelayMs, WS_BASE_RECONNECT_MS, WS_MAX_RECONNECT_MS } = await import("../src/realExecution.js");
+    assert.equal(wsBackoffDelayMs(1), WS_BASE_RECONNECT_MS, "primeira falha usa o intervalo base");
+    assert.equal(wsBackoffDelayMs(2), 2000);
+    assert.equal(wsBackoffDelayMs(3), 4000);
+
+    // Monotonicamente não-decrescente e sempre dentro do teto.
+    let prev = 0;
+    for (let i = 1; i <= 30; i++) {
+      const d = wsBackoffDelayMs(i);
+      assert.ok(d >= prev, `atraso diminuiu na falha ${i} (${d} < ${prev})`);
+      assert.ok(d <= WS_MAX_RECONNECT_MS, `atraso ${d} acima do teto ${WS_MAX_RECONNECT_MS}`);
+      assert.ok(d >= WS_BASE_RECONNECT_MS, `atraso ${d} abaixo do base`);
+      prev = d;
+    }
+    assert.equal(wsBackoffDelayMs(50), WS_MAX_RECONNECT_MS, "no teto, não cresce mais");
+
+    // Custo concreto (o motivo da correção): o default do web3.js é 1000ms para SEMPRE.
+    // Com backoff, 60 falhas consecutivas custam ~50x menos tentativas do que 1/s.
+    let totalMs = 0;
+    for (let i = 1; i <= 60; i++) totalMs += wsBackoffDelayMs(i);
+    assert.ok(totalMs > 60_000, `60 falhas deveriam ocupar mais de 1 minuto de tempo real (${totalMs}ms)`);
+  });
+
+  await test("getHealth não declara detecção conectada só porque subscrições foram pedidas", async () => {
+    const { GeyserStreamClient } = await import("../src/realExecution.js");
+    // Endpoints locais inexistentes: nada de rede externa, falha imediata e determinística.
+    const client = new GeyserStreamClient("http://127.0.0.1:1", "ws://127.0.0.1:1", "");
+    try {
+      await client.connect();
+      const health = client.getHealth();
+      assert.equal(health.socketOpen, false, "socket não abriu: não pode se declarar conectado");
+      assert.equal(
+        health.connected,
+        false,
+        "o web3.js atribui IDs de subscrição ANTES do socket abrir; isso não é conexão"
+      );
+      assert.ok(health.subscriptionsRequested > 0, "as subscrições foram PEDIDAS (fato) e devem aparecer como tal");
+      assert.equal(health.degraded, true, "sem socket aberto a detecção está degradada");
+      assert.equal(health.eventCount, 0, "nenhum evento foi recebido");
+      assert.match(health.note || "", /eventCount/, "a nota precisa apontar a única prova real de detecção");
+    } finally {
+      client.disconnect();
+    }
+  });
+
+  await test("evento detectado move eventCount (a prova, não o log de boot)", async () => {
+    const { GeyserStreamClient } = await import("../src/realExecution.js");
+    const client = new GeyserStreamClient("http://127.0.0.1:1", "ws://127.0.0.1:1", "");
+    let received = 0;
+    client.onTokenDetected(() => {
+      received++;
+    });
+    const healthAntes = client.getHealth();
+    assert.equal(healthAntes.eventCount, 0);
+    assert.equal(received, 0, "nada foi entregue sem evento real");
+    client.disconnect();
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

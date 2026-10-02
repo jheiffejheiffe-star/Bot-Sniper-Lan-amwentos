@@ -165,8 +165,40 @@ app.use((req, res, next) => {
 });
 
 // Essential Cloud Run health check and liveness endpoints
+/**
+ * Cliente de detecção (WebSocket RPC) acessível fora do escopo de inicialização.
+ *
+ * Motivo: sem isso, `/api/health` não tinha como dizer se a DETECÇÃO está de pé — e o painel
+ * exibia "connected" mesmo com o WebSocket inoperante. Um bot cego que se declara saudável é
+ * pior do que um bot que diz "não estou vendo lançamentos".
+ */
+let geyserClientRef: GeyserStreamClient | null = null;
+
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", uptime: process.uptime(), runtimeMode: getRuntimeModeResolution().mode });
+  const detection = geyserClientRef?.getHealth() ?? null;
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    runtimeMode: getRuntimeModeResolution().mode,
+    /**
+     * Estado REAL da detecção. `null` significa "o pipeline de detecção ainda não foi
+     * inicializado" — que é diferente de "conectado" e diferente de "quebrado".
+     */
+    detection: detection
+      ? {
+          connected: detection.connected,
+          subscriptions: detection.subscriptions,
+          degraded: detection.degraded,
+          eventCount: detection.eventCount,
+          lastEventAt: detection.lastEventAt,
+          sinceLastEventMs: detection.sinceLastEventMs,
+          recentErrors: detection.recentErrors,
+        }
+      : null,
+    detectionNote:
+      "connected=true apenas indica que as subscrições de logs foram ACEITAS pelo RPC. " +
+      "A prova de que a detecção funciona é `eventCount` crescendo — não o log de boot.",
+  });
 });
 
 /**
@@ -3983,8 +4015,27 @@ async function startServer() {
           console.error("[Autonomous Daemon] Pipeline execution error:", err.message);
         });
       });
+      geyserClientRef = geyserClient;
       await geyserClient.connect();
-      console.log("[HFT Engine] Yellowstone Geyser stream pipeline connected.");
+      // O log anterior ("Yellowstone Geyser stream pipeline connected.") era impresso sem
+      // verificar nada: `connect()` apenas anexa listeners. Se o RPC recusa o WebSocket, o
+      // operador lia "connected" com o bot cego. Agora imprimimos o estado do cliente.
+      {
+        const h = geyserClient.getHealth();
+        if (h.connected && h.subscriptionsRequested > 0) {
+          console.log(
+            `[HFT Engine] Detecção armada: socket WS aberto, ${h.subscriptionsRequested} ` +
+              `subscrição(ões) registrada(s) localmente. Isto NÃO prova que o RPC aceitou os ` +
+              `filtros nem que eventos chegam — a prova é eventCount > 0 (GET /api/health).`
+          );
+        } else {
+          console.error(
+            `[HFT Engine] Detecção DESARMADA: socket WS ${h.socketOpen ? "aberto" : "NÃO conectado"}, ` +
+              `${h.subscriptionsRequested} subscrição(ões) registrada(s). Nenhum lançamento será ` +
+              `detectado até que RPC_WEBSOCKET responda. GET /api/health → detection.degraded = true.`
+          );
+        }
+      }
     } catch (err: any) {
       console.log("[HFT Engine] Real infrastructure setup skipped or offline. Running simulation fallback mode.", err.message);
     }

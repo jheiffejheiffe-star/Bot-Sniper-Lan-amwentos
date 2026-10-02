@@ -450,7 +450,7 @@ para que ninguém "simplifique" a ordem depois.
 
 ```
 npx tsc --noEmit                  → limpo
-npm run test                      → 44/44 (grupos [1]6 [2]3 [3]5 [4]9 [5]3 [6]1 [7]7 [8]2 [9]8)
+npm run test                      → 47/47 (grupos [1]6 [2]3 [3]5 [4]9 [5]3 [6]1 [7]7 [8]2 [9]8 [10]3)
 boot com LIVE_TRADING_ENABLED=true e sem RUNTIME_MODE  → exit 1 (fatal declarado)
 boot com RUNTIME_MODE=LIVE sem chave/token/RPC https   → exit 1 (três fatais listados)
 npm run dev (HFT_BIND_HOST=0.0.0.0) → aviso de bind exposto sem token, servidor sobe
@@ -478,3 +478,55 @@ uma tabela em que quatro estratégias superavam.
 - Os endpoints fabricados (`/api/hft-telemetry`, `/api/predictive-score`, `/api/geyser-stream`,
   `/api/simulate-snipe`, `/api/simulate-fork`, `/api/jito-tips`, `/api/submit-bundle`, `/metrics`)
   **continuam existindo** com RNG. O modo PAPER não os torna verdadeiros.
+
+
+### Complemento do Adendo 3 — C30 e C31 (medidos com o servidor rodando)
+
+**C30 — reconexão de WebSocket sem backoff: 1 tentativa por segundo, para sempre.** O web3.js
+1.98.4 instancia o cliente WS com `max_reconnects: Infinity` e `reconnect_interval: 1000`
+(constantes internas do `rpc-websockets` 9.3.9). Com o endpoint inacessível — situação medida no
+sandbox e igual à de qualquer VPS com egress bloqueado ou RPC fora do ar — o log do servidor
+mostrava **20 falhas em 20 s (1/s), indefinidamente**: ~3.600 tentativas TLS por hora contra o
+provedor (caminho direto para rate-limit e banimento da chave) e log crescendo sem limite, que é
+como um operador deixa de ler os avisos do sistema.
+
+Correção: o patch já existente de `_wsOnError` passou a aplicar **backoff progressivo** no próprio
+cliente (`setReconnectInterval`, API pública do `rpc-websockets`): 1s → 2s → 4s → 8s → 16s → 32s →
+60s (teto), voltando ao base no primeiro `open`. O log passou a ser **uma linha por estado** (com
+contador de falhas e próximo atraso), não uma por tentativa; o handler original do web3.js, que
+imprime a cada tentativa, deixa de ser chamado (o único efeito colateral dele —
+`_rpcWebSocketConnected = false` — é reproduzido). `wsBackoffDelayMs()` é exportado e testado
+(grupo `[10]`): monotônico, dentro do teto, e 60 falhas consecutivas passam a ocupar > 1 minuto de
+tempo real em vez de 60 s de tentativas.
+
+**C31 — "conectado" era um número local, não uma conexão.** `GeyserStreamClient.connected` era
+`activeSubscriptions.length > 0`, e o web3.js atribui o **ID da subscrição localmente** no momento
+em que `onLogs()` é chamado — antes do socket abrir e sem confirmação alguma do RPC. Resultado: o
+boot imprimia `Yellowstone Geyser stream pipeline connected.` e o painel mostrava detecção ativa com
+o WebSocket inoperante. Um bot cego que se declara saudável é pior do que um bot que diz que não
+está vendo nada.
+
+Correção: `getHealth()` passa a expor `socketOpen` (bit real `_rpcWebSocketConnected`, setado em
+`_wsOnOpen`), `subscriptionsRequested` (ids locais, explicitamente **não** confirmação) e
+`eventCount` (a única prova de detecção), com `degraded` derivado do socket; `/api/health` publica
+esse bloco com a nota de interpretação; o log de boot passou a declarar o estado real
+(`Detecção armada: socket WS aberto, N subscrição(ões) registrada(s) localmente…` ou
+`Detecção DESARMADA…`).
+
+**Correção acoplada — `disconnect()` deixava o processo preso.** O encerramento removia os
+listeners mas não desligava o auto-reconectar do cliente WS, de modo que o event loop nunca
+esvaziava. Descoberto porque a suíte de testes passou a **não terminar** (timeout de 10 min) ao
+exercitar o cliente contra um endpoint local inacessível. Agora `disconnect()` chama
+`setAutoReconnect(false)`, limpa o timer pendente e fecha o socket — comportamento correto para
+qualquer shutdown gracioso, não só para o teste.
+
+Evidência antes/depois (mesmo cenário, endpoint inacessível):
+
+```
+ANTES: 20 linhas "ws error" em 20 s, contínuas, sem teto   (~3600 tentativas/hora)
+DEPOIS: 1 linha informativa na 1ª falha; tentativas em 1s, 2s, 4s … 60s (~60 tentativas/hora no teto)
+```
+
+O que isso **não** resolve: com o WebSocket fora, não há detecção de lançamentos por nenhum
+caminho alternativo — o sistema segue cego e agora **diz isso** em `/api/health`. O caminho para
+latência competitiva continua sendo o canal gRPC (Yellowstone), ainda não implementado.

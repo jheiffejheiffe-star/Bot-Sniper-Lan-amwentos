@@ -55,22 +55,114 @@ dotenv.config();
 // health-check explícito em GeyserStreamClient.getHealth(), porque suprimir reconexão
 // sem monitorar significa WebSocket morto em silêncio.
 const originalWsOnError = (Connection.prototype as any)._wsOnError;
+const originalWsOnOpen = (Connection.prototype as any)._wsOnOpen;
+
+/** Intervalo base de reconexão do cliente WS (o mesmo default do web3.js/rpc-websockets). */
+export const WS_BASE_RECONNECT_MS = 1_000;
+/** Teto do backoff. Um minuto entre tentativas é agressivo o bastante para não derrubar a cota. */
+export const WS_MAX_RECONNECT_MS = 60_000;
+/** Silêncio mínimo entre linhas de log da MESMA falha (evita inundação de log). */
+const WS_LOG_THROTTLE_MS = 30_000;
+
+/**
+ * Atraso da próxima reconexão após `consecutive` falhas consecutivas.
+ *
+ * EXPORTADO e determinístico de propósito: é uma decisão operacional (quantas tentativas por
+ * minuto o seu provedor de RPC recebe) e precisa ser testável sem rede.
+ *
+ * Sem jitter porque este processo mantém UMA conexão WS (os quatro programas de lançamento
+ * compartilham o mesmo socket). Jitter existe para descorrelacionar MUITOS clientes; aqui ele
+ * só tornaria o comportamento não determinístico. Se um dia houver N conexões, somar jitter
+ * passa a ser necessário.
+ */
+export function wsBackoffDelayMs(consecutive: number): number {
+  if (consecutive <= 1) return WS_BASE_RECONNECT_MS;
+  // 1s → 2s → 4s → 8s → 16s → 32s → 60s (teto)
+  const exp = Math.min(consecutive - 1, 6);
+  return Math.min(WS_BASE_RECONNECT_MS * 2 ** exp, WS_MAX_RECONNECT_MS);
+}
+
+interface WsFailureState {
+  consecutive: number;
+  lastLogAt: number;
+}
+
+const wsFailureStates = new WeakMap<object, WsFailureState>();
+
+function isRateLimitMessage(msg: string): boolean {
+  return msg.includes("429") || msg.includes("Unexpected server response: 429") || msg.includes("Too Many Requests");
+}
+
 if (typeof originalWsOnError === "function") {
   (Connection.prototype as any)._wsOnError = function (err: any) {
     this._rpcWebSocketConnected = false;
+
+    const ws = this._rpcWebSocket;
     const msg = err?.message || String(err || "");
-    if (msg.includes("429") || msg.includes("Unexpected server response: 429") || msg.includes("Too Many Requests")) {
-      console.warn(`[Solana RPC WS] Endpoint público rate-limited (HTTP 429). Fast failover ativo para evitar reconnect storm.`);
-      if (this._rpcWebSocket) {
-        this._rpcWebSocket.reconnect = false;
-        if (this._rpcWebSocket.reconnect_timer_id) {
-          clearTimeout(this._rpcWebSocket.reconnect_timer_id);
-          this._rpcWebSocket.reconnect_timer_id = undefined;
+
+    // Rate limit (HTTP 429): NÃO reconectar. Insistir em 429 é o caminho mais rápido para o
+    // provedor bloquear a chave. O failover de RPC (camada HTTP) decide o próximo host.
+    if (isRateLimitMessage(msg)) {
+      console.warn(
+        `[Solana RPC WS] Endpoint rate-limited (HTTP 429). Reconexão WS suspensa neste host ` +
+          `para não amplificar o bloqueio; o failover HTTP assume.`
+      );
+      if (ws) {
+        ws.reconnect = false;
+        if (ws.reconnect_timer_id) {
+          clearTimeout(ws.reconnect_timer_id);
+          ws.reconnect_timer_id = undefined;
         }
       }
       return;
     }
-    originalWsOnError.call(this, err);
+
+    const state = wsFailureStates.get(this) ?? { consecutive: 0, lastLogAt: 0 };
+    state.consecutive++;
+    wsFailureStates.set(this, state);
+
+    /**
+     * BACKOFF PROGRESSIVO — correção de auditoria (2026-10-02).
+     *
+     * MEDIDO: com `max_reconnects: Infinity` e `reconnect_interval: 1000` (defaults internos do
+     * web3.js 1.98.4 / rpc-websockets 9.3.9), uma conexão que nunca abre tentava reconectar
+     * **1x por segundo, para sempre** — 20 falhas em 20 s no teste com host inacessível. Isso
+     * gera 3600 tentativas TLS/hora contra o provedor (caminho direto para rate-limit/ban) e
+     * enche o log até o operador parar de ler. Agora o intervalo cresce 1s → 2s → 4s … 60s e
+     * volta ao base no primeiro `open`.
+     */
+    const delay = wsBackoffDelayMs(state.consecutive);
+    if (ws && typeof ws.setReconnectInterval === "function") {
+      ws.setReconnectInterval(delay);
+    }
+
+    const now = Date.now();
+    if (state.consecutive === 1 || now - state.lastLogAt > WS_LOG_THROTTLE_MS) {
+      state.lastLogAt = now;
+      // Não chamamos o handler original: ele imprime `ws error:` a CADA tentativa. Reproduzimos
+      // apenas o efeito de estado (`_rpcWebSocketConnected = false`, já feito acima) e logamos
+      // uma linha informativa, com o número de falhas e o próximo atraso.
+      console.warn(
+        `[Solana RPC WS] Falha de conexão (${state.consecutive}ª consecutiva): ${msg}. ` +
+          `Próxima tentativa em ${delay}ms (backoff progressivo; teto ${WS_MAX_RECONNECT_MS}ms). ` +
+          `Detecção de lançamentos está DEGRADADA enquanto isso.`
+      );
+    }
+  };
+}
+
+if (typeof originalWsOnOpen === "function") {
+  (Connection.prototype as any)._wsOnOpen = function () {
+    const state = wsFailureStates.get(this);
+    if (state && state.consecutive > 0) {
+      console.log(`[Solana RPC WS] Conexão restabelecida após ${state.consecutive} falha(s) consecutiva(s).`);
+      wsFailureStates.set(this, { consecutive: 0, lastLogAt: 0 });
+      const ws = this._rpcWebSocket;
+      if (ws && typeof ws.setReconnectInterval === "function") {
+        ws.setReconnectInterval(WS_BASE_RECONNECT_MS);
+      }
+    }
+    return originalWsOnOpen.call(this);
   };
 }
 
@@ -432,19 +524,50 @@ export class GeyserStreamClient {
    * Health-check explícito de ingestão. Sem isso, a supressão de reconexão do
    * WebSocket pode deixar o listener morto por horas sem que ninguém perceba.
    */
+  /**
+   * Estado REAL da detecção.
+   *
+   * CORREÇÃO 2026-10-02: `connected` era `activeSubscriptions.length > 0`, e esse número é
+   * atribuído **localmente** pelo web3.js no momento em que `onLogs()` é chamado — antes de o
+   * socket abrir e sem nenhuma confirmação do RPC. Ou seja: o painel exibia "connected" com o
+   * WebSocket inoperante. Aqui passamos a ler o bit de conexão do próprio cliente
+   * (`_rpcWebSocketConnected`, setado em `_wsOnOpen` e limpo em erro/close) e a declarar a
+   * diferença entre "subscrição pedida" e "evento recebido".
+   *
+   * Limitação declarada: nem `_rpcWebSocketConnected` nem a lista de subscrições provam que o
+   * RPC ACEITOU o filtro. A única prova é `eventCount` crescer.
+   */
   public getHealth() {
     const sinceLastEventMs = this.lastEventAt ? Date.now() - this.lastEventAt : null;
+    const socketOpen = (this.connection as any)._rpcWebSocketConnected === true;
     return {
-      connected: this.connected,
+      /** Socket WS de fato conectado (não confundir com "subscrições pedidas"). */
+      socketOpen,
+      connected: socketOpen && this.activeSubscriptions.length > 0,
+      /** IDs de subscrição atribuídos LOCALMENTE — não são confirmação do RPC. */
+      subscriptionsRequested: this.activeSubscriptions.length,
       subscriptions: this.activeSubscriptions.length,
+      /** Prova de que a detecção funciona: eventos recebidos. 0 = nenhum lançamento visto. */
       eventCount: this.eventCount,
       lastEventAt: this.lastEventAt || null,
       sinceLastEventMs,
-      degraded: !this.connected || this.activeSubscriptions.length === 0,
+      degraded: !socketOpen || this.activeSubscriptions.length === 0,
+      note:
+        "socketOpen=true significa socket estabelecido. subscriptionsRequested NÃO é confirmação " +
+        "do RPC. A prova de detecção é eventCount > 0.",
       recentErrors: this.subscriptionErrors.slice(-5),
     };
   }
 
+  /**
+   * Encerra a detecção.
+   *
+   * CORREÇÃO 2026-10-02: a versão anterior só removia os listeners. O cliente WS interno do
+   * web3.js continua com `reconnect: true` e `max_reconnects: Infinity`, isto é, segue tentando
+   * reconectar para sempre — o processo não consegue encerrar (event loop preso) e um shutdown
+   * gracioso vira uma tempestade de reconexão. Aqui desligamos o auto-reconectar ANTES de
+   * fechar o socket.
+   */
   public disconnect(): void {
     this.activeSubscriptions.forEach((sub) => {
       try {
@@ -454,6 +577,21 @@ export class GeyserStreamClient {
       }
     });
     this.activeSubscriptions = [];
+
+    const ws = (this.connection as any)._rpcWebSocket;
+    if (ws) {
+      try {
+        if (typeof ws.setAutoReconnect === "function") ws.setAutoReconnect(false);
+        if (ws.reconnect_timer_id) {
+          clearTimeout(ws.reconnect_timer_id);
+          ws.reconnect_timer_id = undefined;
+        }
+        if (typeof ws.close === "function") ws.close();
+      } catch {
+        /* encerramento best-effort: nunca lançar de dentro de cleanup */
+      }
+    }
+
     this.connected = false;
   }
 }
