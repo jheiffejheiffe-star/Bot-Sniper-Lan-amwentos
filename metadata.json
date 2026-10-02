@@ -1,0 +1,8 @@
+{
+  "name": "Solana HFT Sniper Monitor",
+  "description": "A high-performance Solana trading dashboard, HFT latency tracker, and automatic sniper console.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
