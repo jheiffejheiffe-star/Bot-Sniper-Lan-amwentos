@@ -74,6 +74,13 @@ export interface RecordedAssessment {
   entryPriceSource: string | null;
   /** Custos estimados naquele instante, para o replay recalcular break-even. */
   estimatedCostsBps: number | null;
+  /**
+   * Tempo MEDIDO do filtro profundo e o orçamento vigente (S5). Sem estes dois números,
+   * "por que não entrei nesse lançamento" vira arqueologia: o registro mostra se o sinal
+   * foi reprovado por evidência ou por estouro de orçamento.
+   */
+  deepFilterMs?: number | null;
+  deepFilterBudgetMs?: number | null;
 }
 
 export interface RecordedPriceObservation {

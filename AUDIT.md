@@ -979,3 +979,141 @@ GET /api/system-truth     → 4 fontes reais + 9 painéis simulados declarados
   inacessível, o gerenciador repete `getParsedAccountInfo ... fetch failed` a cada ~3s. É a
   tentativa de cotação do preço, que falha honestamente — mas em produção, com RPC instável,
   vale considerar backoff por posição para não gastar cota de RPC.
+
+---
+
+## Adendo 8 (2026-10-02) — S5: correções do caminho quente + instrumentação (SEM assinar/enviar)
+
+Autorização 6. Escopo executado: o **caminho quente** — tudo o que acontece entre a notificação
+de lançamento e a decisão de entrar — mais a instrumentação necessária para medir o que antes era
+invisível. **Nada foi assinado, nada foi enviado, nenhuma chave real foi usada**; o processo rodou
+em PAPER e nenhuma linha nova chama `signTransaction`/`sendRawTransaction`.
+
+### 1. Diagnóstico que originou o S5 (medido no código, não em suposição)
+
+| # | Defeito | Efeito real |
+|---|---|---|
+| 1 | `getSlot("processed")` **por evento**, só para estimar atraso | 1 RTT pago em TODA decisão, para produzir um número que é estimativa |
+| 2 | `getTransaction` com resultado `null` → `return` + log | **lançamento perdido em silêncio**; taxa de perda não existia em número nenhum |
+| 3 | `logs.slot` lido via `as any` (campo inexistente) | slot do evento sempre `null`; qualquer métrica de arrasto era impossível |
+| 4 | Nenhum dedupe de notificação | WebSocket que reconecta reentrega → **segunda auditoria** (e, em modo real, segunda compra) |
+| 5 | Nenhuma trava por mint | Dois matchers do MESMO mint (ex.: pool Raydium anunciado em dois logs) → duas decisões paralelas |
+| 6 | `submitViaRpc` usava defaults do SDK (`skipPreflight:false`, `maxRetries:3`) | preflight pago em corrida + retry cego do RPC (inobservável, não interrompível) |
+| 7 | `"CO-LOCATED (SHREDSTREAM ACTIVE)"`, throughput/carga/canais com `Math.random()` | painel afirmava infraestrutura inexistente |
+| 8 | Nós RPC com latência **constante por região** (12/19/45/124ms) e um nó `rpc-bare-metal-shred` que não existe | failover "decidido" por números fabricados |
+
+### 2. O que mudou
+
+**`src/hotPath.ts` (novo, funções puras — testável sem rede)**
+- `SeenLaunchSignatures` — dedupe por assinatura com TTL (120 s) e teto (5 000 entradas: o TTL de
+  uma assinatura é irrelevante na prática — ela é única —, mas o teto impede crescimento de memória).
+- `InFlightMints` — trava por mint: segundo sinal do mesmo mint é recusado enquanto há decisão em voo.
+- `resolveSendOptions` — política de envio explícita: `maxRetries` default **0** (retry é da política
+  de EVIDÊNCIA do S4, que reenvia os MESMOS bytes; o RPC repetindo por conta própria é inobservável),
+  `skipPreflight` só quando o chamador declara `preSimulated: true`.
+- `decideEntryWithBudget` — matriz de decisão do orçamento do filtro profundo, agora com **duas causas
+  distintas de incompletude**: `budget` (filtro lento, há dado parcial → LIVE veta, PAPER/SHADOW
+  prossegue marcado `unvetted`) e `audit-error` (filtro FALHOU, não há dado nenhum → **bloqueia em
+  qualquer modo**: prosseguir sem nenhum dado não é "entrar sem auditar", é comprar às cegas).
+- `HotPathStats` — contadores do caminho quente.
+
+**`src/realExecution.ts` (`GeyserStreamClient`)**
+- Callback do `onLogs` corrigido para `(logs, context)` — contrato **verificado no código do
+  `@solana/web3.js`** (`_wsOnLogsNotification` → `_handleServerNotification(sub, [value, context])`,
+  `lib/index.cjs.js` ~8656–8684): `context.slot` é o slot da notificação e agora é usado; `logs.slot`
+  (que não existe) foi removido. **Um RTT por evento eliminado.**
+- Dedupe por assinatura **antes** de qualquer RTT.
+- Enriquecimento com até 3 tentativas em `confirmed` + 80 ms de espera, e a perda contada em
+  `enrichmentFailures` (fim do abandono silencioso). **Limite estrutural documentado no código:**
+  `getTransaction` não aceita `processed` (tipo `Finality` do SDK + doc da RPC) — a espera até
+  `confirmed` NÃO tem solução por retry; quem elimina é `transactionSubscribe` (gRPC), S7.
+- `refreshLocalSlotInBackground()` — no máximo 1 `getSlot` a cada 2 s, com 1 em voo (nunca enfileira);
+  o evento usa a última amostra conhecida ou `null`.
+- `submitViaRpc` passa a usar `resolveSendOptions` (devolve `rationale` junto com a assinatura).
+- `getHealth()` expõe `hotPath` (eventos, duplicatas, retries, falhas, idade da amostra de slot).
+
+**`server.ts`**
+- **Gate rápido** (custo zero, antes de qualquer rede): `isValidPubkey` + trava por mint + contagem
+  de sinal; duplicata é logada com o motivo, não descartada em silêncio.
+- **Orçamento do filtro profundo** (`HFT_DEEP_FILTER_BUDGET_MS`, default 900 ms) medido por sinal e
+  aplicado pela matriz; a **falha do filtro passa pela MESMA política** (`incompleteCause: "audit-error"`).
+- Estágio de latência **`gate_ok`** (received → gate_ok → enriched): mede o overhead do próprio
+  processo, que é a parte otimizável sem comprar infraestrutura. **Não** foi criado estágio
+  `notified`: não existe canal de notificação ao operador no caminho quente (a UI faz polling);
+  instrumentar um passo inexistente seria medição fabricada.
+- `/api/system-truth` → `hotPath` com `deepFilterBudgetMs`, `inFlightMints`, contadores e a
+  **política de envio vigente** (`sendPolicy`), para o operador não descobrir os defaults no dia do
+  incidente. A nota do bloco explica o que cada contador significa **hoje** (incluindo
+  `unvettedEntries` estar sempre 0 enquanto o filtro for tudo-ou-nada).
+- **C40 (fabricações) corrigidas**: `/api/geyser-stream` deixou de afirmar co-localização/stream de
+  shreds e de publicar throughput/carga/canais aleatórios — devolve `measured` (uptime, RSS, versão
+  do Node), `declared` (o que só o OPERADOR sabe: onde o host está) e `unmeasured` (o que não é
+  medido). Os dois logs de auto-recovery que anunciavam "shredstream connections" e "pool de
+  blockhash" passaram a descrever o que o código faz. Os nós RPC deixaram de ter latência constante
+  por região e o nó fabricado `rpc-bare-metal-shred` foi removido; quem não tem medição aparece como
+  `metricsSource: "unavailable"` e a UI mostra **SEM MEDIÇÃO** em vez do selo SHREDSTREAM que só
+  existia para um id inexistente.
+
+**`src/telemetry.ts`** — estágio `gate_ok` em `LATENCY_STAGES` (com o comentário explicando por que
+`notified` não existe).
+
+**`src/eventRecorder.ts`** — `RecordedAssessment` ganhou `deepFilterMs` e `deepFilterBudgetMs`
+(opcionais): sem esses dois números, "por que não entrei nesse lançamento" vira arqueologia.
+
+### 3. Achado de correção: a regra fail-closed era código MORTO
+
+O `catch` de `fetchRealOnChainTokenData` fazia `return` cedo, então `decideEntryWithBudget` só era
+chamada com `deepComplete = true` — as linhas "LIVE + filtro incompleto = veta" **nunca executavam**.
+Existia a política escrita e não existia a proteção. Agora a falha roteia pela política, o veto
+`audit-error` é alcançável e contado (`deepFilterFailures`), e o teste de regressão lê o fonte para
+garantir que o `catch` volte a consultar a política se alguém "simplificar" isso no futuro.
+
+Também corrigido: `liveVetoesByBudget` era incrementado em **reprovação por veredito** (filtro
+funcionando), não só em veto por fail-closed — o rótulo mentia no diagnóstico. Agora há
+`rejectedByVerdict` separado.
+
+E dois **vazamentos da trava por mint** encontrados na revisão (caminho "execução bloqueada por
+kill switch/read-only" e caminho LIVE sem entrada implementada): sem o `release`, o mint ficaria
+bloqueado para sempre — a trava viraria negação de serviço contra o próprio bot. O teste de
+regressão agora exige `release` em todos os caminhos de saída.
+
+### 4. Testes (grupo [16], +11)
+
+Dedupe com TTL e com teto de memória; trava por mint (aquisição, recusa, liberação); matriz de
+envio (default, `preSimulated`, `forcePreflight`, override absurdo); matriz do orçamento
+(completo/aprovado, completo/reprovado — reprovação não se contorna nem em PAPER —, incompleto/LIVE,
+incompleto/PAPER+SHADOW marcado, `audit-error` bloqueando em QUALQUER modo); estágio `gate_ok` e
+ordem dos estágios; e três testes de **regressão sobre o FONTE** (o callback precisa usar
+`context.slot`; `getSlot` não pode voltar ao caminho do evento; `resolveSendOptions` precisa ser
+usado; nenhuma string de infraestrutura fabricada pode reaparecer; todos os caminhos de saída
+precisam liberar o mint; o `catch` precisa consultar a política).
+
+### 5. Estado verificado nesta rodada
+
+```
+npm run lint              → exit 0
+npm run test              → 97/97 (grupo [16]: 11 testes novos)
+npm run build             → ok (dist/server.cjs 314.5 kb)
+npm start (produção)      → boot PAPER, bind 0.0.0.0:3000, UI + API ok
+GET /api/system-truth     → hotPath: deepFilterBudgetMs=900, inFlightMints=0, contadores zerados,
+                            sendPolicy { skipPreflight: true, maxRetries: 0, preflightCommitment: "processed" }
+npm run smoke -- --quick  → 13 estágios, 3 falhas de REDE declaradas (sandbox sem egress)
+```
+
+### 6. O que continua NÃO verificado / aberto
+
+- **O orçamento hoje só MEDE e VETA; não aborta.** Não há deadline real (`Promise.race`) porque
+  `fetchRealOnChainTokenData` é tudo-ou-nada: abortar no meio não produziria dado parcial para
+  decidir. Quando o caminho passar a ter dado parcial (S7/gRPC), o deadline real passa a fazer
+  sentido — e aí a linha "incompleto + PAPER prossegue" deixa de ser política e passa a ser caminho
+  exercitado. Hoje `unvettedEntries` fica em 0, e o endpoint declara isso.
+- **Nada disso foi exercitado com rede real neste sandbox** (sem egress): o dedupe, o
+  enriquecimento e o gate só têm teste unitário e leitura de código; a evidência de campo depende do
+  SEU ambiente.
+- **Caminho de ENTRADA on-chain continua não implementado** (`LaunchSwapper` → `NATIVE_BUILDER_DISABLED`).
+  O S5 arrumou o caminho quente, não criou a compra.
+- **Custo real do filtro profundo ainda não medido** (DexScreener + RPCs inacessíveis aqui): o
+  default de 900 ms é ponto de partida, não valor calibrado — calibrar com o p95 do seu PAPER.
+- Pendências que continuam no roadmap: S6 (entrada real por IDL, com canary de 0,01 SOL — **exige
+  autorização**), S7 (gRPC Yellowstone A/B vs WSS), S8 (envio paralelo Jito/staked), S9 (filtro com
+  rótulos), S10 (Postgres/multi-processo/guarda on-chain), S11 (ShredStream), S12 (Rust).

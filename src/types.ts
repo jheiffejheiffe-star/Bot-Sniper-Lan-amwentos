@@ -12,6 +12,14 @@ export interface RpcNode {
   url?: string;
   blockhashCacheAge?: number;
   reconnectionCount?: number;
+  /**
+   * Procedência dos números deste nó. `unavailable` = nenhuma medição de RTT válida
+   * (URL placeholder ou todas as sondagens falharam) — a UI NÃO pode exibir latência,
+   * porque não existe. `partial` = há medição real, mas campos não observáveis via RPC
+   * (ex.: `load`) ficam zerados de propósito.
+   */
+  metricsSource?: 'real' | 'partial' | 'unavailable';
+  shredStream?: 'active' | 'inactive';
 }
 
 export interface SnipedTransaction {

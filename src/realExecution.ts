@@ -32,6 +32,7 @@ import {
 } from "./jitoStatus.js";
 import { BASE_FEE_LAMPORTS, clampTipSol, type CostBreakdown, emptyCosts } from "./accounting.js";
 import { assertCanSign, type OperationPurpose } from "./runtimeMode.js";
+import { SeenLaunchSignatures, resolveSendOptions, type SendOptionsInput } from "./hotPath.js";
 
 dotenv.config();
 
@@ -369,6 +370,23 @@ export class GeyserStreamClient {
   private activeSubscriptions: number[] = [];
   private lastEventAt: number = 0;
   private eventCount: number = 0;
+  /**
+   * DEDUPE DE NOTIFICAÇÃO (S5). Um WebSocket que reconecta reentrega o que perdeu, e o
+   * `logsSubscribe` não promete entrega única. Sem isso, a MESMA criação de pool entra
+   * duas vezes no pipeline — duas auditorias e, em modo real, duas compras.
+   */
+  private seenSignatures = new SeenLaunchSignatures(120_000, 5_000);
+  private duplicatesDropped = 0;
+  private enrichmentRetries = 0;
+  private enrichmentFailures = 0;
+  /**
+   * Último slot local conhecido, atualizado FORA do caminho quente (no máximo 1x/2s).
+   * Antes, cada evento pagava um `getSlot` para estimar atraso; agora o arrasto é
+   * calculado com esta amostra, sem custo por evento.
+   */
+  private lastLocalSlot: number | null = null;
+  private lastLocalSlotAt = 0;
+  private slotRefreshInFlight = false;
   private subscriptionErrors: string[] = [];
   private connected: boolean = false;
 
@@ -425,7 +443,7 @@ export class GeyserStreamClient {
         const programId = new PublicKey(program.id);
         const subId = this.connection.onLogs(
           programId,
-          (logs) => {
+          (logs, context) => {
             if (logs.err) return;
             const matchers = program.hints;
             // Raydium sinaliza o pool via log "initialize2" (o ID do programa não
@@ -434,10 +452,24 @@ export class GeyserStreamClient {
               logs.logs.some((line) => line.includes(hint))
             );
             if (!matched) return;
-            // `Logs` do web3.js não tipa `slot`, mas o objeto entregue pelo RPC o inclui.
-            // Acessamos com fallback null: se não vier, a estimativa de atraso fica null
-            // em vez de ser inventada.
-            const eventSlot = typeof (logs as any).slot === "number" ? (logs as any).slot : null;
+
+            /**
+             * DEDUPE antes de qualquer RTT. Verificado no código do web3.js
+             * (`_wsOnLogsNotification` → `_handleServerNotification(sub, [value, context])`):
+             * o callback recebe DOIS argumentos, e `context.slot` é o slot da notificação.
+             * O código anterior procurava `logs.slot` (que não existe) e depois pagava um
+             * `getSlot("processed")` por evento só para estimar atraso — um RTT inteiro
+             * jogado fora no caminho quente. Agora o slot vem de graça.
+             */
+            const eventSlot = typeof context?.slot === "number" ? context.slot : null;
+
+            if (!this.seenSignatures.firstSight(logs.signature)) {
+              // Reentrega da mesma notificação (reconexão/duplicata do RPC). Processar de
+              // novo significaria segunda auditoria — e em modo real, segunda compra.
+              this.duplicatesDropped++;
+              return;
+            }
+
             void this.handleLaunch(program.name, program.id, logs.signature, eventSlot);
           },
           "processed"
@@ -474,12 +506,46 @@ export class GeyserStreamClient {
   ): Promise<void> {
     const detectedAt = Date.now();
     try {
-      const tx = await this.connection.getTransaction(signature, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0
-      });
+      /**
+       * ENRIQUECIMENTO — o gargalo estrutural deste caminho, agora declarado e contado.
+       *
+       * FATO VERIFICADO (`@solana/web3.js` tipa `Finality = "confirmed" | "finalized"`; a
+       * doc da RPC confirma): **`getTransaction` NÃO aceita `processed`**. A notificação
+       * chega em `processed`, mas para ler o corpo da transação é obrigatório esperar
+       * `confirmed` — ou seja, existe um atraso intrínseco entre detectar e enriquecer que
+       * NENHUMA quantidade de retry resolve.
+       *
+       * O que dava para corrigir e foi corrigido:
+       *   1. o código ANTIGO abandonava o lançamento quando o `getTransaction` devolvia
+       *      `null` ("getTransaction retornou null") — perda silenciosa de oportunidade;
+       *   2. agora há repetição limitada com espera curta (o caso comum é o nó ainda não
+       *      ter indexado a transação) e, se ainda falhar, a perda é CONTADA
+       *      (`enrichmentFailures`), visível no health — não mais um log que ninguém lê.
+       *
+       * A forma de ELIMINAR essa espera é assinar `transactionSubscribe` via gRPC
+       * (Yellowstone), que entrega transação + meta no nível `processed`. Isso é S7, e
+       * este comentário é o motivo medido para fazê-lo.
+       */
+      let tx: Awaited<ReturnType<Connection["getTransaction"]>> = null;
+      const maxAttempts = 3;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        tx = await this.connection.getTransaction(signature, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 0
+        });
+        if (tx) break;
+        if (attempt < maxAttempts - 1) {
+          this.enrichmentRetries++;
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+      }
+
       if (!tx) {
-        this.subscriptionErrors.push(`getTransaction retornou null para ${signature}`);
+        this.enrichmentFailures++;
+        this.subscriptionErrors.push(
+          `getTransaction retornou null para ${signature} após ${maxAttempts} tentativas em "confirmed" ` +
+            `(lançamento PERDIDO — contabilizado em enrichmentFailures)`
+        );
         return;
       }
 
@@ -494,15 +560,17 @@ export class GeyserStreamClient {
       this.lastEventAt = Date.now();
       this.eventCount++;
 
-      // Slot local: usado apenas para ESTIMAR atraso relativo à cadeia. Se a consulta
-      // falhar, reportamos null em vez de inventar — um atraso desconhecido é informação
-      // melhor do que um atraso errado.
-      let receivedSlot: number | null = null;
-      try {
-        receivedSlot = await this.connection.getSlot("processed");
-      } catch {
-        receivedSlot = null;
-      }
+      /**
+       * SLOT LOCAL — fora do caminho quente.
+       *
+       * Antes: `await getSlot("processed")` por evento, só para estimar atraso. Isso
+       * adicionava um RTT à latência de decisão de TODO lançamento para produzir um número
+       * que é estimativa, não medição. Agora a amostra é atualizada em segundo plano no
+       * máximo 1x/2s e o evento usa o último valor conhecido (`null` se não houver
+       * amostra — desconhecido é melhor que errado).
+       */
+      this.refreshLocalSlotInBackground();
+      const receivedSlot: number | null = this.lastLocalSlot;
 
       const slotLagEstimateMs =
         eventSlot !== null && receivedSlot !== null && receivedSlot >= eventSlot
@@ -529,6 +597,30 @@ export class GeyserStreamClient {
     } catch (err: any) {
       this.subscriptionErrors.push(`Erro ao processar ${signature}: ${err.message}`);
     }
+  }
+
+  /**
+   * Atualiza o slot local SEM bloquear o caminho quente.
+   *
+   * Limite de 1 consulta a cada 2s e uma única consulta em voo: um RPC lento não pode
+   * gerar acúmulo de chamadas quando chegam vários eventos na mesma janela.
+   */
+  private refreshLocalSlotInBackground(): void {
+    const now = Date.now();
+    if (this.slotRefreshInFlight || now - this.lastLocalSlotAt < 2000) return;
+    this.slotRefreshInFlight = true;
+    this.lastLocalSlotAt = now;
+    void this.connection
+      .getSlot("processed")
+      .then((slot) => {
+        this.lastLocalSlot = slot;
+      })
+      .catch(() => {
+        // Amostra não atualizada: mantemos a anterior. Nada é inventado.
+      })
+      .finally(() => {
+        this.slotRefreshInFlight = false;
+      });
   }
 
   /**
@@ -563,6 +655,19 @@ export class GeyserStreamClient {
       lastEventAt: this.lastEventAt || null,
       sinceLastEventMs,
       degraded: !socketOpen || this.activeSubscriptions.length === 0,
+      /**
+       * CONTADORES DO CAMINHO QUENTE (S5) — sem eles, perda de lançamento é invisível.
+       * `enrichmentFailures > 0` significa que vimos a notificação e NÃO conseguimos o
+       * mint: é perda real de oportunidade, não "nada aconteceu no mercado".
+       */
+      hotPath: {
+        launchesSeen: this.eventCount,
+        duplicatesDropped: this.duplicatesDropped,
+        enrichmentRetries: this.enrichmentRetries,
+        enrichmentFailures: this.enrichmentFailures,
+        lastLocalSlot: this.lastLocalSlot,
+        lastLocalSlotAgeMs: this.lastLocalSlotAt ? Date.now() - this.lastLocalSlotAt : null,
+      },
       note:
         "socketOpen=true significa socket estabelecido. subscriptionsRequested NÃO é confirmação " +
         "do RPC. A prova de detecção é eventCount > 0.",
@@ -1104,18 +1209,31 @@ export class JitoBundleSender {
   public async submitViaRpc(
     connection: Connection,
     transaction: VersionedTransaction,
-    options?: { skipPreflight?: boolean; maxRetries?: number }
-  ): Promise<{ signature: string; success: boolean; error?: string }> {
+    options?: SendOptionsInput
+  ): Promise<{ signature: string; success: boolean; error?: string; rationale: string }> {
+    /**
+     * DEFAULTS DE ENVIO (C41) — a decisão está em `resolveSendOptions`, não implícita
+     * aqui. Resumo do que mudou e por quê:
+     *
+     *   - `maxRetries: 3` (default do SDK) → **0**. Repetir no RPC é invisível para o bot
+     *     e não interrompível: pode continuar transmitindo uma transação cujo blockhash já
+     *     expirou. Quem repete, a partir do S4, é a política de EVIDÊNCIA — que reenvia os
+     *     MESMOS bytes (idempotente) e só reconstrói com prova de expiração.
+     *   - `skipPreflight` → verdadeiro APENAS quando o chamador declara `preSimulated`
+     *     (a transação já foi simulada neste processo). Pular preflight sem simular joga
+     *     fora a informação de erro mais barata que existe.
+     */
+    const resolved = resolveSendOptions(options);
     try {
       const raw = transaction.serialize();
       const signature = await connection.sendRawTransaction(raw, {
-        skipPreflight: options?.skipPreflight ?? false,
-        maxRetries: options?.maxRetries ?? 3,
-        preflightCommitment: "processed",
+        skipPreflight: resolved.skipPreflight,
+        maxRetries: resolved.maxRetries,
+        preflightCommitment: resolved.preflightCommitment,
       });
-      return { signature, success: true };
+      return { signature, success: true, rationale: resolved.rationale };
     } catch (err: any) {
-      return { signature: "", success: false, error: err.message };
+      return { signature: "", success: false, error: err.message, rationale: resolved.rationale };
     }
   }
 }

@@ -65,6 +65,12 @@ import {
   type DesyncReport,
   type Holding,
 } from "./src/positionDesync.js";
+import {
+  InFlightMints,
+  decideEntryWithBudget,
+  resolveSendOptions,
+  type HotPathStats,
+} from "./src/hotPath.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
 import { compareStrategies, DEFAULT_STRATEGIES } from "./src/replay.js";
 import bs58 from "bs58";
@@ -597,6 +603,43 @@ const blockedIntentWarned = new Set<string>();
 const jitoTipOracle = new JitoTipOracle({ fetchFn: fetch, now: () => Date.now() });
 
 /**
+ * ESTADO E CONTADORES DO CAMINHO QUENTE (S5).
+ *
+ * `InFlightMints` impede que dois sinais do MESMO mint corram em paralelo — em modo real
+ * isso seriam duas compras para uma decisão. `hotPathStats` é o registro do que o
+ * caminho quente fez de verdade (duplicatas descartadas, filtro estourado, vetos por
+ * fail-closed): sem números, otimização de latência vira adivinhação.
+ */
+const hotPathInFlight = new InFlightMints();
+
+/**
+ * Política de envio vigente (C41), exposta para que o operador SAIBA com que defaults o
+ * processo enviaria — em vez de descobrir no dia do incidente. Não há chamada de envio
+ * neste caminho (a entrada on-chain não está implementada); o valor aqui documenta a
+ * configuração efetiva usada pelas saídas.
+ */
+/** Instante de boot do processo — base para uptime medido (nunca estimado). */
+const processStartAt = Date.now();
+
+const sendPolicy = resolveSendOptions({
+  preSimulated: true,
+  maxRetries: 0,
+  preflightCommitment: "processed",
+});
+const hotPathStats: HotPathStats = {
+  signalsSeen: 0,
+  inFlightDuplicatesDropped: 0,
+  unvettedEntries: 0,
+  deepFilterFailures: 0,
+  rejectedByVerdict: 0,
+  budgetExceeded: 0,
+  liveVetoesByBudget: 0,
+};
+
+/** Orçamento do filtro profundo por sinal. Medido em PAPER antes de qualquer LIVE. */
+const DEEP_FILTER_BUDGET_MS = Math.max(100, Number(process.env.HFT_DEEP_FILTER_BUDGET_MS ?? 900));
+
+/**
  * BACKOFF DE TELEMETRIA DE PREÇO (por posição).
  *
  * Motivo concreto, observado em execução: uma posição cuja fonte de preço está fora do ar
@@ -973,9 +1016,15 @@ app.get("/api/system-truth", (_req, res) => {
       status: "real",
       detail: detection
         ? `socketOpen=${detection.socketOpen}, subscrições=${detection.subscriptionsRequested}, ` +
-          `eventos=${detection.eventCount}, degradado=${detection.degraded}`
+          `eventos=${detection.eventCount}, degradado=${detection.degraded}, ` +
+          `duplicatas descartadas=${detection.hotPath?.duplicatesDropped ?? "?"}, ` +
+          `falhas de enriquecimento=${detection.hotPath?.enrichmentFailures ?? "?"}` +
+          `${detection.hotPath?.lastLocalSlotAgeMs !== null && detection.hotPath?.lastLocalSlotAgeMs !== undefined ? `, amostra de slot local com ${detection.hotPath.lastLocalSlotAgeMs}ms` : ""}`
         : "cliente de detecção ainda não inicializado",
-      caveat: "subscriptionsRequested é registro LOCAL; a prova de detecção é eventCount > 0",
+      caveat:
+        "subscriptionsRequested é registro LOCAL; a prova de detecção é eventCount > 0. " +
+        "enrichmentFailures > 0 = notificação vista e mint NÃO obtido: perda real de oportunidade, " +
+        "não ausência de lançamento.",
     },
     {
       source: "banco operacional",
@@ -1022,6 +1071,27 @@ app.get("/api/system-truth", (_req, res) => {
       "Nada de execução on-chain existe enquanto o caminho de entrada real não estiver implementado.",
     realSources,
     simulatedEndpoints,
+    hotPath: {
+      deepFilterBudgetMs: DEEP_FILTER_BUDGET_MS,
+      inFlightMints: hotPathInFlight.size(),
+      counters: hotPathStats,
+      sendPolicy: {
+        skipPreflight: sendPolicy.skipPreflight,
+        maxRetries: sendPolicy.maxRetries,
+        preflightCommitment: sendPolicy.preflightCommitment,
+        rationale: sendPolicy.rationale,
+      },
+      note:
+        "Contadores do caminho quente desde o boot: inFlightDuplicatesDropped = sinais do mesmo mint com " +
+        "decisão já em andamento (a reentrega da MESMA assinatura é contada no cliente de detecção, em " +
+        "detection.hotPath.duplicatesDropped); " +
+        "deepFilterFailures = filtro profundo FALHOU (perda de oportunidade por erro, não por reprovação); " +
+        "rejectedByVerdict = o filtro reprovou o token com evidência; " +
+        "budgetExceeded = filtro passou do orçamento (medido, não abortado); " +
+        "liveVetoesByBudget = entradas vetadas por fail-closed; " +
+        "unvettedEntries = sinais que seguiram sem filtro completo — HOJE SEMPRE 0, porque o filtro é " +
+        "tudo-ou-nada e sem dado nenhum a entrada é bloqueada em qualquer modo.",
+    },
     summary: {
       realSources: realSources.filter((s) => s.status === "real").length,
       simulatedEndpoints: simulatedEndpoints.length,
@@ -1477,8 +1547,11 @@ app.post("/api/simulate-crash", restrictToDev, async (_req, res) => {
     const recoveredTrades = dbStore.getTrades();
     const recoveredState = dbStore.getOperationalState();
 
-    console.log("[⚡ AUTO-RECOVERY PIPELINE] 1. Reopening WebSocket shredstream connections to Yellowstone Geyser...");
-    console.log("[⚡ AUTO-RECOVERY PIPELINE] 2. Recalculating sliding blockhash offset from cached block pool...");
+    // Estes dois logs anunciavam infraestrutura inexistente (stream de shreds e cache de
+    // blockhash pré-aquecido). Agora dizem o que o código realmente faz: relê o estado do
+    // disco e deixa o cache de blockhash ser repovoado pelo RPC.
+    console.log("[⚡ AUTO-RECOVERY PIPELINE] 1. Relendo estado operacional do disco (JSON atômico com backup)...");
+    console.log("[⚡ AUTO-RECOVERY PIPELINE] 2. Cache de blockhash é repovoado pelo RPC — NÃO há pool pré-aquecido.");
     console.log(`[⚡ AUTO-RECOVERY PIPELINE] 3. Loaded ${recoveredPositions.length} open positions and ${recoveredTrades.length} previous trades.`);
     console.log(`[⚡ AUTO-RECOVERY PIPELINE] 4. Disjuntores rearmados. Kill Switch state: [${recoveredState.killSwitchActive ? "ACTIVE" : "INACTIVE"}]. Active Wallet: [${recoveredState.activeWallet.toUpperCase()}]`);
     console.log("[⚡ AUTO-RECOVERY PIPELINE] >>> AUTORECOVERY COMPLETED IN 41ms! Continuing execution flawlessly.");
@@ -1638,9 +1711,9 @@ app.post("/api/rpc-infra/chaos", (req, res) => {
     case "recover":
       if (node) {
         delete chaosState[nodeId];
-        // Reset immediately to standard
-        node.status = nodeId === "rpc-bare-metal-shred" ? "offline" : "healthy";
-        node.latency = nodeId === "rpc-us-east" ? 12 : nodeId === "rpc-eu-central" ? 19 : nodeId === "rpc-ap-southeast" ? 45 : nodeId === "rpc-backup-public" ? 124 : 999;
+        // Reset imediato: nenhum nó inventado, nenhuma latência inventada.
+        node.status = "healthy";
+        node.latency = Number.NaN; // nunca fabricado; MEDIDO em /api/rpc-nodes
         node.slotLag = 0;
         node.packetLoss = 0;
         failoverEvents.unshift({
@@ -1655,8 +1728,8 @@ app.post("/api/rpc-infra/chaos", (req, res) => {
     case "recover_all":
       Object.keys(chaosState).forEach(key => delete chaosState[key]);
       rpcNodes.forEach(n => {
-        n.status = n.id === "rpc-bare-metal-shred" ? (coLocationActive ? "healthy" : "offline") : "healthy";
-        n.latency = n.id === "rpc-us-east" ? 12 : n.id === "rpc-eu-central" ? 19 : n.id === "rpc-ap-southeast" ? 45 : n.id === "rpc-backup-public" ? 124 : 999;
+        n.status = "healthy";
+        n.latency = Number.NaN; // MEDIDO por /api/rpc-nodes (antes: constantes por região)
         n.slotLag = 0;
         n.packetLoss = 0;
       });
@@ -2387,17 +2460,34 @@ app.get("/api/geyser-stream", (_req, res) => {
     }
   }
 
+  /**
+   * ESTADO DE REDE — só o que é observável daqui (S5/C40).
+   *
+   * A versão anterior anunciava estado de co-localização com stream de shreds ativo e
+   * publicava throughput, carga de sistema e canais ativos com `Math.random()`. Nada disso
+   * existe: não há assinatura de shreds pré-execução neste runtime, e "co-location" é um
+   * fato FÍSICO da máquina (latência de rede até o líder) que este processo não consegue
+   * verificar sobre si mesmo — só o operador sabe onde o servidor está.
+   */
+  const elapsedSeconds = Math.max(1, (Date.now() - processStartAt) / 1000);
   res.json({
     currentSlot,
-    events: combinedEvents.slice(0, 8), // show up to 8 latest events
-    systemLoad: coLocationActive
-      ? parseFloat((11.4 + Math.random() * 3).toFixed(1)) // Low overhead on Bare Metal
-      : parseFloat((45.2 + Math.random() * 8).toFixed(1)),
-    activeChannels: coLocationActive ? 8 : 4,
-    shredStreamState: coLocationActive ? "CO-LOCATED (SHREDSTREAM ACTIVE)" : "CONNECTED",
-    messagesPerSecond: coLocationActive
-      ? 5120 + Math.floor(Math.random() * 600) // ShredStream throughput is massive
-      : 1420 + Math.floor(Math.random() * 150)
+    events: combinedEvents.slice(0, 8),
+    measured: {
+      processUptimeSeconds: Math.round(elapsedSeconds),
+      rssBytes: process.memoryUsage().rss,
+      nodeVersion: process.version,
+    },
+    declared: {
+      coLocation: coLocationActive
+        ? "DECLARADO PELO OPERADOR como ativo — este processo NÃO consegue medir a posição física do host"
+        : "não declarado",
+      note:
+        "ShredStream (shreds pré-execução) NÃO está implementado neste runtime. Assinaturas " +
+        "ativas são de logs WebSocket RPC (mais lentas que gRPC/shreds).",
+    },
+    /** Substitui os antigos números aleatórios: nada aqui é inventado. */
+    unmeasured: ["systemLoad", "messagesPerSecond", "shredThroughput"],
   });
 });
 
@@ -3164,6 +3254,9 @@ async function executeAutonomousPipeline(event: any, trace?: LatencyTrace): Prom
   const tokenMint = event.mint;
   const tokenName = event.mintName || "LAUNCHED_TOKEN";
   const correlationId = `corr_auto_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  // Todo sinal que chega ao pipeline é contado AQUI, antes de qualquer filtro: é a base
+  // para saber quantos foram descartados e por quê (sem denominador, taxa não existe).
+  hotPathStats.signalsSeen++;
 
   console.log(`[Autonomous Daemon] New Token detected via Yellowstone Geyser: ${tokenName} (${tokenMint})`);
   
@@ -3200,21 +3293,148 @@ async function executeAutonomousPipeline(event: any, trace?: LatencyTrace): Prom
     return;
   }
 
-  // 3. Auditoria (fetch on-chain token data)
-  let auditResult;
+  /**
+   * 2.5 GATE RÁPIDO — decisões LOCAIS, sem rede, antes de gastar qualquer RTT.
+   *
+   * Estas verificações custam zero (memória) e cortam o sinal mais caro de todos: o que
+   * já está em processamento (dois eventos do mesmo mint → duas compras) ou que não é
+   * sequer um mint válido. Antes, nada disso existia no caminho: o pipeline ia direto
+   * para o RPC e só depois descobria o problema.
+   */
+  if (!isValidPubkey(tokenMint)) {
+    reportSignalRejected(`mint estruturalmente inválido: ${String(tokenMint).slice(0, 24)}`);
+    return;
+  }
+  if (!hotPathInFlight.tryAcquire(tokenMint)) {
+    hotPathStats.inFlightDuplicatesDropped++;
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "WARN",
+      component: "RISK_ENGINE",
+      message:
+        `[GATE RÁPIDO] Sinal duplicado para ${tokenMint.slice(0, 8)}... ignorado: já existe decisão em ` +
+        `andamento para este mint. Sem esta trava, dois eventos do mesmo lançamento gerariam DUAS entradas.`,
+      correlationId,
+    });
+    return;
+  }
+
+  // Portão rápido vencido: tudo daqui para frente custa rede.
+  trace?.mark("gate_ok");
+
+  const deepStartedAt = Date.now();
+  let deepComplete = false;
+  let deepVerdict: "approve" | "reject" | null = null;
+  let auditResult: Awaited<ReturnType<typeof fetchRealOnChainTokenData>> | null = null;
+
   try {
+    /**
+     * 3. FILTRO PROFUNDO — roda com ORÇAMENTO explícito, e o que acontece ao estourar
+     * depende do modo (ver `decideEntryWithBudget`): em LIVE, filtro incompleto VETA;
+     * em PAPER/SHADOW, prossegue marcado como NÃO AUDITADO — assim medimos quanto o
+     * filtro custa e o que ele reprovaria, sem colocar capital em risco.
+     */
     auditResult = await fetchRealOnChainTokenData(tokenMint, tokenName);
     // Estágio medido: recebimento -> dados on-chain enriquecidos.
     trace?.mark("enriched");
+    deepComplete = true;
+    deepVerdict = (auditResult as any).isRug || (auditResult as any).verdict === "reject" ? "reject" : "approve";
   } catch (err: any) {
+    deepComplete = false;
+    hotPathStats.deepFilterFailures++;
+    /**
+     * A falha do filtro passa pela MESMA função de decisão do orçamento, com a causa
+     * declarada (`audit-error`). Antes, este `catch` saía por `return` sem consultar a
+     * política: a regra "sem auditoria não se entra" existia no código e nunca era
+     * executada — código morto que dava falsa sensação de proteção.
+     */
+    const failDecision = decideEntryWithBudget({
+      mode: getRuntimeModeResolution().mode,
+      deepComplete: false,
+      deepElapsedMs: Date.now() - deepStartedAt,
+      budgetMs: DEEP_FILTER_BUDGET_MS,
+      incompleteCause: "audit-error",
+    });
+    if (!failDecision.proceed && getRuntimeModeResolution().mode === "LIVE") {
+      hotPathStats.liveVetoesByBudget++;
+    }
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
-      level: "ERROR",
+      level: "CRITICAL",
       component: "SECURITY_SHIELD",
-      message: `[Daemon Auditoria Falhou] Erro ao obter dados on-chain para ${tokenMint}: ${err.message}`,
+      message:
+        `[Daemon Auditoria Falhou] Erro ao obter dados on-chain para ${tokenMint}: ${err.message}. ` +
+        failDecision.reason,
       correlationId
     });
+    hotPathInFlight.release(tokenMint);
     return;
+  }
+
+  const deepElapsedMs = Date.now() - deepStartedAt;
+  if (deepElapsedMs > DEEP_FILTER_BUDGET_MS) hotPathStats.budgetExceeded++;
+
+  const budgetDecision = decideEntryWithBudget({
+    mode: getRuntimeModeResolution().mode,
+    deepComplete,
+    deepElapsedMs,
+    budgetMs: DEEP_FILTER_BUDGET_MS,
+    deepVerdict,
+  });
+
+  if (!budgetDecision.proceed) {
+    // Distinção que importa para o operador: veto por ORÇAMENTO/fail-closed é uma decisão
+    // de política; veto por REPROVAÇÃO é o filtro funcionando. Contadores separados.
+    if (budgetDecision.unvetted === false && deepVerdict === "reject") {
+      hotPathStats.rejectedByVerdict++;
+    } else if (getRuntimeModeResolution().mode === "LIVE") {
+      hotPathStats.liveVetoesByBudget++;
+    }
+    trace?.mark("assessed");
+    if (trace) telemetry.record(trace.toRecord("rejected"));
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "CRITICAL",
+      component: "SECURITY_SHIELD",
+      message: `[ORÇAMENTO DO FILTRO] ${budgetDecision.reason}`,
+      correlationId,
+    });
+    recorder.recordAssessment({
+      eventId: trace?.id ?? `evt_${tokenMint}`,
+      mint: tokenMint,
+      decision: "rejected",
+      rejectionReason: budgetDecision.reason,
+      score: typeof auditResult?.score === "number" ? auditResult.score : 0,
+      verdict: "reject",
+      dataComplete: deepComplete,
+      missingChecks: (auditResult as any)?.missingChecks ?? [],
+      isRug: false,
+      mintAuthorityDisabled: auditResult?.mintAuthorityDisabled ?? null,
+      freezeAuthorityDisabled: auditResult?.freezeAuthorityDisabled ?? null,
+      liquidityUsd: auditResult?.liquidityUsd ?? 0,
+      poolSource: auditResult?.poolSource ?? "Unknown",
+      token2022Risk: (auditResult as any)?.token2022Risk,
+      entryPriceSol: null,
+      entryPriceSource: null,
+      estimatedCostsBps: null,
+      deepFilterMs: deepElapsedMs,
+      deepFilterBudgetMs: DEEP_FILTER_BUDGET_MS,
+    });
+    hotPathInFlight.release(tokenMint);
+    return;
+  }
+
+  if (budgetDecision.unvetted) {
+    hotPathStats.unvettedEntries++;
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "WARN",
+      component: "SECURITY_SHIELD",
+      message:
+        `[FILTRO INCOMPLETO] ${budgetDecision.reason} Deep filter completo=${deepComplete}; ` +
+        `gasto=${deepElapsedMs}ms (orçamento ${DEEP_FILTER_BUDGET_MS}ms).`,
+      correlationId,
+    });
   }
 
   // 4. Score & Pontuação (Gemini Technical Audit if API Key is configured)
@@ -3318,6 +3538,8 @@ Respond in a short, scannable JSON object with these keys:
       rejectionReason: isRug
         ? "isRug=true (evidência de bloqueio/inflação)"
         : `score ${score} abaixo do limite 50`,
+      deepFilterMs: deepElapsedMs,
+      deepFilterBudgetMs: DEEP_FILTER_BUDGET_MS,
       score,
       verdict: (auditResult as any).verdict ?? "reject",
       dataComplete: (auditResult as any).dataComplete ?? false,
@@ -3332,6 +3554,7 @@ Respond in a short, scannable JSON object with these keys:
       entryPriceSource: null,
       estimatedCostsBps: null,
     });
+    hotPathInFlight.release(tokenMint);
     return;
   }
 
@@ -3355,6 +3578,7 @@ Respond in a short, scannable JSON object with these keys:
       message: `[Daemon Erro Wallet] KMS Vault falhou ao carregar chaves operacionais: ${err.message}`,
       correlationId
     });
+    hotPathInFlight.release(tokenMint);
     return;
   }
 
@@ -3408,6 +3632,7 @@ Respond in a short, scannable JSON object with these keys:
       correlationId,
     });
     reportSignalRejected("execução bloqueada por kill switch/read-only");
+    hotPathInFlight.release(tokenMint);
     return;
   }
 
@@ -3425,6 +3650,7 @@ Respond in a short, scannable JSON object with these keys:
         `Implemente e teste o caminho de compra antes de habilitar capital real.`,
       correlationId,
     });
+    hotPathInFlight.release(tokenMint);
     return;
   }
 
@@ -3444,6 +3670,7 @@ Respond in a short, scannable JSON object with these keys:
       correlationId,
     });
     reportSignalRejected("sem preço de referência");
+    hotPathInFlight.release(tokenMint);
     return;
   }
 
@@ -3528,6 +3755,8 @@ Respond in a short, scannable JSON object with these keys:
     entryPriceSol: reference.priceSol,
     entryPriceSource: reference.source,
     estimatedCostsBps: Math.round(paperCosts * 100),
+    deepFilterMs: deepElapsedMs,
+    deepFilterBudgetMs: DEEP_FILTER_BUDGET_MS,
   });
   recorder.recordPositionLifecycle({
     positionId: paperTxId,
@@ -3549,6 +3778,8 @@ Respond in a short, scannable JSON object with these keys:
   );
 
   reportSignalAccepted();
+  // Liberação do gate rápido: o mint volta a poder ser processado em um novo lançamento.
+  hotPathInFlight.release(tokenMint);
 }
 
 /**

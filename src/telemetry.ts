@@ -65,6 +65,16 @@ export function wallClockNow(): number {
 
 export const LATENCY_STAGES = [
   "received",   // callback do listener (WSS/gRPC) entregou a notificação
+  /**
+   * Portão RÁPIDO: pubkey válida, sem outra decisão em voo para o mesmo mint, kill switch
+   * e read-only limpos. É o primeiro filtro que NÃO custa rede — a distância
+   * `received → gate_ok` mede o overhead do próprio processo (parsing, locks, log), e é
+   * essa distância que se otimiza sem tocar em infraestrutura.
+   *
+   * Não existe estágio `notified`: não há canal de notificação ao operador no caminho
+   * quente (a UI faz polling). Instrumentar um passo inexistente seria medição fabricada.
+   */
+  "gate_ok",
   "enriched",   // getTransaction retornou + mint extraído
   "assessed",   // risk engine concluiu
   "built",      // transação montada (quote/swap-instructions)

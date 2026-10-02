@@ -1883,6 +1883,220 @@ async function main(): Promise<void> {
     );
   });
 
+  // ---------------------------------------------------------------------------
+  // [16] CAMINHO QUENTE — dedupe, política de envio e orçamento do filtro
+  // ---------------------------------------------------------------------------
+  console.log("\n[16] Caminho quente (dedupe, envio, orçamento do filtro profundo)");
+
+  await test("dedupe: a mesma assinatura só é processada uma vez (com TTL)", async () => {
+    const { SeenLaunchSignatures } = await import("../src/hotPath.js");
+    const seen = new SeenLaunchSignatures(1000, 10);
+    const t0 = 1_000_000;
+    assert.equal(seen.firstSight("sigA", t0), true, "primeira vez processa");
+    assert.equal(seen.firstSight("sigA", t0 + 10), false, "reentrega é ignorada");
+    assert.equal(seen.firstSight("sigB", t0 + 20), true, "assinatura diferente processa");
+    // Depois do TTL a entrada expira (a assinatura é única, então isso é defensivo).
+    assert.equal(seen.firstSight("sigA", t0 + 1500), true);
+    assert.equal(seen.size(t0 + 1500), 1, "as duas entradas antigas expiraram; só sigA foi reinserida");
+  });
+
+  await test("dedupe: não cresce sem limite (memória não vaza)", async () => {
+    const { SeenLaunchSignatures } = await import("../src/hotPath.js");
+    const seen = new SeenLaunchSignatures(60_000, 3);
+    const t0 = 5_000_000;
+    for (let i = 0; i < 10; i++) assert.equal(seen.firstSight(`sig${i}`, t0 + i), true);
+    assert.equal(seen.size(t0 + 10), 3, "o limite é respeitado (remove o mais antigo)");
+    // As 3 mais recentes continuam registradas.
+    assert.equal(seen.firstSight("sig9", t0 + 11), false);
+  });
+
+  await test("trava de mint em voo impede decisão paralela do mesmo mint", async () => {
+    const { InFlightMints } = await import("../src/hotPath.js");
+    const gate = new InFlightMints();
+    assert.equal(gate.tryAcquire("mint1"), true);
+    assert.equal(gate.tryAcquire("mint1"), false, "segundo sinal do MESMO mint é recusado");
+    assert.equal(gate.tryAcquire("mint2"), true, "mint diferente passa");
+    gate.release("mint1");
+    assert.equal(gate.tryAcquire("mint1"), true, "após liberar, o mint volta a poder ser processado");
+  });
+
+  await test("envio: retry do RPC é 0 e preflight só cai com simulação declarada", async () => {
+    const { resolveSendOptions } = await import("../src/hotPath.js");
+    // Caso 1: nada declarado → preflight ATIVO (erro barato) e sem retry às cegas.
+    const padrao = resolveSendOptions({});
+    assert.equal(padrao.skipPreflight, false);
+    assert.equal(padrao.maxRetries, 0, "quem repete é a política de evidência, não o RPC");
+    assert.equal(padrao.preflightCommitment, "processed");
+    assert.ok(/preflight ativo/.test(padrao.rationale));
+
+    // Caso 2: transação já simulada neste processo → preflight pulado (economiza 1 RTT).
+    const preSim = resolveSendOptions({ preSimulated: true });
+    assert.equal(preSim.skipPreflight, true);
+    assert.equal(preSim.maxRetries, 0);
+    assert.ok(/simulada/.test(preSim.rationale));
+
+    // Caso 3: diagnóstico pede preflight mesmo com simulação declarada.
+    assert.equal(resolveSendOptions({ preSimulated: true, forcePreflight: true }).skipPreflight, false);
+
+    // Caso 4: overrides explícitos são respeitados; valor absurdo é saneado.
+    assert.equal(resolveSendOptions({ skipPreflight: true, maxRetries: 2 }).skipPreflight, true);
+    assert.equal(resolveSendOptions({ maxRetries: -5 }).maxRetries, 0, "não existe retry negativo");
+  });
+
+  await test("orçamento: filtro completo decide por EVIDÊNCIA", async () => {
+    const { decideEntryWithBudget } = await import("../src/hotPath.js");
+    const ok = decideEntryWithBudget({
+      mode: "LIVE",
+      deepComplete: true,
+      deepElapsedMs: 400,
+      budgetMs: 900,
+      deepVerdict: "approve",
+    });
+    assert.equal(ok.proceed, true);
+    assert.equal(ok.unvetted, false);
+
+    const reprovado = decideEntryWithBudget({
+      mode: "PAPER",
+      deepComplete: true,
+      deepElapsedMs: 400,
+      budgetMs: 900,
+      deepVerdict: "reject",
+    });
+    assert.equal(reprovado.proceed, false, "reprovação NÃO se contorna nem em PAPER");
+    assert.ok(/REPROVOU/.test(reprovado.reason));
+  });
+
+  await test("orçamento: LIVE sem auditoria é VETADO (fail-closed)", async () => {
+    const { decideEntryWithBudget } = await import("../src/hotPath.js");
+    const decisao = decideEntryWithBudget({
+      mode: "LIVE",
+      deepComplete: false,
+      deepElapsedMs: 1500,
+      budgetMs: 900,
+    });
+    assert.equal(decisao.proceed, false, "entrar em LIVE sem filtro profundo é como se perde a carteira");
+    assert.equal(decisao.unvetted, false);
+    assert.ok(/FAIL-CLOSED/.test(decisao.reason));
+  });
+
+  await test("orçamento: PAPER/SHADOW prosseguem marcados como NÃO AUDITADOS", async () => {
+    const { decideEntryWithBudget } = await import("../src/hotPath.js");
+    for (const mode of ["PAPER", "SHADOW"]) {
+      const decisao = decideEntryWithBudget({ mode, deepComplete: false, deepElapsedMs: 1200, budgetMs: 900 });
+      assert.equal(decisao.proceed, true, `${mode} prossegue (sem capital em risco)`);
+      assert.equal(decisao.unvetted, true, `${mode} precisa ser marcado como não auditado`);
+      assert.ok(/NÃO AUDITADO/.test(decisao.reason));
+    }
+  });
+
+  await test("orçamento: auditoria FALHOU bloqueia em qualquer modo (sem dado = sem decisão)", async () => {
+    const { decideEntryWithBudget } = await import("../src/hotPath.js");
+    for (const mode of ["LIVE", "PAPER", "SHADOW"]) {
+      const decisao = decideEntryWithBudget({
+        mode,
+        deepComplete: false,
+        deepElapsedMs: 40,
+        budgetMs: 900,
+        incompleteCause: "audit-error",
+      });
+      assert.equal(decisao.proceed, false, `${mode}: prosseguir sem NENHUM dado é compra às cegas`);
+      assert.ok(/AUDITORIA FALHOU/.test(decisao.reason));
+    }
+    // A causa precisa distinguir: com dado parcial (orçamento), PAPER prossegue.
+    const parcial = decideEntryWithBudget({
+      mode: "PAPER",
+      deepComplete: false,
+      deepElapsedMs: 1500,
+      budgetMs: 900,
+      incompleteCause: "budget",
+    });
+    assert.equal(parcial.proceed, true);
+    assert.equal(parcial.unvetted, true);
+  });
+
+  await test("latência: estágio gate_ok existe e a ordem recebida→gate_ok→enriquecido é respeitada", async () => {
+    const tel = await import("../src/telemetry.js");
+    assert.ok(
+      (tel.LATENCY_STAGES as readonly string[]).includes("gate_ok"),
+      "o overhead local do processo precisa de estágio próprio"
+    );
+    assert.ok(
+      !(tel.LATENCY_STAGES as readonly string[]).includes("notified"),
+      "não existe canal de notificação no caminho quente — estágio seria medição fabricada"
+    );
+    const trace = new tel.LatencyTrace("t_gate", 1_000, 100, 99);
+    trace.mark("gate_ok");
+    trace.mark("enriched");
+    assert.equal(trace.has("gate_ok"), true);
+    assert.ok(trace.elapsedTo("gate_ok") !== null);
+    const record = trace.toRecord("rejected");
+    assert.ok(record.durationsMs.gate_ok !== undefined, "a duração do portão rápido precisa ser medida");
+    assert.ok(record.durationsMs.enriched !== undefined, "received→gate_ok→enriched");
+  });
+
+  await test("cartão quente: o enriquecimento NÃO bloqueia mais em getSlot nem abandona em silêncio", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = fs.readFileSync(path.join(repoRoot, "src", "realExecution.ts"), "utf8");
+
+    // O callback do logsSubscribe recebe (logs, context) — verificado no web3.js.
+    assert.ok(
+      /this\.connection\.onLogs\([\s\S]{0,200}\(logs, context\)/.test(src),
+      "o callback precisa usar o context da notificação (slot de graça)"
+    );
+    assert.ok(!/logs as any\)\.slot/.test(src), "o slot não existe no objeto de logs; não pode voltar essa leitura");
+    assert.ok(
+      !/receivedSlot = await this\.connection\.getSlot/.test(src),
+      "getSlot não pode estar no caminho do evento (era um RTT por lançamento)"
+    );
+    assert.ok(src.includes("refreshLocalSlotInBackground"), "a amostra de slot deve ser atualizada em segundo plano");
+
+    // Falha de enriquecimento precisa ser CONTADA (perda silenciosa era o defeito).
+    assert.ok(src.includes("enrichmentFailures++"), "perda de lançamento precisa de contador");
+    assert.ok(src.includes("enrichmentRetries++"), "retry do enriquecimento precisa ser visível");
+    assert.ok(
+      /getTransaction\(signature, \{[\s\S]{0,120}commitment: "confirmed"/.test(src),
+      "getTransaction NÃO suporta processed — confirmado na doc da RPC e no tipo Finality do web3.js"
+    );
+    assert.ok(src.includes("resolveSendOptions(options)"), "submitViaRpc precisa usar a política única");
+    assert.ok(
+      !/maxRetries: options\?\.maxRetries \?\? 3/.test(src),
+      "o default maxRetries do SDK (3) não pode voltar: retry cego no RPC é inobservável"
+    );
+  });
+
+  await test("regressão: infraestrutura inexistente não pode ser afirmada", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    for (const proibido of [
+      "SHREDSTREAM ACTIVE",
+      "rpc-bare-metal-shred",
+      "Reopening WebSocket shredstream connections",
+      "ShredStream throughput is massive",
+    ]) {
+      assert.ok(!serverSrc.includes(proibido), `afirmação de infraestrutura inexistente: "${proibido}"`);
+    }
+    // O caminho quente precisa estar LIGADO (não basta existir o módulo).
+    assert.ok(serverSrc.includes("hotPathInFlight.tryAcquire("), "a trava de mint em voo não está aplicada");
+    assert.ok(serverSrc.includes("decideEntryWithBudget({"), "a política de orçamento não está aplicada");
+    assert.ok(
+      serverSrc.includes("hotPathInFlight.release("),
+      "sem liberar o mint, a trava viraria bloqueio permanente"
+    );
+    // A política de orçamento precisa ser consultada também na FALHA do filtro: o `catch`
+    // que só dá `return` deixa a regra fail-closed como código morto.
+    assert.ok(
+      /catch \(err: any\) \{[\s\S]{0,900}decideEntryWithBudget\(/.test(serverSrc),
+      "a falha do filtro profundo precisa passar pela política (senão o veto é código morto)"
+    );
+    assert.ok(serverSrc.includes('trace?.mark("gate_ok")'), "o portão rápido precisa ser marcado");
+    assert.ok(
+      /hotPath\.note|hotPath: \{/.test(serverSrc) && serverSrc.includes("deepFilterFailures"),
+      "os contadores do caminho quente precisam estar expostos para o operador"
+    );
+    const releases = serverSrc.match(/hotPathInFlight\.release\(/g) ?? [];
+    assert.ok(releases.length >= 7, `todo caminho de saída precisa liberar o mint (encontrados ${releases.length})`);
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);
