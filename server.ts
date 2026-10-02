@@ -2420,7 +2420,20 @@ app.get("/api/hft-telemetry", (_req, res) => {
 
 // 4.9 API: Geyser gRPC Live Stream
 app.get("/api/geyser-stream", (_req, res) => {
-  const currentSlot = 278913410 + Math.floor((Date.now() / 400) % 100000);
+  /**
+   * SLOT DE REFERÊNCIA (S5/C40) — antes: `278913410 + (Date.now()/400) % 100000`, isto é,
+   * um número inventado a partir do relógio do processo. Um slot "andando" desse jeito
+   * parece telemetria e não é: nenhuma medição de rede entra ali. Agora usamos a última
+   * medição real de slot dos nós RPC (mesma fonte do laço de infraestrutura) e, quando não
+   * há medição, devolvemos o indicador de NÃO MEDIDO em vez de um número.
+   */
+  const measuredSlots = Object.values(rpcMetrics)
+    .map((m) => m.lastSlot)
+    .filter((v): v is number => typeof v === "number" && v > 0);
+  const detectionSlot = geyserClientRef?.getHealth().hotPath?.lastLocalSlot ?? null;
+  const currentSlot: number | null =
+    measuredSlots.length > 0 ? Math.max(...measuredSlots) : detectionSlot;
+  const currentSlotMeasured = currentSlot !== null;
   const now = Date.now();
   
   // Combine real events and mock events
@@ -2455,7 +2468,14 @@ app.get("/api/geyser-stream", (_req, res) => {
           : parseFloat((320 + Math.random() * 180).toFixed(1)),
         savedComputeUnits: Math.floor(25000 + Math.random() * 15000),
         rawProtobufHex: Array.from({ length: 12 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join(""),
-        isRealOnChain: false
+        isRealOnChain: false,
+        /*
+         * Marcação explícita. `id` já começa com "evt_mock_", mas isso é convenção interna:
+         * quem consome a API (ou o operador lendo o JSON) não deve ter que conhecer o
+         * padrão de id para saber que o evento é decorativo.
+         */
+        simulated: true,
+        source: "MOCK/RNG — evento decorativo do painel, nenhuma transação real corresponde",
       });
     }
   }
@@ -2470,8 +2490,20 @@ app.get("/api/geyser-stream", (_req, res) => {
    * verificar sobre si mesmo — só o operador sabe onde o servidor está.
    */
   const elapsedSeconds = Math.max(1, (Date.now() - processStartAt) / 1000);
+  const realCount = combinedEvents.filter((e: any) => e.isRealOnChain === true).length;
   res.json({
     currentSlot,
+    currentSlotMeasured,
+    currentSlotSource: currentSlotMeasured
+      ? "medido: último slot observado nos nós RPC configurados (ou amostra local de getSlot)"
+      : "NÃO MEDIDO: nenhum RPC respondeu neste processo — o valor é null de propósito, não 0",
+    feed: {
+      real: realCount,
+      simulated: combinedEvents.length - realCount,
+      note:
+        "Eventos com `simulated: true` são decorativos (nomes/latências/hex gerados por RNG). " +
+        "Eles NÃO correspondem a transações: só `isRealOnChain: true` veio de notificação do RPC.",
+    },
     events: combinedEvents.slice(0, 8),
     measured: {
       processUptimeSeconds: Math.round(elapsedSeconds),

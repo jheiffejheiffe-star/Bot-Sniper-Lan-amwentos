@@ -2064,6 +2064,52 @@ async function main(): Promise<void> {
     );
   });
 
+  await test("painel: feed e slot não podem ser fabricados (declarado vs medido)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const radarSrc = fs.readFileSync(
+      path.join(repoRoot, "src", "components", "GeyserGrpcRadar.tsx"),
+      "utf8"
+    );
+
+    /**
+     * Regra geral, mais forte que proibir a string: número de slot derivado do RELÓGIO não
+     * pode aparecer em endpoint declarado como REAL. Ele pode existir em painel declarado
+     * como simulado (onde o TruthBanner avisa) — nunca misturado com medição.
+     */
+    const declaredSimulated = new Set(
+      [...serverSrc.matchAll(/app\.get\("([^"]+)"/g)].length
+        ? [...serverSrc.matchAll(/\{\s*path: "(\/api\/[^"]+)", why:/g)].map((m) => m[1])
+        : []
+    );
+    assert.ok(declaredSimulated.size >= 5, "a lista de painéis declarados como simulados precisa existir");
+    for (const m of serverSrc.matchAll(/278913410 \+ Math\.floor\(\(Date\.now\(\) \/ 400\)/g)) {
+      const before = serverSrc.slice(0, m.index);
+      const endpoints = [...before.matchAll(/app\.get\("([^"]+)"/g)];
+      const owner = endpoints.length > 0 ? endpoints[endpoints.length - 1][1] : "(fora de endpoint)";
+      assert.ok(
+        declaredSimulated.has(owner),
+        `slot fabricado a partir do relógio em ${owner}, que NÃO está declarado como simulado em /api/system-truth`
+      );
+    }
+    assert.ok(serverSrc.includes("currentSlotMeasured"), "a API precisa dizer se o slot foi MEDIDO");
+    assert.ok(
+      /simulated: true,[\s\S]{0,200}MOCK\/RNG/.test(serverSrc),
+      "evento decorativo precisa se declarar como tal no payload"
+    );
+    assert.ok(/feed: \{[\s\S]{0,120}real: realCount/.test(serverSrc), "a API precisa contar real vs simulado");
+    assert.ok(serverSrc.includes("unmeasured"), "o que não é medido precisa ser listado como não medido");
+
+    // O painel não pode afirmar co-localização nem exibir números que a API não devolve.
+    for (const proibido of ["SHREDSTREAM CO-LOCATED", "sub-1.2ms", "System Ingestion Load"]) {
+      assert.ok(!radarSrc.includes(proibido), `afirmação fabricada no painel: "${proibido}"`);
+    }
+    assert.ok(
+      /evt\.isRealOnChain !== true[\s\S]{0,400}mock/i.test(radarSrc),
+      "evento decorativo precisa de selo visível na lista (só `isRealOnChain: true` é notificação real)"
+    );
+  });
+
   await test("regressão: infraestrutura inexistente não pode ser afirmada", async () => {
     const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
     const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
