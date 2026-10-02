@@ -142,7 +142,21 @@ async function checkJupiter(): Promise<void> {
 
 async function checkProgramsExist(): Promise<void> {
   const url = process.env.RPC_ENDPOINT;
-  if (!url) return;
+  if (!url) {
+    /**
+     * SILÊNCIO NÃO É RESULTADO. A versão anterior não imprimia nada aqui quando
+     * RPC_ENDPOINT estava ausente — e uma seção vazia se lê como "nada a reportar",
+     * quando na verdade significa "não verifiquei". Os program IDs são exatamente o que
+     * já foi fabricado uma vez neste projeto: precisam de verificação explícita.
+     */
+    record(
+      "Programas on-chain",
+      false,
+      "NÃO VERIFICADO: sem RPC_ENDPOINT não há como confirmar que os program ids existem " +
+        `e são executáveis (${Object.keys(PROGRAMS).length - 1} endereços não checados)`
+    );
+    return;
+  }
   try {
     const conn = new Connection(url, { commitment: "confirmed" });
     for (const [name, id] of Object.entries(PROGRAMS)) {

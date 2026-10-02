@@ -876,3 +876,106 @@ descartável, e a fixture nunca foi comitada.
 - Nota de ambiente: este workspace não persiste `node_modules/`, arquivos gitignored
   (`hft_operational_db.json`, `data/`) nem o ponteiro local da branch entre sessões. O código
   e o histórico vêm do remoto; dados de runtime sempre começam vazios aqui.
+
+
+---
+
+## Adendo 7 (2026-10-02) — "deixar funcionando": prova de funcionamento, veracidade do painel e runbook
+
+Objetivo desta rodada: responder "está funcionando?" com medição, em vez de impressão.
+
+### C36 — o verificador de endpoints tinha uma seção SILENCIOSA
+
+`npm run verify:endpoints` imprimia a seção `[Programas on-chain]` **vazia** quando
+`RPC_ENDPOINT` não estava definido. Seção vazia se lê como "nada a reportar", mas ali
+significava "não verifiquei" — e os program ids são exatamente o que já foi fabricado uma vez
+neste projeto (C2). Agora a ausência vira uma linha explícita:
+`NÃO VERIFICADO: sem RPC_ENDPOINT não há como confirmar que os program ids existem e são executáveis (14 endereços não checados)`.
+
+Também confirmado por medição (não por leitura de código): o script **sai com código 1** quando
+há falha (`echo $?` → `1`); o `0` que eu havia visto era do `tail` no pipe.
+
+### Build e execução de produção — verificados de ponta a ponta
+
+`npm run build` (vite + esbuild) e `npm start` (`node dist/server.cjs`) eram um caminho nunca
+exercitado nesta auditoria. Verificado:
+
+```
+npm run build   → dist/server.cjs 301,7kb + dist/ (assets) — 1 aviso conhecido (import.meta em CJS,
+                  inócuo: o código usa __filename primeiro nesse formato)
+npm start       → UI HTTP 200 (index.html 1447 B), API ok, POST 503 fail-closed sem ADMIN_TOKEN
+                  (fail-closed em produção é o comportamento CORRETO, não um defeito)
+```
+
+### `npm run smoke` — prova de funcionamento em um comando (`scripts/smoke.ts`)
+
+Existem 13 estágios que só podem ser provados **na rede do operador**: RPC, socket WS de
+detecção, fonte de preço, Jupiter, montagem+simulação da entrada shadow, Jito (tip accounts,
+tip floor, status de landing) e gravação do JSONL. O script roda todos, imprime **fato medido**
+(RTT, slot, contagem, host, id — nunca rótulo vazio) e sai com código 1 se algum falhar.
+
+Garantias: **não assina, não envia, não usa chave, não escreve no banco operacional** (só lê o
+cabeçalho para validar schema v5). O estágio de entrada shadow usa uma pubkey descartável
+(`SYSTEM_PROGRAM`) porque em PAPER/SHADOW nenhuma transação é assinada — e o próprio caminho de
+simulação do servidor é reaproveitado, não uma reimplementação.
+
+Um detalhe de honestidade: "Jito status de landing" é marcado **⚠️**, não ✅, quando a consulta
+é recusada — antes o rótulo verde escondia uma consulta que nunca chegou ao block engine.
+
+### C37 — o painel exibia RNG do servidor como se fosse medição
+
+Nove endpoints do dashboard geram números com `Math.random()` **no servidor**: latências
+P50/P99, `inclusion_rate`, `bundles_sent`, score preditivo, "geyser stream", veredito de bundle
+("Landed"), cenário de fork, RTT por região e escala de líderes. Nada disso é medição — e um
+operador lendo "inclusion rate 91,3%" não tem como saber.
+
+Correção (declarar, não esconder):
+
+- **`GET /api/system-truth`** — o próprio servidor enumera `realSources` (com o estado MEDIDO:
+  `socketOpen`/`eventCount`, contagens do banco, intenções ativas, estado do oráculo de tip,
+  modo) e `simulatedEndpoints` (com o motivo, endpoint por endpoint), mais
+  `summary.liveExecutionPath`.
+- **`<TruthBanner/>`** montado no topo de `App.tsx`, permanente e recolhível: `N painel(is) desta
+  tela são SIMULAÇÃO (números aleatórios no servidor)`. Se `/api/system-truth` não responder, o
+  banner **declara a falha** e pede que todos os números sejam tratados como não verificados —
+  não assume estado.
+- **`JitoTipOracle.getStatus()`** — corrigido um erro meu de leitura: `getLastError() === null`
+  significava "sem erro", mas era lido como "tudo certo" mesmo quando o oráculo **nunca havia
+  sido consultado**. Agora há `everQueried`/`lastSuccessAt`/`lastSuccessAgeMs`, e o endpoint
+  devolve "nunca consultado neste processo (nenhuma leitura de mercado feita ainda)" em vez de
+  "real".
+
+### `OPERACAO.md` — runbook de operação
+
+Documento novo com: estado atual de cada capacidade (o que existe / o que NÃO existe), sequência
+do zero ao rodando, tabela de variáveis de ambiente com valor seguro para começar, **como ler
+cada resposta** (fato → interpretação correta → interpretação ERRADA, incluindo
+`eventCount` como única prova de detecção e `snapshotAvailable` como "não houve comparação" e
+nunca "carteira vazia"), checklist da primeira hora, tabela de modos (o que cada um assina/envia),
+problemas comuns com o que eles NÃO significam, e a lista do que não está implementado.
+
+### Estado verificado nesta rodada
+
+```
+npm run lint              → exit 0
+npm run test              → 86/86 (novo grupo [15]: 4 testes)
+npm run build             → ok
+npm start (produção)      → UI 200 + API ok + POST fail-closed 503
+npm run smoke -- --quick  → 13 estágios, 3 falhas de REDE declaradas (sandbox sem egress)
+npm run verify:endpoints  → exit 1, com a seção vazia corrigida
+GET /api/system-truth     → 4 fontes reais + 9 painéis simulados declarados
+```
+
+### O que continua NÃO verificado
+
+- **O smoke nunca passou com egress**: nenhum estágio de rede (RPC, WS, Jupiter, Jito) foi
+  observado com sucesso aqui. A execução no SEU ambiente é que produz a evidência.
+- **A entrada shadow nunca simulou uma transação real** neste sandbox (sem cotação → sem
+  montagem → sem simulação). O caminho está implementado e testado com dependências injetadas,
+  não observado ponta a ponta.
+- **O banner é visual**: verifiquei que o componente está no bundle servido e que o endpoint
+  responde em produção, mas não há verificação de renderização (sem browser neste ambiente).
+- **Ruído de fundo observado** (não é bug de bloqueio): quando há posição gerível e o RPC está
+  inacessível, o gerenciador repete `getParsedAccountInfo ... fetch failed` a cada ~3s. É a
+  tentativa de cotação do preço, que falha honestamente — mas em produção, com RPC instável,
+  vale considerar backoff por posição para não gastar cota de RPC.

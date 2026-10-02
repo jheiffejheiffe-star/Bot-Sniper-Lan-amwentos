@@ -931,6 +931,105 @@ app.get("/api/execution-intents", (req, res) => {
   });
 });
 
+/**
+ * GET /api/system-truth — O QUE NESTE PAINEL É MEDIÇÃO E O QUE É SIMULAÇÃO.
+ *
+ * Motivo: a interface tem N painéis que exibem números visivelmente plausíveis (latências,
+ * inclusion rate, score preditivo, "geyser stream") que NÃO vêm de nenhum dado desta
+ * máquina — são gerados com `Math.random()` no próprio servidor. Sem uma declaração
+ * explícita, um operador lê "inclusion rate 91,3%" como desempenho medido.
+ *
+ * Este endpoint NÃO esconde nem remove esses painéis (o escopo de reescrever a UI é
+ * outro); ele DECLARA o status de cada fonte, para que a leitura seja possível.
+ *
+ * Classificação (por fonte):
+ *   - "real"        : o dado vem de RPC/rede/banco desta instalação, com a contagem observada.
+ *   - "simulated"   : número gerado por RNG no servidor. Não é medição de nada.
+ *   - "unavailable" : a fonte existe mas não respondeu nesta instalação (nunca preenchido com número).
+ *   - "read-only"   : consulta a leitura de verdade, com estado real (ex.: intenções, desync).
+ */
+app.get("/api/system-truth", (_req, res) => {
+  const detection = geyserClientRef?.getHealth() ?? null;
+  const positions = dbStore.getPositions();
+  const trades = dbStore.getTrades();
+  const intents = dbStore.getIntents();
+  const mode = getRuntimeModeResolution();
+
+  const simulatedEndpoints = [
+    { path: "/api/hft-telemetry", why: "latências, P50/P99, inclusion rate e bundles enviados são RNG" },
+    { path: "/metrics", why: "p95/p99, inclusion rate e bundles enviados são RNG (padrão Prometheus mantido por compatibilidade)" },
+    { path: "/api/predictive-score", why: "score/confiança/recomendação são RNG" },
+    { path: "/api/geyser-stream", why: "contadores de blobs/transações/slots são RNG" },
+    { path: "/api/submit-bundle", why: "bundle id e veredito 'Landed' são gerados; nenhum bundle é enviado" },
+    { path: "/api/simulate-fork", why: "cenário e tempos são RNG" },
+    { path: "/api/simulate-snipe", why: "roteiro de compra simulado (grava posição marcada como paper)" },
+    { path: "/api/co-location", why: "RTT por região é RNG" },
+    { path: "/api/jito-leader-schedule", why: "escala de líderes é RNG" },
+  ];
+
+  const realSources = [
+    {
+      source: "detecção (logsSubscribe WSS)",
+      status: "real",
+      detail: detection
+        ? `socketOpen=${detection.socketOpen}, subscrições=${detection.subscriptionsRequested}, ` +
+          `eventos=${detection.eventCount}, degradado=${detection.degraded}`
+        : "cliente de detecção ainda não inicializado",
+      caveat: "subscriptionsRequested é registro LOCAL; a prova de detecção é eventCount > 0",
+    },
+    {
+      source: "banco operacional",
+      status: "real",
+      detail:
+        `${positions.length} posição(ões) (${positions.filter((p: any) => p.mode === "paper").length} paper), ` +
+        `${trades.length} trade(s) (${trades.filter((t) => t.mode === "paper" || t.status === "paper").length} paper/shadow)`,
+      caveat: "contagens do arquivo local; posições com `mode` ausente são históricas e podem ser fabricadas",
+    },
+    {
+      source: "intenções de execução (idempotência)",
+      status: "real",
+      detail:
+        `${intents.length} registrada(s), ${intents.filter((i) => !["confirmed", "failed", "expired"].includes(i.state)).length} ativa(s)`,
+      caveat: "intenção ativa BLOQUEIA nova assinatura na mesma posição/lado",
+    },
+    (() => {
+      const jito = jitoTipOracle.getStatus();
+      const status = !jito.everQueried ? "unavailable" : jito.lastError ? "unavailable" : "real";
+      return {
+        source: "tip floor / status de landing (Jito)",
+        status,
+        detail: !jito.everQueried
+          ? "nunca consultado neste processo (nenhuma leitura de mercado feita ainda)"
+          : jito.lastError
+            ? `último erro: ${jito.lastError}`
+            : `último sucesso há ${jito.lastSuccessAgeMs}ms`,
+        caveat:
+          "sem resposta da fonte, percentis ficam nulos e a recomendação de tip é indisponível — nunca preenchida com valor de reserva",
+      };
+    })(),
+    {
+      source: "modo de execução",
+      status: "read-only",
+      detail: `${mode.mode} (canSign=${mode.liveAuthorized}; conflitos=${mode.conflicts.length})`,
+      caveat: "PAPER/SHADOW não assinam nada",
+    },
+  ];
+
+  return res.json({
+    generatedAt: new Date().toISOString(),
+    headline:
+      "Este painel mistura MEDIÇÃO REAL com painéis SIMULADOS (RNG no servidor). " +
+      "Nada de execução on-chain existe enquanto o caminho de entrada real não estiver implementado.",
+    realSources,
+    simulatedEndpoints,
+    summary: {
+      realSources: realSources.filter((s) => s.status === "real").length,
+      simulatedEndpoints: simulatedEndpoints.length,
+      liveExecutionPath: "não implementado (LaunchSwapper desabilitado) — nenhuma compra real é possível hoje",
+    },
+  });
+});
+
 app.get("/api/positions", (req, res) => {
   const includeQuarantined = String(req.query.include ?? "") === "quarantined";
   const positions = dbStore.getPositions();

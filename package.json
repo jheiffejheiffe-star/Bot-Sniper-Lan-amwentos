@@ -14,7 +14,8 @@
     "verify:endpoints": "tsx scripts/verify-endpoints.ts",
     "test:destructive": "tsx test-production.ts",
     "replay": "tsx scripts/replay.ts",
-    "quarantine": "tsx scripts/quarantine-db.ts"
+    "quarantine": "tsx scripts/quarantine-db.ts",
+    "smoke": "tsx scripts/smoke.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

@@ -1795,6 +1795,94 @@ async function main(): Promise<void> {
     );
   });
 
+  // ---------------------------------------------------------------------------
+  // [15] VERACIDADE DO PAINEL — o que é medição e o que é simulação
+  // ---------------------------------------------------------------------------
+  console.log("\n[15] Veracidade do painel e estado do oráculo de tip");
+
+  await test("oráculo nunca consultado NÃO é reportado como ok", async () => {
+    const { JitoTipOracle } = await import("../src/jitoStatus.js");
+    const oracle = new JitoTipOracle({ fetchFn: (async () => { throw new Error("não deve chamar"); }) as any, now: () => 1000 });
+    const st = oracle.getStatus();
+    assert.equal(st.everQueried, false, "sem consulta não existe sucesso");
+    assert.equal(st.lastSuccessAt, null);
+    assert.equal(st.lastSuccessAgeMs, null);
+    assert.equal(st.lastError, null, "null aqui é 'não consultado', não 'tudo certo'");
+  });
+
+  await test("oráculo registra sucesso e erro de forma distinguível", async () => {
+    const { JitoTipOracle } = await import("../src/jitoStatus.js");
+    // Formato REAL da resposta: ARRAY com os percentis em SOL (ver tip_floor do Jito).
+    const okBody = [
+      {
+        time: "2026-01-01T00:00:00Z",
+        landed_tips_25th_percentile: 6.001e-6,
+        landed_tips_50th_percentile: 1e-5,
+        landed_tips_75th_percentile: 3.6e-5,
+        landed_tips_95th_percentile: 1.4e-3,
+        landed_tips_99th_percentile: 1e-2,
+        ema_landed_tips_50th_percentile: 9.8e-6,
+      },
+    ];
+    let nowMs = 1_000;
+    const okFetch = (async () => new Response(JSON.stringify(okBody), { status: 200, headers: { "content-type": "application/json" } })) as any;
+    const oracle = new JitoTipOracle({ fetchFn: okFetch, now: () => nowMs });
+    const floor = await oracle.getTipFloor();
+    assert.equal(floor.available, true);
+    const st = oracle.getStatus();
+    assert.equal(st.everQueried, true);
+    assert.equal(st.lastError, null);
+    assert.equal(st.lastSuccessAgeMs, 0);
+
+    // Segunda instância: fonte fora do ar → erro registrado, sem sucesso.
+    const failing = new JitoTipOracle({ fetchFn: (async () => { throw new Error("fetch failed"); }) as any, now: () => 5_000 });
+    const bad = await failing.getTipFloor();
+    assert.equal(bad.available, false);
+    const stBad = failing.getStatus();
+    assert.equal(stBad.everQueried, false, "consulta que falhou não é sucesso");
+    assert.ok(stBad.lastError && /fetch failed/.test(stBad.lastError));
+  });
+
+  await test("o servidor declara os painéis simulados (endpoint /api/system-truth)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes('"/api/system-truth"'), "o endpoint de veracidade precisa existir");
+    // Os painéis conhecidos como RNG precisam estar DECLARADOS (não basta existirem).
+    for (const path_ of [
+      "/api/hft-telemetry",
+      "/metrics",
+      "/api/predictive-score",
+      "/api/geyser-stream",
+      "/api/submit-bundle",
+      "/api/simulate-fork",
+      "/api/simulate-snipe",
+      "/api/co-location",
+      "/api/jito-leader-schedule",
+    ]) {
+      assert.ok(
+        serverSrc.includes(path_),
+        `o painel simulado ${path_} precisa aparecer na declaração de veracidade`
+      );
+    }
+    assert.ok(
+      serverSrc.includes("liveExecutionPath") && /não implementado/.test(serverSrc),
+      "o endpoint precisa declarar que o caminho de execução real não existe hoje"
+    );
+  });
+
+  await test("o banner de verdade está MONTADO na interface (não só criado)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+    const bannerSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "TruthBanner.tsx"), "utf8");
+    assert.ok(appSrc.includes('import TruthBanner from "./components/TruthBanner"'), "import ausente");
+    assert.ok(appSrc.includes("<TruthBanner />"), "componente criado mas NÃO renderizado (não apareceria na tela)");
+    assert.ok(bannerSrc.includes("/api/system-truth"), "o banner precisa ler o endpoint de veracidade");
+    assert.ok(
+      /Não foi possível ler o status de veracidade/.test(bannerSrc),
+      "sem leitura, o banner precisa declarar a falha e não inventar estado"
+    );
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

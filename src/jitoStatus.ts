@@ -688,6 +688,8 @@ export class JitoTipOracle {
   private cache: { sample: TipFloorSample; fetchedAt: number; problems: string[] } | null = null;
   private lastRequestAt = 0;
   private lastError: string | null = null;
+  /** Momento do último sucesso real (null = nunca consultado com sucesso). */
+  private lastSuccessAt: number | null = null;
 
   constructor(private readonly options: TipOracleOptions) {}
 
@@ -755,6 +757,7 @@ export class JitoTipOracle {
       }
       this.cache = { sample: parsed.sample, fetchedAt: now, problems: parsed.problems };
       this.lastError = null;
+      this.lastSuccessAt = now;
       return {
         available: true,
         sample: parsed.sample,
@@ -894,5 +897,30 @@ export class JitoTipOracle {
   /** Último erro observado (para diagnóstico no painel), sem inventar estado. */
   getLastError(): string | null {
     return this.lastError;
+  }
+
+  /**
+   * Estado REAL do oráculo, para diagnóstico honesto.
+   *
+   * `lastError` só existe depois de uma consulta falha; `lastSuccessAt` só depois de uma
+   * consulta bem-sucedida. Um oráculo NUNCA consultado não é "ok" nem "com erro" — é
+   * "não consultado", e é isso que ele reporta (antes, `getLastError() === null` era lido
+   * como "tudo certo" mesmo sem nenhuma chamada ter acontecido).
+   */
+  getStatus(): {
+    everQueried: boolean;
+    lastSuccessAt: number | null;
+    lastSuccessAgeMs: number | null;
+    lastError: string | null;
+    hasLastKnown: boolean;
+  } {
+    const now = this.options.now();
+    return {
+      everQueried: this.lastSuccessAt !== null,
+      lastSuccessAt: this.lastSuccessAt,
+      lastSuccessAgeMs: this.lastSuccessAt === null ? null : now - this.lastSuccessAt,
+      lastError: this.lastError,
+      hasLastKnown: this.describeLastKnown(now) !== null,
+    };
   }
 }
