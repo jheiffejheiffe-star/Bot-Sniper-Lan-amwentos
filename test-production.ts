@@ -3,9 +3,35 @@ import fs from "fs";
 import { dbStore } from "./src/persistence.js";
 import { getActiveWalletPublicKey, initializeVault } from "./src/security.js";
 
+/**
+ * AVISO DE SEGURANÇA (auditoria 2026-10-02)
+ * -----------------------------------------
+ * Este script APAGA hft_operational_db.json e o .bak nas primeiras linhas. Rodá-lo em
+ * produção destrói o histórico operacional (trades, posições, logs) sem aviso — foi o
+ * que ele fazia. Além disso, os "10/10 testes" anunciados eram, na prática, 4 áreas de
+ * asserção, e duas delas testavam REIMPLEMENTAÇÕES locais da lógica (um Set de lock
+ * próprio e uma cópia da fórmula de slippage), não o código real do servidor.
+ *
+ * Para testes reais use: npm run test     (tests/safety.test.ts, não destrutivo)
+ * Este arquivo só roda com confirmação explícita.
+ */
 async function runTests() {
+  if (process.env.HFT_ALLOW_DB_WIPE !== "true") {
+    console.error(
+      "=========================================\n" +
+        "⛔ test-production.ts está DESABILITADO por segurança.\n\n" +
+        "Ele APAGA o banco operacional (hft_operational_db.json + .bak).\n\n" +
+        "Use a suíte real, que roda em diretório isolado e não toca no seu histórico:\n" +
+        "    npm run test\n\n" +
+        "Se você realmente quer apagar o banco e rodar este script legado:\n" +
+        "    HFT_ALLOW_DB_WIPE=true npm run test:destructive\n" +
+        "========================================="
+    );
+    process.exit(1);
+  }
+
   console.log("=========================================");
-  console.log("🚨 INICIANDO TESTES DE HOMOLOGAÇÃO DE PRODUÇÃO");
+  console.log("🚨 INICIANDO TESTES DE HOMOLOGAÇÃO (DESTRUTIVO — banco será apagado)");
   console.log("=========================================");
 
   // Initialize KMS Secure Memory Vault
@@ -114,7 +140,7 @@ async function runTests() {
   console.log("  ✅ Slippage Adaptativo Dinâmico por Tentativa: OK");
 
   console.log("\n=========================================");
-  console.log("🏆 TODOS OS TESTES PASSARAM COM SUCESSO (10/10)!");
+  console.log("⚠️  4 áreas verificadas neste script legado — isto NÃO é cobertura de 10 testes.");
   console.log("=========================================");
 }
 

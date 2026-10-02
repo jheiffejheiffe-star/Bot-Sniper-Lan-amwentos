@@ -9,7 +9,12 @@ export interface DBTrade {
   mint: string;
   amount: string;
   outAmount: string;
-  status: "success" | "failed" | "blacklisted";
+  /**
+   * "paper" e "shadow" NUNCA podem ser contados como execução real em relatório de PnL.
+   * Sem esta distinção, somar trades de sombra com trades reais produz um número que não
+   * corresponde a dinheiro nenhum.
+   */
+  status: "success" | "failed" | "blacklisted" | "paper" | "shadow";
   block: number;
   tipSol: number;
   route: string;
@@ -17,6 +22,20 @@ export interface DBTrade {
   latencyMs: number;
   isAntiRugSaved?: boolean;
   savedAmountSol?: string;
+  /**
+   * "live" = execução real on-chain; "paper" = sombra/simulação (NUNCA é PnL real).
+   * Sem este campo não há como distinguir resultado real de simulado no relatório —
+   * e confundir os dois é o erro que mais destrói capital em bots.
+   */
+  mode?: "live" | "paper";
+  /** Assinatura on-chain real. `null` em paper trades (nunca preenchida com texto). */
+  signature?: string | null;
+  /** PnL líquido medido por delta de saldo (SOL). Ausente quando não medido. */
+  pnlNetSol?: number;
+  /** Fee de rede paga (SOL). */
+  feesSol?: number;
+  /** true somente quando o resultado foi derivado de saldos on-chain confirmados. */
+  measuredOnChain?: boolean;
 }
 
 export interface DBPosition {
@@ -37,6 +56,16 @@ export interface DBPosition {
   timeClosed?: string;
   slippageBps?: number;
   maxSlippageBps?: number;
+  /** "paper" = posição sombra; o gerenciador NÃO tenta liquidar on-chain. */
+  mode?: "live" | "paper";
+  /** Origem do último preço usado (para auditar decisões de SL/TP). */
+  priceSource?: string;
+  /** Contador de tentativas de saída que falharam (posição continua aberta). */
+  exitAttempts?: number;
+  lastExitError?: string;
+  lastExitAttemptAt?: string;
+  lastPriceAlertAt?: number;
+  priceTelemetry?: { status: string; lastAttemptAt: string };
 }
 
 export interface DBOperationalState {
@@ -69,6 +98,10 @@ export interface DBLog {
 class TransactionalStore {
   private dbPath: string = "";
   private logCounter: number = 0;
+  /** Contadores REAIS de persistência (substituem as constantes de "saúde"). */
+  private commitsAttempted: number = 0;
+  private commitFailures: number = 0;
+  private lastCommitDurationsMs: number[] = [];
   private data: {
     trades: DBTrade[];
     positions: DBPosition[];
@@ -203,6 +236,9 @@ class TransactionalStore {
   private commit(newData: typeof this.data) {
     if (!isServer) return;
 
+    const startedAt = Date.now();
+    this.commitsAttempted++;
+
     try {
       newData.transactionCount++;
       const jsonString = JSON.stringify(newData, null, 2);
@@ -238,7 +274,11 @@ class TransactionalStore {
 
       // Atomic rename
       fs.renameSync(tmpPath, this.dbPath);
+
+      this.lastCommitDurationsMs.push(Date.now() - startedAt);
+      if (this.lastCommitDurationsMs.length > 50) this.lastCommitDurationsMs.shift();
     } catch (err: any) {
+      this.commitFailures++;
       console.error("[Database Commit Error] Disk write aborted, rolled back to state cache.", err.message);
     }
   }
@@ -329,10 +369,18 @@ class TransactionalStore {
     return newLog;
   }
 
-  public rotateLogs(retentionDays: number = 7, maxSizeKb: number = 2000): { rotatedCount: number; bytesSaved: number; currentSizeKb: number } {
+  public rotateLogs(retentionDays: number = 7, maxSizeKb: number = 2000): {
+    rotatedCount: number;
+    bytesSaved: number;
+    currentSizeKb: number;
+    bytesAreEstimated: boolean;
+    appliedPolicy: string;
+  } {
     if (!this.data.logs) this.data.logs = [];
     const initialCount = this.data.logs.length;
-    // We rotate by trimming the array to the most recent 15 elements to simulate purging
+    // AVISO: isto é rotação por CONTAGEM, não por retenção de tempo/tamanho.
+    // Os parâmetros retentionDays/maxSizeKb são aceitos mas NÃO aplicados — reportamos isso
+    // no retorno (appliedPolicy) para que a UI não afirme uma política que não existe.
     const keptCount = Math.min(initialCount, 15);
     const removedCount = initialCount - keptCount;
     this.data.logs = this.data.logs.slice(0, keptCount);
@@ -350,8 +398,12 @@ class TransactionalStore {
     
     return {
       rotatedCount: removedCount,
-      bytesSaved: removedCount * 180, // Estimated bytes
-      currentSizeKb: Math.round((this.data.logs.length * 180) / 1024 * 100) / 100
+      // bytesSaved/currentSizeKb são ESTIMATIVAS (180 bytes/log). Marcado explicitamente
+      // para não serem lidos como medição precisa.
+      bytesSaved: removedCount * 180,
+      currentSizeKb: Math.round((this.data.logs.length * 180) / 1024 * 100) / 100,
+      bytesAreEstimated: true,
+      appliedPolicy: `contagem (máx. 15 entradas); retentionDays=${retentionDays} e maxSizeKb=${maxSizeKb} NÃO aplicados`,
     };
   }
 
@@ -364,8 +416,24 @@ class TransactionalStore {
       positionsCount: this.data.positions.length,
       logsCount: (this.data.logs || []).length,
       path: this.dbPath,
-      health: "EXCELLENT",
-      writeLatencyMs: 0.12 // sub-millisecond local write cache
+      // MÉTRICAS REAIS (auditoria): "EXCELLENT" e 0.12ms eram constantes hardcoded exibidas
+      // como se fossem medição. health agora deriva da razão de commits com falha; a latência
+      // de escrita é a média das últimas operações observadas.
+      health: this.commitsAttempted === 0
+        ? "UNKNOWN"
+        : this.commitFailures / this.commitsAttempted > 0.05
+          ? "DEGRADED"
+          : this.commitFailures > 0
+            ? "WARN"
+            : "OK",
+      commitsAttempted: this.commitsAttempted,
+      commitFailures: this.commitFailures,
+      writeLatencyMs: this.lastCommitDurationsMs.length
+        ? Math.round((this.lastCommitDurationsMs.reduce((a, b) => a + b, 0) / this.lastCommitDurationsMs.length) * 100) / 100
+        : null,
+      logsRetentionNote:
+        "Rotação por contagem (não por dias/KB): mantém as 15 entradas mais recentes. " +
+        "Os parâmetros retentionDays/maxSizeKb são aceitos por compatibilidade e NÃO são aplicados.",
     };
   }
 }

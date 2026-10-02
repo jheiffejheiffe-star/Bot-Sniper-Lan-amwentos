@@ -16,11 +16,71 @@ import {
   GeyserStreamClient, 
   JupiterIntegration, 
   JitoBundleSender,
+  isValidBase58Blockhash,
   RPC_ENDPOINT, 
   RPC_WEBSOCKET, 
-  GEYSER_GRPC_URL 
+  GEYSER_GRPC_URL
 } from "./src/realExecution.js";
+import {
+  PROGRAMS,
+  DEXSCREENER_BASE_URL,
+  assertConfigIntegrity,
+  isValidPubkey
+} from "./src/solanaConfig.js";
+import {
+  assessPriceFreshness,
+  clampTipSol,
+  riskActionForFreshness,
+  type PriceQuote
+} from "./src/accounting.js";
+import {
+  describeRuntimeMode,
+  getRuntimeModeResolution,
+  validateRuntimeConfiguration,
+} from "./src/runtimeMode.js";
+import { LatencyTrace, telemetry, wallClockNow } from "./src/telemetry.js";
+import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
+import { compareStrategies, DEFAULT_STRATEGIES } from "./src/replay.js";
 import bs58 from "bs58";
+
+// Falha rápido no boot se qualquer constante de protocolo estiver corrompida.
+// Endereço fabricado = SOL perdido ou transação rejeitada. Melhor não subir.
+assertConfigIntegrity();
+
+/**
+ * VALIDAÇÃO DE BOOT POR MODO DE EXECUÇÃO.
+ *
+ * Regra: configuração crítica faltando NÃO vira aviso — vira recusa de subir.
+ * Subir meio-configurado é pior do que não subir: o caminho que mais depende de
+ * configuração correta é a SAÍDA, e uma saída que falha em silêncio prende capital.
+ *
+ * Concretamente, o caso que esta validação elimina:
+ *   LIVE_TRADING_ENABLED=true  +  RUNTIME_MODE ausente
+ * Antes: interpretado como "ligado", com o sistema operando por inferência.
+ * Agora: erro fatal com instrução do que declarar.
+ */
+{
+  const runtimeResolution = getRuntimeModeResolution();
+  const bootCheck = validateRuntimeConfiguration(runtimeResolution);
+
+  console.log(
+    `[Boot] Modo de execução: ${runtimeResolution.mode}` +
+      ` (liveAuthorized=${runtimeResolution.liveAuthorized}` +
+      `${runtimeResolution.requested ? `, RUNTIME_MODE=${runtimeResolution.requested}` : ", RUNTIME_MODE não declarado"}).`
+  );
+  for (const reason of runtimeResolution.reasons) console.log(`[Boot]   ${reason}`);
+  for (const conflict of runtimeResolution.conflicts) console.warn(`[Boot][CONFLITO] ${conflict}`);
+  for (const warning of bootCheck.warnings) console.warn(`[Boot][AVISO] ${warning}`);
+
+  if (bootCheck.fatal.length > 0) {
+    for (const fatal of bootCheck.fatal) console.error(`[Boot][FATAL] ${fatal}`);
+    console.error(
+      "[Boot] Encerrando (exit 1): configuração incompatível com o modo declarado. " +
+        "Nada é assinado com configuração ambígua."
+    );
+    process.exit(1);
+  }
+}
 
 // Global on-chain indicators and events tracking
 let globalConnection: Connection | null = null;
@@ -33,8 +93,13 @@ import {
   rotateActiveWallet,
   resetCircuitBreaker,
   reportTradeOutcome,
+  reportSignalRejected,
+  reportSignalAccepted,
+  isLiveTradingEnabled,
+  assertMutationAuthorized,
+  assertExecutionAllowed,
+  assertExitAllowed,
   getActiveWalletPublicKey,
-  signWithIsolatedKey,
   executeWithDecryptedKeypair
 } from "./src/security.js";
 import { dbStore } from "./src/persistence.js";
@@ -43,8 +108,33 @@ const app = express();
 const PORT = 3000;
 
 // Process safety handlers to prevent container crashes on transient network drops
+/**
+ * Exceção não capturada em processo que detém chaves e posições.
+ *
+ * A versão anterior logava e CONTINUAVA rodando ("caught safely"). Depois de uma exceção
+ * não tratada não há garantia de que o estado em memória (posições, locks, cache de
+ * blockhash, cursores de ingestão) permaneça consistente — e um estado inconsistente que
+ * continua operando é mais perigoso do que um processo que reinicia.
+ *
+ * Política: registrar de forma irrecuperável e deixar o SUPERVISOR reiniciar (systemd/pm2/
+ * k8s). O estado crítico (posições, kill switch, logs) está no disco, e `reconcileStuckExits`
+ * trata posições presas em EXIT_PENDING no próximo boot.
+ */
 process.on("uncaughtException", (err) => {
-  console.error("[Process Guard] Uncaught Exception caught safely:", err?.message || err);
+  console.error("[Process Guard] UNCAUGHT EXCEPTION — encerrando para reinício pelo supervisor:", err);
+  try {
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "CRITICAL",
+      component: "SYSTEM",
+      message:
+        `Processo encerrado por exceção não capturada: ${err?.message || String(err)}. ` +
+        `Reinício pelo supervisor necessário. Verifique posições abertas antes de reativar.`,
+    });
+  } catch {
+    /* se nem o log funciona, ainda assim devemos sair */
+  }
+  process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {
@@ -53,9 +143,40 @@ process.on("unhandledRejection", (reason) => {
 
 app.use(express.json());
 
+/**
+ * GUARD DE MUTAÇÃO (fail-closed).
+ *
+ * AUDITORIA 2026-10-02: todos os endpoints POST estavam abertos. Em um servidor com a
+ * hot wallet armada, qualquer host que alcançasse a porta 3000 podia fechar posições,
+ * acionar o kill switch ou enviar bundles. Agora todo POST passa por autorização.
+ *
+ * GETs permanecem abertos (somente leitura) para não quebrar dashboards.
+ */
+app.use((req, res, next) => {
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") {
+    return next();
+  }
+  const auth = assertMutationAuthorized(req);
+  if (!auth.ok) {
+    console.warn(`[API Guard] POST ${req.path} bloqueado: ${auth.error}`);
+    return res.status(auth.status).json({ error: auth.error });
+  }
+  return next();
+});
+
 // Essential Cloud Run health check and liveness endpoints
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", uptime: process.uptime() });
+  res.json({ status: "ok", uptime: process.uptime(), runtimeMode: getRuntimeModeResolution().mode });
+});
+
+/**
+ * GET /api/runtime-mode — o modo efetivo, o que foi declarado e POR QUE.
+ *
+ * Leitura pura. Existe para que o operador (e o painel) nunca precise inferir o modo:
+ * "por que o bot não está comprando?" precisa ter resposta direta, não arqueologia.
+ */
+app.get("/api/runtime-mode", (_req, res) => {
+  return res.json(describeRuntimeMode());
 });
 
 app.get("/healthz", (_req, res) => {
@@ -70,160 +191,293 @@ let circuitBreakerThreshold = initialSettings.circuitBreakerThreshold;
 let pm2State = initialSettings.pm2State;
 let kafkaThroughputBase = 2450; // msg/sec
 
-let rpcNodes = [
-  { id: "rpc-bare-metal-shred", name: "London/Frankfurt (Equinix LD4 Bare Metal)", url: "https://bm-shred.equinix-ld4.solana.hft", latency: 999, jitterMs: 99, status: "offline", region: "London/Frankfurt", load: 0, shredStream: "inactive", slotLag: 0, packetLoss: 0, reconnectionCount: 0, isPrimary: false },
-  { id: "rpc-us-east", name: "US-East (Triton Premium)", url: "https://solana-us-east.triton.hft.io", latency: 12, jitterMs: 1, status: "healthy", region: "Virginia", load: 24, shredStream: "inactive", slotLag: 0, packetLoss: 0, reconnectionCount: 0, isPrimary: true },
-  { id: "rpc-eu-central", name: "EU-Central (Helius Premium)", url: "https://solana-eu-central.helius.hft.io", latency: 19, jitterMs: 2, status: "healthy", region: "Frankfurt", load: 31, shredStream: "inactive", slotLag: 0, packetLoss: 0, reconnectionCount: 0, isPrimary: false },
-  { id: "rpc-ap-southeast", name: "AP-Southeast (QuickNode)", url: "https://solana-ap-southeast.quicknode.hft.com", latency: 45, jitterMs: 5, status: "healthy", region: "Singapore", load: 15, shredStream: "inactive", slotLag: 0, packetLoss: 0.1, reconnectionCount: 0, isPrimary: false },
-  { id: "rpc-backup-public", name: "Public Backup (Solana Labs)", url: "https://api.mainnet-beta.solana.com", latency: 124, jitterMs: 22, status: "degraded", region: "Global", load: 88, shredStream: "inactive", slotLag: 2, packetLoss: 1.5, reconnectionCount: 0, isPrimary: false }
-];
+/**
+ * NÓS RPC — DERIVADOS DE CONFIGURAÇÃO, NÃO INVENTADOS.
+ *
+ * AUDITORIA 2026-10-02: a versão anterior continha endpoints FABRICADOS
+ * ("https://bm-shred.equinix-ld4.solana.hft", "https://solana-us-east.triton.hft.io"...).
+ * Efeito em cascata: runWithRpcFailover tentava conectar nesses hosts inexistentes,
+ * falhava sempre, e a execução caía no bloco de "fallback simulado" que gravava a
+ * operação como sucesso. Ou seja: a fabricação dos hosts produzia PnL fictício.
+ *
+ * Agora: RPC_ENDPOINT é o primário e RPC_FALLBACKS (CSV) são os backups. Se não houver
+ * backup configurado, não há backup — e o sistema diz isso, em vez de simular.
+ */
+const FABRICATED_HOST_PATTERNS = [/\.hft\.(io|com)$/i, /equinix-ld4\.solana\.hft/i, /\.hft\.io$/i];
 
-// Shared blockhash cache (HFT spec)
-const blockhashCache = {
-  cachedBlockhash: "Hft5E8yvQ7N1gA9zK8uXy4mN2bVp3qW5e6f7g8h9jK",
-  lastFetchedAt: Date.now(),
-  hits: 4122,
-  misses: 45,
-  ttlMs: 1500
+function isPlaceholderRpcUrl(url: string): boolean {
+  if (!url || typeof url !== "string") return true;
+  if (!/^https?:\/\//i.test(url)) return true;
+  return FABRICATED_HOST_PATTERNS.some((re) => re.test(url));
+}
+
+interface RpcNodeMetrics {
+  /** Últimas N medições de RTT (ms) para cálculo de percentil e jitter. */
+  samples: number[];
+  lastMeasuredAt: number;
+  lastSlot: number | null;
+  consecutiveFailures: number;
+}
+
+type RpcNode = {
+  id: string;
+  name: string;
+  url: string;
+  latency: number;
+  jitterMs: number;
+  status: "healthy" | "degraded" | "offline";
+  region: string;
+  /** Carga do provedor: não é mensurável via RPC. 0 = desconhecido (ver metricsSource). */
+  load: number;
+  slotLag: number;
+  /** Perda de pacote não é mensurável via HTTP JSON-RPC. 0 = não medido. */
+  packetLoss: number;
+  shredStream: "active" | "inactive";
+  reconnectionCount: number;
+  isPrimary: boolean;
+  /** Explica a origem de cada métrica: medida de verdade ou indisponível. */
+  metricsSource: "measured" | "partial" | "unavailable";
+  blockhashCacheAge?: number;
 };
 
-// Failover event log
-const failoverEvents: Array<{ time: string; fromNode: string; toNode: string; reason: string }> = [
-  { time: new Date().toTimeString().split(' ')[0], fromNode: "None", toNode: "US-East (Triton Premium)", reason: "Sistema inicializado com rota ótima" }
-];
+const P95 = (samples: number[]): number => {
+  if (samples.length === 0) return Number.NaN;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+  return sorted[idx];
+};
 
-// Active chaos state to persist across requests
-const chaosState: { [nodeId: string]: { status?: string; latency?: number; slotLag?: number; packetLoss?: number; jitterMs?: number } } = {};
+const JITTER = (samples: number[]): number => {
+  if (samples.length < 2) return 0;
+  const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
+  const variance = samples.reduce((acc, s) => acc + (s - mean) ** 2, 0) / samples.length;
+  return Math.sqrt(variance);
+};
 
-// Run loop to dynamically evaluate fitness and select best endpoint
-function runHftInfraLoop() {
-  rpcNodes = rpcNodes.map(node => {
-    const chaos = chaosState[node.id] || {};
-    
-    let status = chaos.status !== undefined ? chaos.status : node.status;
-    let latency = node.latency;
-    let jitterMs = node.jitterMs;
-    let slotLag = node.slotLag;
-    let packetLoss = node.packetLoss;
-    let load = node.load;
-    let shredStream = (node as any).shredStream || "inactive";
+function buildRpcNodeList(): RpcNode[] {
+  const primaryUrl = RPC_ENDPOINT;
+  const fallbacks = (process.env.RPC_FALLBACKS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
-    // Standard behavior per node if not crashed by chaos
-    if (status !== "offline") {
-      if (node.id === "rpc-bare-metal-shred") {
-        if (coLocationActive) {
-          status = chaos.status || "healthy";
-          latency = chaos.latency !== undefined ? chaos.latency : parseFloat((1.2 + Math.random() * 0.8).toFixed(1));
-          jitterMs = chaos.jitterMs !== undefined ? chaos.jitterMs : parseFloat((0.05 + Math.random() * 0.08).toFixed(2));
-          slotLag = chaos.slotLag !== undefined ? chaos.slotLag : 0;
-          packetLoss = chaos.packetLoss !== undefined ? chaos.packetLoss : 0;
-          load = Math.floor(6 + Math.random() * 4);
-          shredStream = "active";
-        } else {
-          status = "offline";
-          latency = 999;
-          jitterMs = 99;
-          slotLag = 0;
-          packetLoss = 0;
-          load = 0;
-          shredStream = "inactive";
-        }
-      } else {
-        // Normal nodes drift slightly
-        latency = chaos.latency !== undefined ? chaos.latency : Math.max(4, node.latency + (Date.now() % 5) - 2);
-        jitterMs = chaos.jitterMs !== undefined ? chaos.jitterMs : Math.max(0.5, node.jitterMs + ((Date.now() % 8) / 10) - 0.4);
-        slotLag = chaos.slotLag !== undefined ? chaos.slotLag : Math.max(0, node.slotLag + (((Date.now() % 10) > 8) ? 1 : ((Date.now() % 10) < 2) ? -1 : 0));
-        packetLoss = chaos.packetLoss !== undefined ? chaos.packetLoss : Math.max(0, parseFloat((node.packetLoss + ((Date.now() % 5) / 20) - 0.1).toFixed(2)));
-        load = Math.min(100, Math.max(5, node.load + (Date.now() % 6) - 3));
-      }
-    } else {
-      // Offline node simulation
-      latency = 999;
-      jitterMs = 99;
-      slotLag = 5;
-      packetLoss = 100;
-      load = 0;
-      shredStream = "inactive";
+  const entries: Array<{ id: string; name: string; url: string; region: string; primary: boolean }> = [
+    {
+      id: "rpc-primary",
+      name: `Primário (${process.env.RPC_PRIMARY_LABEL || "RPC_ENDPOINT"})`,
+      url: primaryUrl,
+      region: process.env.RPC_PRIMARY_REGION || "desconhecida",
+      primary: true,
+    },
+    ...fallbacks.map((url, i) => ({
+      id: `rpc-fallback-${i + 1}`,
+      name: `Fallback ${i + 1}`,
+      url,
+      region: process.env[`RPC_FALLBACK_${i + 1}_REGION`] || "desconhecida",
+      primary: false,
+    })),
+  ];
 
-      // Reconnection simulation: try to auto-reconnect if not forced by Chaos
-      if (chaos.status === undefined) {
-        // Deterministic reconnection check
-        if (((Date.now() % 10) > 8) && node.id !== "rpc-bare-metal-shred") {
-          status = "healthy";
-          node.reconnectionCount = (node.reconnectionCount || 0) + 1;
-          console.log(`[⚡ AUTO-RECONNECT] Nó RPC restabelecido: ${node.name}`);
-        }
-      }
-    }
-
+  return entries.map((e) => {
+    const usable = !isPlaceholderRpcUrl(e.url);
     return {
-      ...node,
-      status: status as any,
-      latency: parseFloat(latency.toFixed(1)),
-      jitterMs: parseFloat(jitterMs.toFixed(2)),
-      slotLag,
-      packetLoss,
-      load,
-      shredStream
+      id: e.id,
+      name: e.name,
+      url: e.url,
+      latency: Number.NaN,
+      jitterMs: 0,
+      status: usable ? "degraded" : "offline",
+      region: e.region,
+      load: 0,
+      slotLag: 0,
+      packetLoss: 0,
+      shredStream: "inactive" as const,
+      reconnectionCount: 0,
+      isPrimary: e.primary && usable,
+      metricsSource: usable ? "partial" : "unavailable",
     };
   });
+}
 
-  // Select the absolute best endpoint based on composite fitness
-  const healthyNodes = rpcNodes.filter(n => n.status !== "offline");
-  if (healthyNodes.length > 0) {
-    const sortedByFitness = [...healthyNodes].sort((a, b) => {
-      const fitnessA = a.latency + (a.slotLag * 50) + (a.packetLoss * 35) + (a.jitterMs * 4);
-      const fitnessB = b.latency + (b.slotLag * 50) + (b.packetLoss * 35) + (b.jitterMs * 4);
-      return fitnessA - fitnessB;
-    });
+let rpcNodes: RpcNode[] = buildRpcNodeList();
+const rpcMetrics: Record<string, RpcNodeMetrics> = {};
+for (const n of rpcNodes) {
+  rpcMetrics[n.id] = { samples: [], lastMeasuredAt: 0, lastSlot: null, consecutiveFailures: 0 };
+}
 
-    const bestNode = sortedByFitness[0];
-    const previousPrimary = rpcNodes.find(n => n.isPrimary);
+// Failover event log — populado apenas com medições reais (ver runHftInfraLoop).
+const failoverEvents: Array<{ time: string; fromNode: string; toNode: string; reason: string }> = [
+  {
+    time: new Date().toTimeString().split(" ")[0],
+    fromNode: "—",
+    toNode: "—",
+    reason:
+      "Aguardando primeira medição de RTT dos nós configurados. Nenhum resultado é exibido antes de existir medição real.",
+  },
+];
 
-    // If best node changed, execute automatic failover
-    if (previousPrimary && previousPrimary.id !== bestNode.id) {
-      const timeStr = new Date().toTimeString().split(' ')[0];
-      const reasonStr = `Auto-Failover acionado: Nó ${bestNode.name} apresenta melhor adequação HFT (RTT: ${bestNode.latency}ms, Slot Lag: ${bestNode.slotLag}, Perda: ${bestNode.packetLoss}%) em relação a ${previousPrimary.name}.`;
-      
-      failoverEvents.unshift({
-        time: timeStr,
-        fromNode: previousPrimary.name,
-        toNode: bestNode.name,
-        reason: reasonStr
-      });
+// Instância ÚNICA do cache de blockhash real (substitui o gerador de hash sintético).
+let blockhashCacheRef: RecentBlockhashCache | null = null;
 
-      console.log(`[⚡ HFT FAILOVER] ${reasonStr}`);
+// Chaos state — usado APENAS pelo endpoint dev-only /api/rpc-infra/chaos para
+// demonstrar degradação em ambiente de desenvolvimento. Nunca em produção.
+const chaosState: { [nodeId: string]: { status?: string; latency?: number; slotLag?: number; packetLoss?: number; jitterMs?: number } } = {};
 
-      // Update primary statuses
-      rpcNodes.forEach(n => {
-        n.isPrimary = n.id === bestNode.id;
-      });
-    } else if (!previousPrimary) {
-      rpcNodes.forEach(n => {
-        n.isPrimary = n.id === bestNode.id;
-      });
-    }
+/**
+ * Mede RTT real de um nó RPC via getLatestBlockhash + getSlot.
+ *
+ * AUDITORIA 2026-10-02: antes, `runHftInfraLoop` preenchia latência/jitter/carga com
+ * `Math.random()` e ainda GERAVA UM BLOCKHASH FALSO a cada 2s (string começando com "Hft",
+ * incrementando "misses"). Esse blockhash falso era exibido na UI e exposto em
+ * /api/rpc-infra/blockhash como se fosse real. Foi removido.
+ *
+ * Carga do provedor e perda de pacote NÃO são mensuráveis via JSON-RPC HTTP.
+ * Antes eram inventados; agora são reportados como 0/desconhecidos em `metricsSource`.
+ */
+async function measureRpcNode(node: RpcNode): Promise<void> {
+  const metrics = rpcMetrics[node.id];
+  if (!metrics || isPlaceholderRpcUrl(node.url)) {
+    if (metrics) metrics.consecutiveFailures++;
+    return;
   }
 
-  // Update blockhash cache stats
-  const cacheAge = Date.now() - blockhashCache.lastFetchedAt;
-  if (cacheAge >= blockhashCache.ttlMs) {
-    const chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    let newHash = "Hft";
-    const seed = Date.now();
-    for (let i = 0; i < 35; i++) {
-      newHash += chars.charAt((seed + i * 17) % chars.length);
+  const started = Date.now();
+  try {
+    const conn = new Connection(node.url, { commitment: "processed", disableRetryOnRateLimit: true });
+    const [blockhashInfo, slot] = await Promise.all([
+      conn.getLatestBlockhash("processed"),
+      conn.getSlot("processed"),
+    ]);
+
+    if (!isValidBase58Blockhash(blockhashInfo.blockhash)) {
+      throw new Error(`blockhash estruturalmente inválido: "${blockhashInfo.blockhash}"`);
     }
-    blockhashCache.cachedBlockhash = newHash;
-    blockhashCache.lastFetchedAt = Date.now();
-    blockhashCache.misses++;
-  } else {
-    blockhashCache.hits += (Date.now() % 5) + 1;
+
+    const rtt = Date.now() - started;
+    metrics.samples.push(rtt);
+    if (metrics.samples.length > 20) metrics.samples.shift();
+    metrics.lastSlot = slot;
+    metrics.lastMeasuredAt = Date.now();
+    metrics.consecutiveFailures = 0;
+  } catch {
+    metrics.consecutiveFailures++;
+    metrics.lastMeasuredAt = Date.now();
   }
 }
 
-// Run health checks every 2 seconds
-setInterval(runHftInfraLoop, 2000);
+const MEASUREMENT_INTERVAL_MS = 5000;
+const MAX_CONSECUTIVE_FAILURES = 3;
+
+async function runHftInfraLoop(): Promise<void> {
+  const now = Date.now();
+
+  // 1. Mede nós cujo último resultado está velho (staggered para não estourar rate-limit).
+  await Promise.all(
+    rpcNodes
+      .filter((n) => now - (rpcMetrics[n.id]?.lastMeasuredAt ?? 0) > MEASUREMENT_INTERVAL_MS)
+      .map((n) => measureRpcNode(n))
+  );
+
+  // 2. Slot de referência = maior slot observado entre os nós medidos.
+  const observedSlots = Object.values(rpcMetrics)
+    .map((m) => m.lastSlot)
+    .filter((s): s is number => typeof s === "number" && s > 0);
+  const referenceSlot = observedSlots.length > 0 ? Math.max(...observedSlots) : null;
+
+  // 3. Aplica medições reais + overrides de chaos (dev).
+  rpcNodes = rpcNodes.map((node) => {
+    const chaos = chaosState[node.id] || {};
+    const metrics = rpcMetrics[node.id];
+    const samples = metrics?.samples ?? [];
+    const hasSamples = samples.length > 0;
+    const failures = metrics?.consecutiveFailures ?? 0;
+
+    const measuredLatency = hasSamples ? P95(samples) : Number.NaN;
+    const measuredJitter = JITTER(samples);
+    const measuredSlotLag =
+      referenceSlot !== null && metrics?.lastSlot ? Math.max(0, referenceSlot - metrics.lastSlot) : 0;
+
+    let status: RpcNode["status"];
+    if (isPlaceholderRpcUrl(node.url)) status = "offline";
+    else if (failures >= MAX_CONSECUTIVE_FAILURES) status = "offline";
+    else if (!hasSamples) status = "degraded";
+    else if (measuredLatency > 400 || measuredSlotLag > 5) status = "degraded";
+    else status = "healthy";
+
+    // Chaos (somente dev) sobrepõe a medição real.
+    if (chaos.status) status = chaos.status as RpcNode["status"];
+
+    const latency = chaos.latency ?? (hasSamples ? measuredLatency : Number.NaN);
+    const jitterMs = chaos.jitterMs ?? measuredJitter;
+    const slotLag = chaos.slotLag ?? measuredSlotLag;
+    const packetLoss = chaos.packetLoss ?? 0;
+
+    const metricsSource: RpcNode["metricsSource"] = isPlaceholderRpcUrl(node.url)
+      ? "unavailable"
+      : hasSamples
+        ? "partial"
+        : "unavailable";
+
+    return {
+      ...node,
+      status,
+      latency: Number.isFinite(latency) ? parseFloat(latency.toFixed(1)) : 0,
+      jitterMs: parseFloat(jitterMs.toFixed(2)),
+      slotLag,
+      packetLoss,
+      // load não é mensurável via RPC; mantido 0 e sinalizado em metricsSource.
+      load: 0,
+      shredStream: "inactive" as const,
+      metricsSource,
+    };
+  });
+
+  // 4. Seleção de primário por fitness real (só entre nós medidos e saudáveis).
+  const candidates = rpcNodes.filter(
+    (n) => n.status !== "offline" && n.metricsSource !== "unavailable" && n.latency > 0
+  );
+
+  if (candidates.length > 0) {
+    const best = [...candidates].sort((a, b) => {
+      const fit = (n: RpcNode) => n.latency + n.slotLag * 50 + n.jitterMs * 4;
+      return fit(a) - fit(b);
+    })[0];
+
+    const previousPrimary = rpcNodes.find((n) => n.isPrimary);
+    if (!previousPrimary || previousPrimary.id !== best.id) {
+      if (previousPrimary) {
+        const reason =
+          `Failover: ${best.name} tem melhor fitness medido ` +
+          `(p95=${best.latency}ms, jitter=${best.jitterMs}ms, slotLag=${best.slotLag}) ` +
+          `que ${previousPrimary.name} ` +
+          `(p95=${previousPrimary.latency}ms, jitter=${previousPrimary.jitterMs}ms, slotLag=${previousPrimary.slotLag}).`;
+        failoverEvents.unshift({
+          time: new Date().toTimeString().split(" ")[0],
+          fromNode: previousPrimary.name,
+          toNode: best.name,
+          reason,
+        });
+        if (failoverEvents.length > 50) failoverEvents.pop();
+        console.log(`[HFT FAILOVER] ${reason}`);
+      }
+      rpcNodes.forEach((n) => {
+        n.isPrimary = n.id === best.id;
+      });
+    }
+  }
+
+  // 5. Idade do blockhash real em uso (sem geração de hash sintético).
+  const bhStatus = blockhashCacheRef?.getStatus();
+  const bhAge = bhStatus ? bhStatus.ageMs : undefined;
+  for (const node of rpcNodes) {
+    node.blockhashCacheAge = Number.isFinite(bhAge as number) ? (bhAge as number) : undefined;
+  }
+}
+
+// Health checks a cada 2s (medições reais são feitas a cada 5s por nó).
+setInterval(() => {
+  void runHftInfraLoop();
+}, 2000);
 
 // Robust runWithRpcFailover wrapper to handle RPC connection issues on-chain dynamically
 async function runWithRpcFailover<T>(operation: (conn: Connection) => Promise<T>): Promise<T> {
@@ -267,6 +521,22 @@ const snipedTransactions: any[] = dbStore.getTrades();
 
 // Global thread-safe set for position liquidation locks (Race condition prevention)
 const exitLocks = new Set<string>();
+
+/** Avisos de posição inválida: 1 por posição, para não inundar o log a cada 3s. */
+const invalidPositionWarned = new Set<string>();
+
+/**
+ * BACKOFF DE TELEMETRIA DE PREÇO (por posição).
+ *
+ * Motivo concreto, observado em execução: uma posição cuja fonte de preço está fora do ar
+ * era consultada a cada 3 s indefinidamente. Com um provedor de RPC pago, isso é uma
+ * chamada perdida a cada 3 s por posição — e nenhuma delas traz informação nova.
+ *
+ * Aqui o intervalo dobra a cada falha consecutiva (3 s → 6 s → 12 s … teto de 60 s) e
+ * volta ao normal no primeiro preço obtido. Não é otimização cosmética: é o que impede
+ * que a perda de telemetria de UMA posição consuma a cota de RPC de TODAS.
+ */
+const priceTelemetryBackoff = new Map<string, { misses: number; nextPollAt: number }>();
 
 // 0.5 API: Co-location State Management
 app.get("/api/co-location", (_req, res) => {
@@ -360,6 +630,119 @@ app.get("/api/database/stats", (_req, res) => {
   return res.json(dbStore.getDatabaseStats());
 });
 
+/** Cache de conveniência do replay (invalidado por mtime+tamanho do JSONL). */
+const replayCache = new Map<string, any>();
+
+/* -------------------------------------------------------------------------- */
+/* LATÊNCIA MEDIDA / REPLAY (rotas de LEITURA)                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * GET /api/latency — o que foi MEDIDO neste processo.
+ *
+ * O painel só mostra histogramas de amostras reais. Não existe número de recheio:
+ * com zero eventos, todos os estágios vêm `null` e `traces: 0`. O campo `detection`
+ * declara explicitamente que, sob WebSocket RPC, o instante de origem é INCONHECIDO —
+ * portanto a detecção ponta a ponta NÃO é mensurável nesta configuração.
+ */
+app.get("/api/latency", (_req, res) => {
+  const snapshot = telemetry.snapshot();
+  const measured = Object.entries(snapshot.perStageMs)
+    .filter(([, h]) => h !== null)
+    .map(([stage]) => stage);
+  return res.json({
+    ...snapshot,
+    measuredStages: measured,
+    honesty: {
+      tracesObserved: snapshot.traces,
+      note: snapshot.traces === 0
+        ? "Nenhum evento processado desde o boot: não há distribuição de latência a reportar."
+        : "Histogramas calculados sobre as amostras observadas (ring buffer de 2000 por estágio).",
+      exclusion: "Tempos de relógio de parede não entram no cálculo; medimos tempo monotônico.",
+    },
+  });
+});
+
+/**
+ * GET /api/replay — compara estratégias de saída sobre os dados JÁ GRAVADOS.
+ *
+ * Lê `data/events.jsonl`, monta episódios por mint (INCLUINDO os sinais rejeitados) e
+ * compara cada estratégia contra a linha de base `baseline-hold`. O ranking só é emitido
+ * se houver amostra suficiente; caso contrário volta vazio com a razão declarada.
+ *
+ * Read-only e determinístico: não toca em ordens, carteira ou banco operacional.
+ */
+app.get("/api/replay", (req, res) => {
+  const limit = Math.min(5000, Math.max(0, Number(req.query.limit ?? 1000) || 1000));
+  const filterRaw = String(req.query.filter ?? "all");
+  const allowedFilters = new Set(["all", "accepted-only", "rejected-only", "no-assessment"]);
+  const filter = (allowedFilters.has(filterRaw) ? filterRaw : "all") as any;
+
+  try {
+    const dataFile = path.join(process.cwd(), "data", "events.jsonl");
+    // CACHE POR IMPRESSÃO DIGITAL DO ARQUIVO.
+    // Motivo concreto: `loadBacktestDataset` lê e faz JSON.parse do arquivo INTEIRO de forma
+    // síncrona, na thread do servidor. Com um JSONL de dezenas de MB, uma chamada de dashboard
+    // bloquearia o event loop e atrasaria o caminho de execução. O cache é invalidado por
+    // mtime+tamanho, então nunca serve dado velho: se o arquivo cresceu, re-lê.
+    let fingerprint = "ausente";
+    try {
+      const st = fs.statSync(dataFile);
+      fingerprint = `${st.mtimeMs}:${st.size}`;
+    } catch {
+      /* arquivo ainda não existe — dataset vazio é resposta legítima */
+    }
+
+    const cacheKey = `${fingerprint}|${filter}|${limit}`;
+    let payload = replayCache.get(cacheKey);
+    const cacheHit = payload !== undefined;
+
+    if (!payload) {
+      const dataset = loadBacktestDataset();
+
+      // Amostragem declarada: o `limit` corta os EPISÓDIOS analisados (mais recentes),
+      // não as observações de preço — cortar no meio de um episódio inventaria uma saída.
+      const episodes = dataset.episodes.slice(-limit);
+      const truncated = limit < dataset.episodes.length;
+      const sampledDataset = truncated
+        ? { ...dataset, episodes, records: episodes.reduce((acc, e) => acc + e.prices.length, 0) }
+        : dataset;
+      const comparison = compareStrategies(sampledDataset, DEFAULT_STRATEGIES, { filter });
+
+      payload = {
+        generatedAt: new Date().toISOString(),
+        datasetPath: dataset.path,
+        availableFiles: listDataFiles(),
+        datasetStats: dataset.stats,
+        corruptedLines: dataset.corruptedLines,
+        episodesAnalyzed: episodes.length,
+        truncated,
+        requestedFilter: filter,
+        /**
+         * Sem NENHUM registro gravado, as linhas de estratégia vêm zeradas. Um zero é
+         * ambíguo (pode significar "empate técnico"), então marcamos explicitamente.
+         */
+        noData: dataset.records === 0,
+        noDataReason:
+          dataset.records === 0
+            ? "Nenhum evento gravado em data/events.jsonl. Rode o bot em modo paper/shadow para acumular dados; sem dados não existe replay."
+            : null,
+        comparison,
+      };
+      if (replayCache.size > 8) replayCache.clear(); // limites pequenos: é cache de conveniência, não de histórico
+      replayCache.set(cacheKey, payload);
+    }
+
+    return res.json({ ...payload, cached: cacheHit, cacheKey: cacheHit ? cacheKey : undefined });
+  } catch (err: any) {
+    return res.status(500).json({
+      error: "Falha ao montar o dataset de replay.",
+      detail: err.message,
+      hint: "O registro é alimentado pelo loop de eventos. Sem eventos gravados não há replay — e é correto que não haja.",
+    });
+  }
+});
+
 app.get("/api/positions", (_req, res) => {
   return res.json(dbStore.getPositions());
 });
@@ -389,7 +772,15 @@ app.post("/api/positions/close", async (req, res) => {
     return res.status(404).json({ error: "Position not found" });
   }
 
-  // 1. Race condition protection / thread-safe lock
+  // 1. Gate de saída: exige live trading; read-only permite sair (reduz risco);
+  //    kill switch bloqueia apenas se BLOCK_EXITS_ON_KILL_SWITCH=true.
+  const exitGate = assertExitAllowed();
+  if (!exitGate.ok) {
+    return res.status(exitGate.status).json({ error: exitGate.error });
+  }
+  exitGate.warnings.forEach((w) => console.warn(`[Exit Gate] ${w}`));
+
+  // 2. Race condition protection / thread-safe lock
   if (exitLocks.has(pos.id) || pos.status === "exit_pending" || pos.status === "closed") {
     return res.status(409).json({ error: "Esta posição já está em processo de fechamento ou já foi liquidada." });
   }
@@ -441,7 +832,22 @@ app.post("/api/positions/close", async (req, res) => {
       rawAmount = Math.floor(qtyFloat * Math.pow(10, decimals));
     }
 
-    const jitoTip = 0.003;
+    // Tip LIMITADO por bps do capital (auditoria: tip fixo de 0.003 SOL = 300 bps em
+    // uma posição de 0.1 SOL, o que inviabiliza matematicamente a operação).
+    const { tipSol: jitoTip, clamped: tipClamped } = clampTipSol(
+      0.003,
+      pos.sizeSol,
+      Number(process.env.MAX_TIP_BPS ?? 50)
+    );
+    if (tipClamped) {
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "WARN",
+        component: "JITO_BUNDLE",
+        message: `[Tip Limitado] Tip de fechamento reduzido para ${jitoTip.toFixed(6)} SOL para respeitar o teto de ${process.env.MAX_TIP_BPS ?? 50} bps sobre ${pos.sizeSol} SOL.`,
+        correlationId
+      });
+    }
     const jitoSender = new JitoBundleSender(globalConnection);
     
     let signature = "";
@@ -471,46 +877,36 @@ app.post("/api/positions/close", async (req, res) => {
           correlationId
         });
 
-        // 3. Fetch Quote
-        const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${pos.mint}&outputMint=So11111111111111111111111111111111111111112&amount=${rawAmount}&slippageBps=${currentSlippageBps}`;
-        const quoteRes = await fetch(quoteUrl);
-        if (!quoteRes.ok) {
-          throw new Error(`Jupiter Quote API failed with status ${quoteRes.status}`);
-        }
-        quoteData = await quoteRes.json();
+        // 3–4. Cotação e construção do swap via JupiterIntegration.
+        //
+        // AUDITORIA 2026-10-02 (achado C24): este trecho chamava
+        // `quote-api.jup.ag/v6/*` — host SUNSET pela Jupiter. A rota de saída era a única
+        // proteção de capital do sistema e apontava para um endpoint morto. Agora usa o
+        // cliente único (host configurável por JUPITER_BASE_URL, header x-api-key quando
+        // houver chave, timeout e falha dura quando o host devolve HTML em vez de JSON).
+        quoteData = await JupiterIntegration.getQuote(
+          pos.mint,
+          "So11111111111111111111111111111111111111112",
+          rawAmount,
+          currentSlippageBps
+        );
 
-        // 4. Jupiter Swap Build
-        const swapRes = await fetch("https://quote-api.jup.ag/v6/swap", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            quoteResponse: quoteData,
-            userPublicKey: walletPublicKey.toBase58(),
-            wrapAndUnwrapSol: true,
-            dynamicComputeUnitLimit: true,
-            prioritizationFeeLamports: "auto"
-          })
-        });
-        if (!swapRes.ok) {
-          throw new Error(`Jupiter Swap API failed with status ${swapRes.status}`);
-        }
-        const { swapTransaction } = await swapRes.json();
-
-        // Deserialize and sign
-        const txBuffer = Buffer.from(swapTransaction, "base64");
-        const transaction = VersionedTransaction.deserialize(txBuffer);
+        const transaction = await JupiterIntegration.buildSwapTransaction(
+          quoteData,
+          walletPublicKey.toBase58()
+        );
 
         const { blockhash } = await globalConnection.getLatestBlockhash("processed");
 
         const jitoRes = await executeWithDecryptedKeypair(async (keypair) => {
           transaction.sign([keypair]);
-          return await jitoSender.submitBundle(
-            [transaction],
-            keypair,
-            jitoTip,
-            blockhash
-          );
-        });
+          return await jitoSender.submitBundle([transaction], keypair, jitoTip, blockhash, {
+            capitalCommittedSol: pos.sizeSol,
+            maxTipBps: Number(process.env.MAX_TIP_BPS ?? 50),
+            region: (process.env.JITO_REGION as any) || undefined,
+            purpose: "exit",
+          });
+        }, "exit");
 
         if (!jitoRes.success) {
           throw new Error(`Jito Bundle rejected: ${jitoRes.error || "Unknown bundle error"}`);
@@ -561,18 +957,28 @@ app.post("/api/positions/close", async (req, res) => {
     const outSol = parseFloat(quoteData.outAmount) / 1e9;
     const latencyMs = Date.now() - triggerTime;
 
+    // PnL MEDIDO, não estimado: lê o delta real de SOL da carteira na transação
+    // confirmada (inclui tip, priority fee e base fee). O valor da cotação serve
+    // apenas como referência de "sem atrito".
+    const economics = await measureExitEconomics(signature, walletPublicKey);
+
     const realCloseTx = {
       id: `txn_manual_exit_${Date.now()}`,
       token: pos.token,
       mint: pos.mint,
       amount: `${(rawAmount / Math.pow(10, decimals)).toFixed(2)} ${pos.token}`,
-      outAmount: `${outSol.toFixed(4)} SOL`,
+      outAmount: `${outSol.toFixed(4)} SOL (bruto cotado)`,
       time: new Date().toTimeString().split(' ')[0] + "." + String(Date.now() % 1000).padStart(3, '0'),
       latencyMs,
       status: "success" as const,
       block: finalSlot,
       tipSol: jitoTip,
-      route: `KMS Manual Jito Exit`
+      route: `KMS Manual Jito Exit${economics.measured ? "" : " (PnL não medido on-chain)"}`,
+      signature,
+      pnlNetSol: economics.measured ? economics.solDeltaSol : undefined,
+      feesSol: economics.measured ? economics.feeSol : undefined,
+      measuredOnChain: economics.measured,
+      mode: "live" as const,
     };
 
     dbStore.saveTrade(realCloseTx);
@@ -587,6 +993,20 @@ app.post("/api/positions/close", async (req, res) => {
     dbStore.deletePosition(id);
     exitLocks.delete(id);
 
+    recorder.recordPositionLifecycle({
+      positionId: id,
+      mint: pos.mint,
+      token: pos.token,
+      event: "closed",
+      mode: "live",
+      sizeSol: pos.sizeSol,
+      entryPriceSol: pos.entryPrice ?? null,
+      exitPriceSol: outSol,
+      pnlPercent: economics.measured && pos.sizeSol > 0 ? (economics.solDeltaSol / pos.sizeSol) * 100 : null,
+      reason: "manual-exit",
+      pnlMeasuredOnChain: economics.measured,
+    });
+
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
       level: "SUCCESS",
@@ -599,46 +1019,39 @@ app.post("/api/positions/close", async (req, res) => {
     return res.json({ success: true, transaction: realCloseTx });
 
   } catch (err: any) {
-    // Simulated fallback manual close when real network/RPC is unreachable or rate limited
-    const outSol = parseFloat((pos.sizeSol * (1 + ((pos.pnlPercent || 0) / 100))).toFixed(4)) || pos.sizeSol || 0.5;
-    const latencyMs = Math.floor(1 + Math.random() * 3);
-    const mockSig = `sim_manual_exit_${Date.now()}`;
+    /**
+     * Ver comentário equivalente em executeAutonomousExit: falha de fechamento manual
+     * é reportada como FALHA e a posição permanece aberta. Antes, este bloco forjava um
+     * fechamento "bem-sucedido" com block aleatório e removia a posição do banco,
+     * fazendo o operador acreditar que havia vendido quando os tokens seguiam na carteira.
+     */
+    const latencyMs = Date.now() - triggerTime;
+    const errorMessage = err?.message || String(err);
 
-    const fallbackTx = {
-      id: mockSig,
-      token: pos.token,
-      mint: pos.mint,
-      amount: `${(pos.sizeSol / (pos.entryPrice || 0.0001)).toFixed(2)} ${pos.token}`,
-      outAmount: `${outSol.toFixed(4)} SOL`,
-      time: new Date().toTimeString().split(' ')[0] + "." + String(Date.now() % 1000).padStart(3, '0'),
-      latencyMs,
-      status: "success" as const,
-      block: 284910230 + Math.floor(Math.random() * 5000),
-      tipSol: 0.003,
-      route: `HFT Engine Fallback (Manual Exit)`
-    };
-
-    dbStore.saveTrade(fallbackTx);
-    snipedTransactions.unshift(fallbackTx);
-    if (snipedTransactions.length > 25) {
-      snipedTransactions.pop();
-    }
-
-    pos.status = "closed";
+    pos.status = "open";
+    (pos as any).exitAttempts = ((pos as any).exitAttempts || 0) + 1;
+    (pos as any).lastExitError = errorMessage;
+    (pos as any).lastExitAttemptAt = new Date().toISOString();
     dbStore.savePosition(pos);
-    dbStore.deletePosition(id);
     exitLocks.delete(id);
 
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
-      level: "SUCCESS",
+      level: "CRITICAL",
       component: "RISK_ENGINE",
-      message: `[MANUAL EXIT SIMULADO FALLBACK] Posição de $${pos.token} encerrada via HFT Internal Simulator em ${latencyMs}ms. Retornado: ${outSol.toFixed(4)} SOL.`,
-      correlationId
+      message:
+        `[FALHA DE FECHAMENTO MANUAL] Não foi possível liquidar $${pos.token} em ${latencyMs}ms. ` +
+        `Erro: ${errorMessage}. A posição CONTINUA ABERTA. Nenhum PnL foi registrado.`,
+      correlationId,
     });
 
-    reportTradeOutcome(true);
-    return res.json({ success: true, transaction: fallbackTx });
+    reportTradeOutcome(false);
+    return res.status(502).json({
+      success: false,
+      error: "Fechamento NÃO executado. A posição permanece aberta.",
+      detail: errorMessage,
+      attempts: (pos as any).exitAttempts,
+    });
   }
 });
 
@@ -678,28 +1091,52 @@ app.get("/api/rpc-nodes", (_req, res) => {
   return res.json({ nodes: rpcNodes, timestamp: Date.now() });
 });
 
-// 1.1 API: HFT Shared Blockhash Cache
+// 1.1 API: Cache de blockhash COMPARTILHADO (valor real do RPC, nunca sintético).
+//
+// AUDITORIA 2026-10-02: este endpoint exibia um blockhash gerado por RNG, e o POST de
+// refresh gerava outro. Um blockhash falso parece válido na UI (base58, 32 bytes) mas
+// faz toda transação assinada com ele ser rejeitada — e o painel dizia "refresh em 0.14ms".
 app.get("/api/rpc-infra/blockhash", (_req, res) => {
+  if (!blockhashCacheRef) {
+    return res.status(503).json({
+      error: "Cache de blockhash não inicializado (RPC indisponível no boot).",
+      available: false,
+    });
+  }
+  const status = blockhashCacheRef.getStatus();
+  const cached = blockhashCacheRef.get();
   return res.json({
-    ...blockhashCache,
-    ageMs: Date.now() - blockhashCache.lastFetchedAt
+    blockhash: cached.blockhash || null,
+    lastValidBlockHeight: cached.lastValidBlockHeight || null,
+    usable: status.usable,
+    ageMs: Number.isFinite(status.ageMs) ? Math.round(status.ageMs) : null,
+    consecutiveFailures: status.consecutiveFailures,
+    lastError: status.lastError,
+    source: "solana-rpc getLatestBlockhash(processed)",
   });
 });
 
-app.post("/api/rpc-infra/blockhash/refresh", (_req, res) => {
-  const chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  let newHash = "Hft";
-  for (let i = 0; i < 35; i++) {
-    newHash += chars.charAt(Math.floor(Math.random() * chars.length));
+app.post("/api/rpc-infra/blockhash/refresh", async (_req, res) => {
+  if (!blockhashCacheRef) {
+    return res.status(503).json({ success: false, error: "Cache de blockhash não inicializado." });
   }
-  blockhashCache.cachedBlockhash = newHash;
-  blockhashCache.lastFetchedAt = Date.now();
-  blockhashCache.misses = 0; // reset misses on manual force refresh
-  return res.json({
-    success: true,
-    message: "Shared blockhash cache successfully refreshed in 0.14ms",
-    blockhash: newHash
-  });
+  const started = Date.now();
+  try {
+    const fresh = await blockhashCacheRef.getFresh();
+    return res.json({
+      success: true,
+      blockhash: fresh.blockhash,
+      lastValidBlockHeight: fresh.lastValidBlockHeight,
+      measuredRttMs: Date.now() - started,
+      source: "solana-rpc getLatestBlockhash(processed)",
+    });
+  } catch (err: any) {
+    return res.status(502).json({
+      success: false,
+      error: err.message,
+      measuredRttMs: Date.now() - started,
+    });
+  }
 });
 
 // 1.2 API: Failover Event Logs
@@ -1684,192 +2121,336 @@ Based on this information, provide a final predictive judgment verdict. Your res
 });
 
 // Helper to fetch real on-chain data and market statistics from Solana RPC and DexScreener
-async function fetchRealOnChainTokenData(tokenMint: string, tokenName?: string) {
+/**
+ * MOTOR DE RISCO ON-CHAIN — VERSÃO CORRIGIDA (auditoria 2026-10-02).
+ *
+ * O QUE MUDOU E POR QUÊ
+ * ---------------------
+ * A versão anterior era FAIL-OPEN e FABRICAVA indicadores de segurança. Os três
+ * problemas, com consequência direta em capital:
+ *
+ *  [F1] FALHA ABERTA EM AUTORIDADES.
+ *       Defaults: `mintAuthorityDisabled = true`, `freezeAuthorityDisabled = true`.
+ *       Se as chamadas RPC falhassem (RPC público rate-limited, mint inexistente,
+ *       token-2022 não parseado), o relatório dizia "propriedade renunciada, seguro".
+ *       Um token com freeze authority ATIVA — capaz de impedir a VENDA dos seus tokens —
+ *       era classificado como seguro justamente quando o dado não pôde ser lido.
+ *       Agora: autoridade desconhecida => dado ausente => REPROVAÇÃO (fail-closed).
+ *
+ *  [F2] "LIQUIDEZ BLOQUEADA / QUEIMADA" INVENTADA.
+ *       O texto (`liquidityLocked`) era deduzido de `liquidity.usd > 50000`:
+ *         > $50k  => "95% (Burned / Locked)"
+ *         > $0    => "80% (Locked)"
+ *       Nem DexScreener nem o RPC informam se o LP está lockado/queimado. Isso exigiria
+ *       localizar o NFT do LP e verificar burn ou custódia em programa de lock.
+ *       Era o pior tipo de bug: um SELO DE SEGURANÇA inventado. Agora reportamos
+ *       explicitamente "não verificado" e não pontuamos a favor.
+ *
+ *  [F3] "TAXA DE COMPRA/VENDA" E "ALOCAÇÃO DO DEV" INVENTADAS.
+ *       `taxBuySell` era literalmente `"0% / 0%"` ou `"100% / 100% (Honeypot)"` escolhido
+ *       por um `if` sobre freeze authority, sem nenhuma simulação de compra/venda.
+ *       `creatorAllocation` era `top10Pct * 0.15` — um número inventado apresentado como
+ *       dado on-chain. Ambos agora são reportados como "Não medido", com a explicação do
+ *       que seria necessário para medir de verdade (simulação de swap / trace de criação).
+ *
+ * NOTA SOBRE TOP HOLDERS: `getTokenLargestAccounts` retorna as maiores CONTAS de token,
+ * não os maiores PROPRIETÁRIOS. Um mesmo dono pode ter várias contas, e a conta do pool
+ * de liquidez/bonding curve concentra a maior parte do supply por construção. Tratar
+ * esse número como "concentração de holders" reprova todo lançamento legítimo com pool.
+ * Aqui ele é reportado com o nome correto e com a ressalva explícita.
+ */
+interface TokenRiskAssessment {
+  isRug: boolean;
+  score: number;
+  verdict: "reject" | "review" | "pass";
+  mint: string;
+  name: string;
+  renounced: boolean | null;
+  liquidityLocked: string;
+  topHoldersShare: string;
+  analysis: string;
+  freezeAuthorityDisabled: boolean | null;
+  mintAuthorityDisabled: boolean | null;
+  creatorAllocation: string;
+  taxBuySell: string;
+  priceSol: number;
+  poolSource: string;
+  liquidityUsd: number;
+  priceImpact: string;
+  /** Token-2022 com extensões perigosas (transfer hook / transfer fee): risco alto. */
+  token2022Risk?: string;
+  /** false quando alguma verificação crítica não pôde ser concluída -> reprovar. */
+  dataComplete: boolean;
+  missingChecks: string[];
+  /** Origem de cada dado, para auditoria. */
+  evidence: Record<string, string>;
+}
+
+async function fetchRealOnChainTokenData(tokenMint: string, tokenName?: string): Promise<TokenRiskAssessment> {
   let name = tokenName || "UNKNOWN TOKEN";
   let symbol = "TOKEN";
-  let isRug = false;
-  let score = 90;
-  let renounced = true;
-  let liquidityLocked = "Unknown";
-  let topHoldersShare = "8.2%";
-  let freezeAuthorityDisabled = true;
-  let mintAuthorityDisabled = true;
-  let creatorAllocation = "1.5%";
-  let taxBuySell = "0% / 0%";
-  let analysis = "";
   let priceSol = 0;
   let poolSource = "Unknown";
   let liquidityUsd = 0;
-  let priceImpact = "0.0%";
+  let priceImpact = "Não medido";
+  let token2022Risk: string | undefined;
 
-  // 1. Validate if it's a real Solana address (length 32-44, Base58)
-  const isAddress = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(tokenMint);
-  if (!isAddress) {
-    // Elegant simulation fallback if a mock/non-address is provided
-    isRug = tokenMint.toLowerCase().includes("rug") || tokenMint.startsWith("1111") || name.toUpperCase().includes("RUG");
+  const missingChecks: string[] = [];
+  const evidence: Record<string, string> = {};
+  let riskReasons: string[] = [];
+  let score = 100;
+
+  // Autoridades: começam como DESCONHECIDAS (null), nunca como "seguras".
+  let mintAuthorityDisabled: boolean | null = null;
+  let freezeAuthorityDisabled: boolean | null = null;
+  let top10AccountsShare: number | null = null;
+  let top10ShareRaw = "Não medido";
+
+  // 1. Validação estrutural do endereço.
+  if (!isValidPubkey(tokenMint)) {
     return {
-      isRug,
-      score: isRug ? 18 : 88 + Math.floor(Math.random() * 10),
+      isRug: false,
+      score: 0,
+      verdict: "reject",
       mint: tokenMint,
       name,
-      renounced: !isRug,
-      liquidityLocked: isRug ? "0%" : "98% (Burned)",
-      topHoldersShare: isRug ? "45%" : "8.2%",
-      analysis: `[SIMULATED - Non-address] Liquidity pool checked on Raydium. Contract metadata appears ${isRug ? "extremely malicious with active mint authority" : "clean, with renounced ownership"}. Top holders own less than 10%. Dynamic slippage target: ${isRug ? "99% (Warning)" : "1.5%"}.`,
-      freezeAuthorityDisabled: !isRug,
-      mintAuthorityDisabled: !isRug,
-      creatorAllocation: isRug ? "15.0%" : "1.2%",
-      taxBuySell: isRug ? "30% / 30%" : "0% / 0%",
-      priceSol: isRug ? 0.0 : 0.00012,
-      poolSource: isRug ? "None" : "Raydium v4",
-      liquidityUsd: isRug ? 150 : 25410,
-      priceImpact: isRug ? "95%" : "1.25%"
+      renounced: null,
+      liquidityLocked: "Não verificado",
+      topHoldersShare: "Não medido",
+      analysis:
+        `Endereço inválido: "${tokenMint}" não é um pubkey base58 de 32 bytes. ` +
+        `Ausência de evidência é motivo de reprovação — não de aprovação.`,
+      freezeAuthorityDisabled: null,
+      mintAuthorityDisabled: null,
+      creatorAllocation: "Não medido",
+      taxBuySell: "Não medido",
+      priceSol: 0,
+      poolSource: "Unknown",
+      liquidityUsd: 0,
+      priceImpact: "Não medido",
+      dataComplete: false,
+      missingChecks: ["endereço válido"],
+      evidence: { addressValidation: "failed" },
     };
   }
 
-  // 2. Fetch from DexScreener public API
+  // 2. Mercado: DexScreener, escolhendo o par de MAIOR liquidez.
   try {
-    const dexRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`);
+    const dexRes = await fetch(`${DEXSCREENER_BASE_URL}/tokens/${tokenMint}`, {
+      signal: AbortSignal.timeout(6000),
+    });
     if (dexRes.ok) {
       const dexData = await dexRes.json();
-      if (dexData && dexData.pairs && dexData.pairs.length > 0) {
-        // Find best Solana pair (e.g. on Raydium or Pump.fun)
-        const solPairs = dexData.pairs.filter((p: any) => p.chainId === "solana");
-        if (solPairs.length > 0) {
-          const bestPair = solPairs[0];
-          name = bestPair.baseToken.name || name;
-          symbol = bestPair.baseToken.symbol || "TOKEN";
-          priceSol = parseFloat(bestPair.priceNative) || 0;
-          liquidityUsd = bestPair.liquidity?.usd || 0;
-          poolSource = bestPair.dexId === "pumpfun" ? "Pump.fun" : bestPair.dexId === "raydium" ? "Raydium" : bestPair.dexId === "jupiter" ? "Jupiter" : bestPair.dexId;
-          
-          // Compute a realistic price impact or slippage
-          const h1PriceChange = bestPair.priceChange?.h1 || 0;
-          priceImpact = h1PriceChange !== 0 ? `${Math.abs(h1PriceChange * 0.05).toFixed(2)}%` : "0.15%";
-          
-          // LP Lock status
-          if (bestPair.dexId === "pumpfun") {
-            liquidityLocked = "100% (Bonding Curve)";
-          } else if (bestPair.liquidity && bestPair.liquidity.usd > 50000) {
-            liquidityLocked = "95% (Burned / Locked)";
-          } else {
-            liquidityLocked = "80% (Locked)";
-          }
-        }
+      const solPairs = Array.isArray(dexData?.pairs)
+        ? dexData.pairs.filter((p: any) => p.chainId === "solana")
+        : [];
+      if (solPairs.length > 0) {
+        const bestPair = solPairs.sort(
+          (a: any, b: any) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0)
+        )[0];
+        name = bestPair.baseToken?.name || name;
+        symbol = bestPair.baseToken?.symbol || symbol;
+        priceSol = parseFloat(bestPair.priceNative) || 0;
+        liquidityUsd = bestPair.liquidity?.usd || 0;
+        poolSource = bestPair.dexId || "unknown";
+        evidence.market = `DexScreener pair ${String(bestPair.pairAddress || "").slice(0, 10)}...`;
+        // Price impact NÃO é derivável de variação de preço. É função do tamanho da
+        // ordem contra a profundidade do pool. Sem simulação de quote, não existe número.
+        priceImpact = "Não medido (exige simulação de quote no tamanho da ordem)";
+      } else {
+        missingChecks.push("pool de liquidez em DEX");
+        evidence.market = "nenhum par Solana encontrado";
       }
+    } else {
+      missingChecks.push("consulta DexScreener");
+      evidence.market = `HTTP ${dexRes.status}`;
     }
   } catch (err: any) {
-    console.log("[On-Chain Audit] DexScreener query status:", err.message);
+    missingChecks.push("consulta DexScreener");
+    evidence.market = `erro: ${err.message}`;
   }
 
-  // 3. Fetch from Solana RPC using globalConnection
-  if (globalConnection) {
+  // 3. On-chain via RPC: mint account (autoridades + extensões Token-2022) e holders.
+  if (!globalConnection) {
+    missingChecks.push("conexão RPC");
+    evidence.rpc = "globalConnection indisponível";
+  } else {
+    // 3.1 Mint account
     try {
       const mintPubkey = new PublicKey(tokenMint);
-      
-      // Fetch parsed mint account info
       const accountInfo = await globalConnection.getParsedAccountInfo(mintPubkey);
-      if (accountInfo && accountInfo.value) {
-        const data = accountInfo.value.data;
-        if (data && typeof data === "object" && "parsed" in data) {
-          const parsedInfo = data.parsed?.info;
-          if (parsedInfo) {
-            // Check Mint Authority & Freeze Authority
-            mintAuthorityDisabled = parsedInfo.mintAuthority === null;
-            freezeAuthorityDisabled = parsedInfo.freezeAuthority === null;
-            renounced = mintAuthorityDisabled;
+      const value: any = accountInfo?.value;
+
+      if (!value) {
+        // Mint não existe on-chain: pode ser endereço de outro tipo ou inexistente.
+        missingChecks.push("conta mint on-chain");
+        evidence.mintAccount = "não encontrada";
+      } else {
+        const ownerProgram = value.owner?.toBase58?.() || "desconhecido";
+        evidence.mintOwner = ownerProgram;
+
+        if (value.data && typeof value.data === "object" && "parsed" in value.data) {
+          const info = value.data.parsed?.info;
+          if (info) {
+            mintAuthorityDisabled = info.mintAuthority === null;
+            freezeAuthorityDisabled = info.freezeAuthority === null;
+            evidence.authorities = `owner=${ownerProgram}`;
           }
+
+          // Token-2022: extensões perigosas. Um transfer hook ou transfer fee oculto é
+          // vetor moderno de honeypot — não aparece em verificações de mint/freeze.
+          const extensions = info?.extensions;
+          if (Array.isArray(extensions) && extensions.length > 0) {
+            const dangerous = extensions
+              .map((e: any) => e?.extension)
+              .filter((ext: string) =>
+                ["transferHook", "transferFeeConfig", "permanentDelegate", "defaultAccountState"].includes(ext)
+              );
+            if (dangerous.length > 0) {
+              token2022Risk = `Extensões Token-2022 de risco: ${dangerous.join(", ")}`;
+              riskReasons.push(token2022Risk);
+              score -= 40;
+            }
+            evidence.token2022Extensions = extensions.map((e: any) => e?.extension).join(",");
+          }
+        } else {
+          missingChecks.push("parse da conta mint (formato inesperado)");
+          evidence.mintAccount = "formato não parseável";
         }
       }
+    } catch (err: any) {
+      missingChecks.push("leitura da conta mint");
+      evidence.mintAccount = `erro: ${err.message}`;
+    }
 
-      // Fetch top holders distribution
-      const largestAccounts = await globalConnection.getTokenLargestAccounts(mintPubkey);
-      const supplyInfo = await globalConnection.getTokenSupply(mintPubkey);
+    // 3.2 Distribuição de token accounts.
+    try {
+      const mintPubkey = new PublicKey(tokenMint);
+      const [largestAccounts, supplyInfo] = await Promise.all([
+        globalConnection.getTokenLargestAccounts(mintPubkey),
+        globalConnection.getTokenSupply(mintPubkey),
+      ]);
       const totalSupply = parseFloat(supplyInfo.value.amount);
-
-      if (largestAccounts && largestAccounts.value && totalSupply > 0) {
+      if (largestAccounts?.value && totalSupply > 0) {
         let top10Sum = 0;
         for (const acc of largestAccounts.value.slice(0, 10)) {
           top10Sum += parseFloat(acc.amount);
         }
-        const top10Pct = (top10Sum / totalSupply) * 100;
-        topHoldersShare = `${top10Pct.toFixed(1)}%`;
-
-        if (top10Pct > 70) {
-          creatorAllocation = `${(top10Pct - 40).toFixed(1)}%`;
-        } else {
-          creatorAllocation = `${(top10Pct * 0.15).toFixed(1)}%`;
-        }
+        top10AccountsShare = (top10Sum / totalSupply) * 100;
+        top10ShareRaw = `${top10AccountsShare.toFixed(1)}% (contas de token, não proprietários; inclui pool/curve)`;
+        evidence.holders = `${largestAccounts.value.length} contas retornadas`;
+      } else {
+        missingChecks.push("distribuição de token accounts");
+        evidence.holders = "sem dados de supply/largest accounts";
       }
     } catch (err: any) {
-      console.log("[On-Chain Audit] Solana RPC query status:", err.message);
+      missingChecks.push("distribuição de token accounts");
+      evidence.holders = `erro: ${err.message}`;
     }
   }
 
-  // If we couldn't get authorities but it's a pump.fun mint, pump.fun disables them by default
-  if (tokenMint.endsWith("pump")) {
-    mintAuthorityDisabled = true;
-    freezeAuthorityDisabled = true;
-    renounced = true;
-    if (liquidityLocked === "Unknown") {
-      liquidityLocked = "100% (Bonding Curve)";
-    }
-    if (poolSource === "Unknown") {
-      poolSource = "Pump.fun";
-    }
-  }
-
-  // 4. Honeypot / Rug detection rules using real on-chain indicators
-  let riskReasons: string[] = [];
-  score = 100;
-
-  if (!mintAuthorityDisabled) {
+  // 4. SCORING — apenas sobre evidência positiva.
+  if (mintAuthorityDisabled === false) {
     score -= 30;
-    riskReasons.push("Mint Authority ATIVA");
+    riskReasons.push("Mint Authority ATIVA (pode inflacionar o supply)");
   }
-  if (!freezeAuthorityDisabled) {
+  if (freezeAuthorityDisabled === false) {
     score -= 40;
-    riskReasons.push("Freeze Authority ATIVA (honeypot risk)");
+    riskReasons.push("Freeze Authority ATIVA (o emissor pode congelar sua conta e impedir a VENDA)");
   }
-  
   if (liquidityUsd > 0 && liquidityUsd < 5000) {
     score -= 15;
-    riskReasons.push("Liquidez extremamente baixa (< $5K USD)");
+    riskReasons.push(`Liquidez muito baixa ($${Math.round(liquidityUsd).toLocaleString()})`);
+  }
+  if (top10AccountsShare !== null && top10AccountsShare > 60) {
+    score -= 10;
+    riskReasons.push(
+      `Top 10 CONTAS de token concentram ${top10AccountsShare.toFixed(1)}% do supply ` +
+        `(inclui a conta do pool/bonding curve — não é prova de concentração em holders reais)`
+    );
+  }
+  if (mintAuthorityDisabled === null || freezeAuthorityDisabled === null) {
+    missingChecks.push("status de mint/freeze authority");
+  }
+  if (poolSource === "Unknown") {
+    missingChecks.push("fonte de pool identificada");
   }
 
-  const top10PctNum = parseFloat(topHoldersShare);
-  if (top10PctNum > 60) {
-    score -= 15;
-    riskReasons.push(`Concentração excessiva de holders (Top 10: ${topHoldersShare})`);
+  // FAIL-CLOSED: qualquer verificação crítica ausente impede aprovação.
+  const criticalMissing = missingChecks.filter((m) =>
+    [
+      "status de mint/freeze authority",
+      "conta mint on-chain",
+      "leitura da conta mint",
+      "conexão RPC",
+      "consulta DexScreener",
+      "pool de liquidez em DEX",
+    ].includes(m)
+  );
+  const dataComplete = criticalMissing.length === 0;
+
+  if (!dataComplete) {
+    // Teto de 40 força reprovação no caller (score < 50) sem afirmar "é rug".
+    score = Math.min(score, 40);
   }
+  score = Math.max(0, Math.min(100, score));
 
-  isRug = score < 50;
+  const verdict: TokenRiskAssessment["verdict"] = !dataComplete
+    ? "reject"
+    : score < 50
+      ? "reject"
+      : score < 75
+        ? "review"
+        : "pass";
 
-  if (isRug) {
-    taxBuySell = !freezeAuthorityDisabled ? "100% / 100% (Honeypot)" : "15% / 15%";
-    analysis = `🚨 ALERTA DE RUG: Falhas críticas detectadas. ${riskReasons.join(". ")}.`;
+  // isRug só é true quando existe EVIDÊNCIA de mecanismo de bloqueio/inflação —
+  // nunca por "dado ausente". Dado ausente já reprova via score/verdict.
+  const isRug = freezeAuthorityDisabled === false || (mintAuthorityDisabled === false && score < 30);
+
+  let analysis: string;
+  if (!dataComplete) {
+    analysis =
+      `REPROVADO POR FALTA DE DADOS (fail-closed). Não foi possível verificar: ${criticalMissing.join(", ")}. ` +
+      `Motivo: ausência de evidência não é evidência de segurança em token recém-lançado. ` +
+      `${riskReasons.length ? "Além disso: " + riskReasons.join("; ") + ". " : ""}` +
+      `Nenhuma afirmação sobre honeypot/taxa/lock é feita — não há dado para isso.`;
   } else {
-    taxBuySell = "0% / 0%";
-    analysis = `🛡️ CONTRATO SEGURO: Propriedade ${renounced ? "renunciada" : "ativa, mas sem mint"}. Liquidez de ${liquidityLocked} verificada no ${poolSource || "Raydium"}.`;
+    const parts: string[] = [];
+    parts.push(
+      `Autoridades: mint ${mintAuthorityDisabled ? "revogada" : "ATIVA"}, ` +
+        `freeze ${freezeAuthorityDisabled ? "revogada" : "ATIVA"}.`
+    );
+    if (riskReasons.length > 0) parts.push(`Alertas: ${riskReasons.join("; ")}.`);
+    parts.push(
+      `Liquidez: ${liquidityUsd > 0 ? "$" + Math.round(liquidityUsd).toLocaleString() : "não medida"} ` +
+        `em ${poolSource}. Status de lock do LP NÃO VERIFICADO.`
+    );
+    analysis = parts.join(" ");
   }
 
   return {
     isRug,
     score,
+    verdict,
     mint: tokenMint,
-    name: name === "UNKNOWN TOKEN" ? `${name}` : `${name} (${symbol})`,
-    renounced,
-    liquidityLocked,
-    topHoldersShare,
+    name: name === "UNKNOWN TOKEN" ? name : `${name} (${symbol})`,
+    renounced: mintAuthorityDisabled,
+    // Honestidade explícita: não afirmamos lock sem evidência (NFT do LP burn/custódia).
+    liquidityLocked: "Não verificado (exige checagem do NFT do LP: burn ou lock em programa)",
+    topHoldersShare: top10ShareRaw,
     analysis,
     freezeAuthorityDisabled,
     mintAuthorityDisabled,
-    creatorAllocation,
-    taxBuySell,
+    creatorAllocation: "Não medido (exige trace da transação de criação + funding do deployer)",
+    taxBuySell: "Não medido (exige simulação de compra E de venda on-chain)",
     priceSol,
     poolSource,
     liquidityUsd,
-    priceImpact
+    priceImpact,
+    token2022Risk,
+    dataComplete,
+    missingChecks,
+    evidence,
   };
 }
 
@@ -1910,9 +2491,23 @@ app.post("/api/audit-token", async (req, res) => {
     const prompt = `Perform a strict technical security audit of a Solana token using these real on-chain and market metrics:
 Token Mint Address: "${tokenMint}"
 Token Name: "${parsedOnChain.name}"
-Mint Authority Status: ${parsedOnChain.mintAuthorityDisabled ? "Disabled (Safe)" : "Active (High Risk of inflation)"}
-Freeze Authority Status: ${parsedOnChain.freezeAuthorityDisabled ? "Disabled (Safe)" : "Active (High Risk of Honeypot / Blacklist)"}
-Ownership Renounced: ${parsedOnChain.renounced ? "Yes (Safe)" : "No (High Risk)"}
+Mint Authority Status: ${
+        parsedOnChain.mintAuthorityDisabled === null
+          ? "UNKNOWN (on-chain read failed — automatic fail-closed rejection)"
+          : parsedOnChain.mintAuthorityDisabled
+            ? "Disabled (Safe)"
+            : "Active (High Risk of inflation)"
+      }
+Freeze Authority Status: ${
+        parsedOnChain.freezeAuthorityDisabled === null
+          ? "UNKNOWN (on-chain read failed — automatic fail-closed rejection)"
+          : parsedOnChain.freezeAuthorityDisabled
+            ? "Disabled (Safe)"
+            : "Active (High Risk of Honeypot / Blacklist)"
+      }
+Ownership Renounced: ${parsedOnChain.renounced === null ? "UNKNOWN" : parsedOnChain.renounced ? "Yes" : "No"}
+Data completeness: ${parsedOnChain.dataComplete ? "complete" : `INCOMPLETE — missing: ${parsedOnChain.missingChecks.join(", ")}`}
+LP lock status: NOT VERIFIED (do not assume locked)
 Liquidity on DEX: ${parsedOnChain.liquidityUsd > 0 ? `$${parsedOnChain.liquidityUsd.toLocaleString()} USD` : "No DEX pool found (High risk)"}
 LP Lock Status: "${parsedOnChain.liquidityLocked}"
 Pool Source: "${parsedOnChain.poolSource}"
@@ -1951,13 +2546,37 @@ Respond in a short, scannable JSON object with these keys:
     const parsed = JSON.parse(response.text || "{}");
     
     // Merge on-chain verification fallback fields if AI returns empty or malformed fields
+    /**
+     * ORDENAÇÃO DE AUTORIDADE (corrigido na auditoria):
+     * o resultado on-chain é a FONTE DE VERDADE. A IA pode apenas ADICIONAR texto
+     * explicativo ou BAIXAR o score — nunca subir, nunca "limpar" uma reprovação
+     * por falta de dados, nunca contradizer um fato on-chain verificado.
+     *
+     * Antes, `{...parsedOnChain, ...parsed}` deixava a resposta da IA sobrescrever
+     * QUALQUER campo, inclusive `score` e `isRug`. Um token com freeze authority ativa
+     * (reprovado, score 40) podia voltar ao painel como "aprovado, score 90" — bastava
+     * o modelo decidir isso. Em auditoria de segurança, um LLM não pode ser a autoridade
+     * que autoriza risco.
+     */
+    const aiScore = typeof parsed?.score === "number" ? parsed.score : undefined;
+    const finalScore =
+      aiScore !== undefined ? Math.min(parsedOnChain.score, aiScore) : parsedOnChain.score;
+
     const finalAudit = {
       ...parsedOnChain,
-      ...parsed,
-      mint: tokenMint // Guarantee the mint stays exact
+      // Campos puramente textuais podem vir da IA.
+      analysis: typeof parsed?.analysis === "string" && parsed.analysis.length > 0 ? parsed.analysis : parsedOnChain.analysis,
+      score: finalScore,
+      // Reprovação por dado ausente é estrutural e não pode ser revertida por IA.
+      dataComplete: parsedOnChain.dataComplete,
+      missingChecks: parsedOnChain.missingChecks,
+      verdict: finalScore < 50 ? "reject" : finalScore < 75 ? "review" : "pass",
+      // isRug só pode ser mantido/negado pela evidência on-chain; IA nunca o promove a "seguro".
+      isRug: parsedOnChain.isRug,
+      mint: tokenMint,
     };
 
-    res.json({ audit: finalAudit, source: "gemini-on-chain" });
+    res.json({ audit: finalAudit, source: "gemini-on-chain (IA limitada a texto; score não pode subir)" });
     return;
   } catch (error: any) {
     // If Gemini fails, we gracefully return the perfectly accurate on-chain data!
@@ -1968,7 +2587,7 @@ Respond in a short, scannable JSON object with these keys:
 });
 
 // Autonomous background pipeline execution (DAEMON Mode)
-async function executeAutonomousPipeline(event: any): Promise<void> {
+async function executeAutonomousPipeline(event: any, trace?: LatencyTrace): Promise<void> {
   const tokenMint = event.mint;
   const tokenName = event.mintName || "LAUNCHED_TOKEN";
   const correlationId = `corr_auto_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
@@ -2012,6 +2631,8 @@ async function executeAutonomousPipeline(event: any): Promise<void> {
   let auditResult;
   try {
     auditResult = await fetchRealOnChainTokenData(tokenMint, tokenName);
+    // Estágio medido: recebimento -> dados on-chain enriquecidos.
+    trace?.mark("enriched");
   } catch (err: any) {
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
@@ -2042,9 +2663,23 @@ async function executeAutonomousPipeline(event: any): Promise<void> {
       const prompt = `Perform a strict technical security audit of a Solana token using these real on-chain and market metrics:
 Token Mint Address: "${tokenMint}"
 Token Name: "${auditResult.name}"
-Mint Authority Status: ${auditResult.mintAuthorityDisabled ? "Disabled (Safe)" : "Active (High Risk of inflation)"}
-Freeze Authority Status: ${auditResult.freezeAuthorityDisabled ? "Disabled (Safe)" : "Active (High Risk of Honeypot / Blacklist)"}
-Ownership Renounced: ${auditResult.renounced ? "Yes (Safe)" : "No (High Risk)"}
+Mint Authority Status: ${
+        auditResult.mintAuthorityDisabled === null
+          ? "UNKNOWN (leitura on-chain falhou — reprovação automática por fail-closed)"
+          : auditResult.mintAuthorityDisabled
+            ? "Disabled (Safe)"
+            : "Active (High Risk of inflation)"
+      }
+Freeze Authority Status: ${
+        auditResult.freezeAuthorityDisabled === null
+          ? "UNKNOWN (leitura on-chain falhou — reprovação automática por fail-closed)"
+          : auditResult.freezeAuthorityDisabled
+            ? "Disabled (Safe)"
+            : "Active (High Risk of Honeypot / Blacklist)"
+      }
+Ownership Renounced: ${auditResult.renounced === null ? "UNKNOWN" : auditResult.renounced ? "Yes" : "No"}
+Data completeness: ${auditResult.dataComplete ? "complete" : `INCOMPLETE — missing: ${auditResult.missingChecks.join(", ")}`}
+LP lock status: NOT VERIFIED (do not assume locked)
 Liquidity on DEX: ${auditResult.liquidityUsd > 0 ? `$${auditResult.liquidityUsd.toLocaleString()} USD` : "No DEX pool pool found (High risk)"}
 LP Lock Status: "${auditResult.liquidityLocked}"
 Pool Source: "${auditResult.poolSource}"
@@ -2065,8 +2700,13 @@ Respond in a short, scannable JSON object with these keys:
       });
 
       const parsed = JSON.parse(response.text || "{}");
-      if (parsed.score !== undefined) score = parsed.score;
-      if (parsed.isRug !== undefined) isRug = parsed.isRug;
+      // IA tem autoridade LIMITADA: pode baixar o score, nunca subir.
+      // Se a verificação on-chain está incompleta (fail-closed), nenhuma opinião de
+      // modelo reverte isso.
+      if (typeof parsed.score === "number") {
+        score = Math.min(score, parsed.score);
+      }
+      if (parsed.isRug === true) isRug = true; // IA pode confirmar rug, nunca absolver
 
       dbStore.saveLog({
         timestamp: new Date().toISOString(),
@@ -2089,8 +2729,36 @@ Respond in a short, scannable JSON object with these keys:
       message: `[ALERTA DE SEGURANÇA - DAEMON] Auditoria do token ${tokenName.toUpperCase()} identificou indicadores severos de RUGPULL/HONEYPOT (Score = ${score}). Snipe Abortado.`,
       correlationId
     });
-    // Feed trade outcome (success=false) to Circuit Breaker as we rejected a bad token
-    reportTradeOutcome(false);
+    // CORREÇÃO: rejeição de sinal NÃO é falha de execução. Alimentar o circuit breaker
+    // aqui fazia o bot se auto-desligar após 3 rejeições legítimas de auditoria.
+    reportSignalRejected(`auditoria reprovou ${tokenName}: score=${score}, isRug=${isRug}`);
+
+    // Registramos a REJEIÇÃO no dataset de replay. Um backtest que só enxerga o que foi
+    // aprovado mede a si mesmo, não o mercado — é preciso poder perguntar depois
+    // "o que teria acontecido se eu tivesse entrado nesses?".
+    trace?.mark("assessed");
+    if (trace) telemetry.record(trace.toRecord("rejected"));
+    recorder.recordAssessment({
+      eventId: trace?.id ?? `evt_${tokenMint}`,
+      mint: tokenMint,
+      decision: "rejected",
+      rejectionReason: isRug
+        ? "isRug=true (evidência de bloqueio/inflação)"
+        : `score ${score} abaixo do limite 50`,
+      score,
+      verdict: (auditResult as any).verdict ?? "reject",
+      dataComplete: (auditResult as any).dataComplete ?? false,
+      missingChecks: (auditResult as any).missingChecks ?? [],
+      isRug,
+      mintAuthorityDisabled: auditResult.mintAuthorityDisabled ?? null,
+      freezeAuthorityDisabled: auditResult.freezeAuthorityDisabled ?? null,
+      liquidityUsd: auditResult.liquidityUsd ?? 0,
+      poolSource: auditResult.poolSource ?? "Unknown",
+      token2022Risk: (auditResult as any).token2022Risk,
+      entryPriceSol: null,
+      entryPriceSource: null,
+      estimatedCostsBps: null,
+    });
     return;
   }
 
@@ -2117,142 +2785,357 @@ Respond in a short, scannable JSON object with these keys:
     return;
   }
 
-  const tradingSolAmount = 0.1; // Default operational execution amount
+  // Tamanho de referência da operação. Em paper mode é apenas o notional simulado;
+  // em live mode deve vir de configuração de risco (limite por operação), não de literal.
+  const tradingSolAmount = Number(process.env.MAX_POSITION_SOL ?? 0.1);
   dbStore.saveLog({
     timestamp: new Date().toISOString(),
     level: "INFO",
-    component: "JITO_BUNDLE",
-    message: `[Daemon Execução] Montando transações para compra de ${tradingSolAmount} SOL do token ${tokenName.toUpperCase()} usando carteira ${activeWalletPubKey.toBase58().slice(0, 8)}...`,
+    component: "RISK_ENGINE",
+    message:
+      `[Daemon] Sinal aprovado pela auditoria para ${tokenName.toUpperCase()}. ` +
+      `Carteira ativa: ${activeWalletPubKey.toBase58().slice(0, 8)}... ` +
+      `Tamanho de referência: ${tradingSolAmount} SOL. Live trading: ${isLiveTradingEnabled() ? "ON" : "OFF (paper)"}.`,
     correlationId
   });
 
-  // Decide route based on programId or mintName
-  const isPump = tokenMint.endsWith("pump") || event.programName === "Pump.fun";
-  const isRaydium = event.programName === "Raydium AMM" || event.programId === "675k1g2EPJ8gS7q9yGP8REukXXhxZ9ReM78D4cifFGL";
-  
-  let routeUsed = "Jupiter Router v6 (REAL-TIME)";
-  if (isPump) {
-    routeUsed = "Pump.fun Native";
-  } else if (isRaydium) {
-    routeUsed = "Raydium Native";
-  }
+  // Rota identificada por PROGRAM ID verificado (nunca por sufixo do mint).
+  // O código anterior usava `tokenMint.endsWith("pump")`, que é heurística de vaidade
+  // do mint, não evidência de programa: existe mint pump.fun que não termina em "pump"
+  // e mint de outro programa que termina.
+  const isPump = event.programId === PROGRAMS.PUMP_FUN || event.programId === PROGRAMS.PUMP_SWAP_AMM;
+  const isRaydium = event.programId === PROGRAMS.RAYDIUM_AMM_V4 || event.programId === PROGRAMS.RAYDIUM_CPMM;
+  const routeHint = isPump ? "Pump.fun" : isRaydium ? "Raydium" : "Jupiter/agregador";
 
-  // 7. Signature & Jito Bundle
-  const priorityTip = 0.001; // tip in SOL
-  dbStore.saveLog({
-    timestamp: new Date().toISOString(),
-    level: "INFO",
-    component: "JITO_BUNDLE",
-    message: `[Daemon Jito Bundle] Montando e assinando Bundle privado via KMS com propina (Jito Tip) de ${priorityTip} SOL. Rota: ${routeUsed}`,
-    correlationId
-  });
-
-  // Let's sign using our Ed25519 isolated vault
-  let signatureBytes;
-  try {
-    const testMessage = new TextEncoder().encode(`Snipe transaction for ${tokenMint} at ${Date.now()}`);
-    signatureBytes = await signWithIsolatedKey(testMessage);
-  } catch (err: any) {
+  // ---------------------------------------------------------------------------
+  // 7. GATE DE EXECUÇÃO REAL
+  //
+  // AUDITORIA 2026-10-02 (achado CRÍTICO): este trecho "assinava" uma MENSAGEM DE TEXTO
+  // (não uma transação) com a chave isolada, sorteava `Math.random() > 0.05` para decidir
+  // se a operação "aterrissou", inventava block number, latência e quantidade adquirida,
+  // gravava o resultado com `status: "success"` e criava uma POSIÇÃO REAL no banco com
+  // preço de entrada aleatório (`0.000003 + Math.random() * 0.000004`).
+  //
+  // Ou seja: o bot registrava compras que nunca existiram, a preços inventados, e essas
+  // posições entravam no gerenciador de risco como se fossem exposição real. Todo o PnL
+  // exibido era fabricado, e o operador não tinha como distinguir do real.
+  //
+  // Correção: o daemon NÃO inventa fills. Em modo paper, registra a decisão com preço de
+  // MERCADO real e marca explicitamente `mode: "paper"`. Em modo live, exige execução
+  // real; como o entry on-chain não está implementado/testado neste código, ele RECUSA
+  // executar em vez de simular.
+  // ---------------------------------------------------------------------------
+  const executionAllowed = assertExecutionAllowed();
+  if (!executionAllowed.ok) {
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
-      level: "ERROR",
-      component: "JITO_BUNDLE",
-      message: `[Daemon Jito Bundle] Erro de Assinatura Isolada: ${err.message}`,
-      correlationId
-    });
-    return;
-  }
-
-  if (!signatureBytes) {
-    dbStore.saveLog({
-      timestamp: new Date().toISOString(),
-      level: "ERROR",
-      component: "JITO_BUNDLE",
-      message: `[Daemon Jito Bundle] Falha ao assinar transação via Vault Isolado. Operação cancelada.`,
-      correlationId
-    });
-    return;
-  }
-
-  // Simulate landed bundle on-chain (since we are on dev/sandbox)
-  const isLandedSuccess = Math.random() > 0.05; // 95% execution guarantee with Jito
-  const mockBlockHeight = 278913000 + Math.floor(Math.random() * 5000);
-  const latencyMs = Math.floor(Math.random() * 6) + 3; // sub-10ms
-
-  // 8. Confirmation
-  if (isLandedSuccess) {
-    const txId = `txn_auto_${Date.now()}`;
-    const mockTx = {
-      id: txId,
-      token: tokenName.toUpperCase(),
-      mint: tokenMint,
-      amount: `${tradingSolAmount} SOL`,
-      outAmount: `${(tradingSolAmount * (140000 + Math.floor(Math.random() * 30000))).toLocaleString()} ${tokenName.toUpperCase()}`,
-      time: new Date().toTimeString().split(' ')[0] + "." + String(Date.now() % 1000).padStart(3, '0'),
-      latencyMs,
-      status: "success" as const,
-      block: mockBlockHeight,
-      tipSol: priorityTip,
-      route: routeUsed
-    };
-
-    // Save trade to persistence
-    dbStore.saveTrade(mockTx);
-    snipedTransactions.unshift(mockTx);
-    if (snipedTransactions.length > 25) {
-      snipedTransactions.pop();
-    }
-
-    dbStore.saveLog({
-      timestamp: new Date().toISOString(),
-      level: "SUCCESS",
-      component: "JITO_BUNDLE",
-      message: `[Daemon Bundle Landed] Transação incluída com sucesso no bloco #${mockBlockHeight}. Quantidade adquirida: ${mockTx.outAmount}. Latência total de execução: ${latencyMs}ms.`,
-      correlationId
-    });
-
-    // 9. Registrar posição (Register active position)
-    const entryPrice = 0.000003 + (Math.random() * 0.000004);
-    const newPos = {
-      id: `pos_auto_${Date.now()}`,
-      token: tokenName.toUpperCase(),
-      mint: tokenMint,
-      sizeSol: tradingSolAmount,
-      entryPrice,
-      currentPrice: entryPrice,
-      pnlPercent: 0,
-      status: "open" as const,
-      stopLossPercent: -5.0, // -5% default SL
-      takeProfitPercent: 15.0, // +15% default TP
-      trailingStopActive: true,
-      trailingStopOffsetPercent: 2.5,
-      highestPrice: entryPrice,
-      timeOpened: new Date().toLocaleTimeString()
-    };
-    dbStore.savePosition(newPos);
-
-    dbStore.saveLog({
-      timestamp: new Date().toISOString(),
-      level: "INFO",
+      level: "WARN",
       component: "RISK_ENGINE",
-      message: `[Daemon Risk Engine] Nova posição de risco registrada para ${tokenName.toUpperCase()}. Stop Loss: -5.0%, Take Profit: 15.0%.`,
-      correlationId
+      message: `[Daemon] Entrada bloqueada para ${tokenName.toUpperCase()}: ${executionAllowed.error}`,
+      correlationId,
     });
+    reportSignalRejected("execução bloqueada por kill switch/read-only");
+    return;
+  }
 
-    // Report success to the circuit breaker
-    reportTradeOutcome(true);
+  const liveTrading = isLiveTradingEnabled();
 
-  } else {
+  if (liveTrading) {
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
-      level: "ERROR",
+      level: "CRITICAL",
       component: "JITO_BUNDLE",
-      message: `[Daemon Bundle Dropped] Falha ao enviar transação: gRPC Bundle descartado pelos validadores líderes por expiração do blockhash.`,
-      correlationId
+      message:
+        `[Daemon] LIVE_TRADING_ENABLED=true, mas a execução de ENTRADA on-chain não está implementada ` +
+        `e verificada neste código (sem testes de fill real, sem política de tip/CU validada em mainnet). ` +
+        `O sistema RECUSA simular um fill para não gerar PnL fictício. Rota pretendida: ${routeHint}. ` +
+        `Implemente e teste o caminho de compra antes de habilitar capital real.`,
+      correlationId,
     });
-    // Report failure to the circuit breaker
-    reportTradeOutcome(false);
+    return;
   }
+
+  // ---------------------------------------------------------------------------
+  // 8. MODO PAPER (default): registra a decisão com preço REAL de mercado, sem
+  //    assinar nada e sem tocar a rede.
+  // ---------------------------------------------------------------------------
+  const reference = await fetchReferenceMarketPrice(tokenMint);
+  if (!reference) {
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "WARN",
+      component: "RISK_ENGINE",
+      message:
+        `[Daemon PAPER] Sem preço de mercado confiável para ${tokenName.toUpperCase()} (${tokenMint.slice(0, 8)}...). ` +
+        `Nenhuma posição simulada foi criada: não é possível gerenciar risco de um ativo sem preço.`,
+      correlationId,
+    });
+    reportSignalRejected("sem preço de referência");
+    return;
+  }
+
+  const paperSizeSol = tradingSolAmount;
+  const paperTxId = `paper_${Date.now()}`;
+  const paperTx = {
+    id: paperTxId,
+    token: tokenName.toUpperCase(),
+    mint: tokenMint,
+    amount: `${paperSizeSol} SOL (PAPER)`,
+    outAmount: `shadow fill @ ${reference.priceSol.toPrecision(6)} SOL/token`,
+    time: new Date().toTimeString().split(" ")[0] + "." + String(Date.now() % 1000).padStart(3, "0"),
+    latencyMs: 0,
+    // "paper" (não "success"): o relatório de desempenho não pode somar sombra com execução real.
+    status: "paper" as const,
+    block: 0,
+    tipSol: 0,
+    route: `PAPER/shadow (${routeHint}) — SEM execução on-chain`,
+    mode: "paper" as const,
+    signature: null,
+  };
+
+  dbStore.saveTrade(paperTx);
+  snipedTransactions.unshift(paperTx);
+  if (snipedTransactions.length > 25) {
+    snipedTransactions.pop();
+  }
+
+  dbStore.savePosition({
+    id: `pos_paper_${Date.now()}`,
+    token: tokenName.toUpperCase(),
+    mint: tokenMint,
+    sizeSol: paperSizeSol,
+    entryPrice: reference.priceSol,
+    currentPrice: reference.priceSol,
+    pnlPercent: 0,
+    status: "open",
+    stopLossPercent: -5.0,
+    takeProfitPercent: 15.0,
+    trailingStopActive: true,
+    trailingStopOffsetPercent: 2.5,
+    highestPrice: reference.priceSol,
+    timeOpened: new Date().toLocaleTimeString(),
+    mode: "paper",
+    priceSource: reference.source,
+  } as any);
+
+  // Custo round-trip estimado: em paper mode é a métrica que mais importa, porque mostra
+  // se a oportunidade sobrevive a taxas antes de qualquer risco de capital.
+  const paperCosts = estimatePaperRoundTrip(reference.priceSol, paperSizeSol);
+
+  dbStore.saveLog({
+    timestamp: new Date().toISOString(),
+    level: "INFO",
+    component: "RISK_ENGINE",
+    message:
+      `[Daemon PAPER] Posição sombra registrada para ${tokenName.toUpperCase()} @ ${reference.priceSol.toPrecision(6)} SOL/token ` +
+      `(fonte: ${reference.source}, liquidez: $${Math.round(reference.liquidityUsd).toLocaleString()}). ` +
+      `Break-even estimado round-trip: ${paperCosts.toFixed(2)}% — se o take-profit é 15%, ` +
+      `isso representa ${(paperCosts / 15 * 100).toFixed(0)}% do alvo consumido em custos. NENHUMA transação foi enviada.`,
+    correlationId,
+  });
+
+  // Fecha a trilha de latência com o desfecho real e grava a avaliação APROVADA.
+  trace?.mark("assessed");
+  if (trace) telemetry.record(trace.toRecord("executed"));
+  recorder.recordAssessment({
+    eventId: trace?.id ?? `evt_${tokenMint}`,
+    mint: tokenMint,
+    decision: "accepted",
+    rejectionReason: null,
+    score,
+    verdict: (auditResult as any).verdict ?? "pass",
+    dataComplete: (auditResult as any).dataComplete ?? false,
+    missingChecks: (auditResult as any).missingChecks ?? [],
+    isRug,
+    mintAuthorityDisabled: auditResult.mintAuthorityDisabled ?? null,
+    freezeAuthorityDisabled: auditResult.freezeAuthorityDisabled ?? null,
+    liquidityUsd: auditResult.liquidityUsd ?? 0,
+    poolSource: auditResult.poolSource ?? "Unknown",
+    token2022Risk: (auditResult as any).token2022Risk,
+    entryPriceSol: reference.priceSol,
+    entryPriceSource: reference.source,
+    estimatedCostsBps: Math.round(paperCosts * 100),
+  });
+  recorder.recordPositionLifecycle({
+    positionId: paperTxId,
+    mint: tokenMint,
+    token: tokenName.toUpperCase(),
+    event: "opened",
+    mode: "paper",
+    sizeSol: paperSizeSol,
+    entryPriceSol: reference.priceSol,
+    exitPriceSol: null,
+    pnlPercent: null,
+    reason: "paper/shadow entry",
+    pnlMeasuredOnChain: false,
+  });
+
+  reportSignalAccepted();
+}
+
+/**
+ * Busca preço de referência REAL de mercado (SOL por token) via DexScreener,
+ * escolhendo o par de MAIOR LIQUIDEZ — não o primeiro da lista.
+ *
+ * Por que não o primeiro par: o código anterior usava `solPairs[0]`, que pode ser um
+ * pool raso/desatualizado. Preço de um pool ilíquido não é preço de mercado; usar isso
+ * como entry price produz PnL errado e stop-loss disparando por ruído de pool vazio.
+ */
+async function fetchReferenceMarketPrice(
+  mint: string
+): Promise<{ priceSol: number; source: string; liquidityUsd: number; fetchedAt: number } | null> {
+  if (!isValidPubkey(mint)) return null;
+  try {
+    const res = await fetch(`${DEXSCREENER_BASE_URL}/tokens/${mint}`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const pairs = Array.isArray(data?.pairs)
+      ? data.pairs.filter((p: any) => p.chainId === "solana" && typeof p.priceNative === "string")
+      : [];
+    if (pairs.length === 0) return null;
+
+    const best = pairs.sort(
+      (a: any, b: any) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0)
+    )[0];
+    const priceSol = parseFloat(best.priceNative);
+    if (!Number.isFinite(priceSol) || priceSol <= 0) return null;
+
+    return {
+      priceSol,
+      source: `DexScreener/${best.dexId} (pair ${String(best.pairAddress || "").slice(0, 8)}...)`,
+      liquidityUsd: best?.liquidity?.usd || 0,
+      fetchedAt: Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Estimativa de custo round-trip para decisão em modo paper.
+ * Assume o mesmo perfil de execução do caminho live (tip limitado por bps), para não
+ * criar expectativa otimista.
+ */
+function estimatePaperRoundTrip(priceSol: number, sizeSol: number): number {
+  const jitoTipSol = 0.001;
+  const priorityFeeSol = 0.00002 * 2;
+  const baseFeeSol = 0.000005 * 2;
+  const ammFeeSol = 0.0025 * sizeSol;
+  const slippageSol = 0.015 * sizeSol * 2;
+  const total = jitoTipSol * 2 + priorityFeeSol + baseFeeSol + ammFeeSol + slippageSol;
+  void priceSol;
+  return (total / sizeSol) * 100;
+}
+
+/**
+ * RECONCILIADOR DE ESTADO DE SAÍDA — resolve posições presas em `exit_pending`.
+ *
+ * POR QUE ISTO EXISTE (lacuna que eu mesmo introduzi):
+ * a correção de falha de saída reverte a posição para `open` dentro do `catch`, o que
+ * resolve o caso comum. Mas se o PROCESSO morrer no meio da liquidação (deploy, OOM,
+ * SIGKILL), a posição fica em `exit_pending` no disco para sempre — e o lock em memória
+ * (`exitLocks`) some no restart, então o gerenciador pode pegar a posição depois.
+ * Pior: se um kill switch ou um read-only foi acionado no meio, a posição fica travada
+ * em `exit_pending` sem ninguém para destravá-la, e todo POST de fechamento devolve 409.
+ *
+ * Comportamento: as posições são liberadas para `open` com falha registrada, forçando
+ * uma nova avaliação de risco. Isos e honesto: registra cada reconciliação no log.
+ */
+async function reconcileStuckExits(): Promise<void> {
+  try {
+    const positions = dbStore.getPositions();
+    const stuck = positions.filter((p) => p.status === "exit_pending");
+    for (const pos of stuck) {
+      pos.status = "open";
+      pos.exitAttempts = (pos.exitAttempts || 0) + 1;
+      pos.lastExitError = "Posição encontrada em exit_pending no boot (processo interrompido durante a liquidação).";
+      pos.lastExitAttemptAt = new Date().toISOString();
+      dbStore.savePosition(pos);
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "WARN",
+        component: "RISK_ENGINE",
+        message:
+          `[RECONCILIAÇÃO] Posição $${pos.token} estava presa em EXIT_PENDING (liquidação interrompida). ` +
+          `Status revertido para OPEN para que o risco seja reavaliado. Verifique on-chain se os tokens ` +
+          `ainda estão na carteira antes de confiar no estado local.`,
+        correlationId: `corr_reconcile_${pos.id}_${Date.now()}`,
+      });
+    }
+    if (stuck.length > 0) {
+      console.warn(`[Risk Engine] ${stuck.length} posição(ões) reconciliada(s) de EXIT_PENDING para OPEN.`);
+    }
+  } catch (err: any) {
+    console.error("[Risk Engine] Falha na reconciliação de posições:", err.message);
+  }
+}
+
+/**
+ * Fecha uma posição PAPER (shadow trading) usando o preço de mercado observado.
+ *
+ * Por que isto é separado de executeAutonomousExit:
+ *   - Não assina nada, não envia nada, não toca a rede.
+ *   - Registra o resultado marcado como `mode: "paper"`, para que nunca se confunda com
+ *     PnL real nos relatórios. Um backtest que se disfarça de execução real é pior do que
+ *     nenhum backtest.
+ */
+function recordPaperClose(pos: any, reason: string, pnlPercent: number): void {
+  const exitPrice = pos.currentPrice || pos.entryPrice;
+  const pnlSol = (pos.sizeSol * pnlPercent) / 100;
+
+  const paperTrade = {
+    id: `paper_close_${pos.id}_${Date.now()}`,
+    token: pos.token,
+    mint: pos.mint,
+    amount: `${pos.sizeSol} SOL (PAPER)`,
+    outAmount: `${pnlSol >= 0 ? "+" : ""}${pnlSol.toFixed(4)} SOL (shadow, não realizado)`,
+    time: new Date().toTimeString().split(" ")[0] + "." + String(Date.now() % 1000).padStart(3, "0"),
+    latencyMs: 0,
+    status: "paper" as const,
+    block: 0,
+    tipSol: 0,
+    route: `PAPER/shadow close (${reason}) @ ${Number(exitPrice).toPrecision(6)} SOL`,
+    mode: "paper" as const,
+    signature: null,
+  };
+
+  dbStore.saveTrade(paperTrade);
+  snipedTransactions.unshift(paperTrade);
+  if (snipedTransactions.length > 25) snipedTransactions.pop();
+
+  pos.status = "closed";
+  pos.pnlPercent = pnlPercent;
+  dbStore.savePosition(pos);
+  dbStore.deletePosition(pos.id);
+  exitLocks.delete(pos.id);
+
+  recorder.recordPositionLifecycle({
+    positionId: pos.id,
+    mint: pos.mint,
+    token: pos.token,
+    event: "closed",
+    mode: "paper",
+    sizeSol: pos.sizeSol,
+    entryPriceSol: pos.entryPrice ?? null,
+    exitPriceSol: null, // a sombra não recebe preço de execução; o gatilho é registrado em 'reason'
+    pnlPercent,
+    reason,
+    pnlMeasuredOnChain: false, // sombra: NUNCA medido on-chain
+  });
+
+  dbStore.saveLog({
+    timestamp: new Date().toISOString(),
+    level: "INFO",
+    component: "RISK_ENGINE",
+    message:
+      `[PAPER/SHADOW] Posição simulada de $${pos.token} encerrada por ${reason} com PnL ` +
+      `${pnlPercent.toFixed(2)}% (${pnlSol.toFixed(4)} SOL nocionais). Nenhuma transação foi ` +
+      `enviada on-chain. Este resultado NÃO é PnL real e não deve ser usado como métrica de ` +
+      `desempenho de capital.`,
+    correlationId: `corr_paper_${pos.id}_${Date.now()}`,
+  });
 }
 
 // ETAPA 12 — Motor de Gerenciamento de Posições On-Chain REAL (Zero Simulation Mode)
@@ -2276,81 +3159,178 @@ async function startAutonomousPositionManager(): Promise<void> {
       }
 
       for (const pos of openPositions) {
-        // 1. Consulta de preço real (DexScreener API -> Jupiter Price API -> Jupiter Quote API)
+        // POSIÇÕES PAPER: gestão de risco em modo sombra. Nenhuma assinatura, nenhuma
+        // transação. Sem este desvio, o gerenciador tentaria VENDER tokens que nunca
+        // foram comprados — e antes da correção, gravava essa "venda" como sucesso.
+        const isPaper = (pos as any).mode === "paper";
+
+        /**
+         * SANIDADE DE POSIÇÃO — corta lixo ANTES de gastar RPC.
+         *
+         * Observado em execução (2026-10-02): o banco operacional atual contém posições de
+         * histórico fabricado (tokens que nunca existiram) e o loop de gestão gastava uma
+         * chamada de RPC por mint a cada 3s, além de inundar o log. Nenhuma dessas posições
+         * pode ser gerida de verdade — e uma delas tinha `sizeSol: 0`.
+         *
+         * Isto NÃO apaga nem corrige nada: só recusa consultar o que é estruturalmente
+         * impossível. A decisão de quarentenar o banco continua sendo do operador.
+         */
+        if (!Number.isFinite(Number(pos.sizeSol)) || Number(pos.sizeSol) <= 0) {
+          if (!invalidPositionWarned.has(pos.id)) {
+            invalidPositionWarned.add(pos.id);
+            dbStore.saveLog({
+              timestamp: new Date().toISOString(),
+              level: "WARN",
+              component: "RISK_ENGINE",
+              message:
+                `[POSIÇÃO INVÁLIDA] ${pos.token ?? pos.id} tem tamanho ${pos.sizeSol} SOL (esperado > 0). ` +
+                `Não será gerida nem consultada. Provável resíduo de histórico fabricado — considere quarentenar o banco.`,
+              correlationId: `corr_invalid_pos_${pos.id}`,
+            });
+          }
+          continue;
+        }
+        if (!pos.mint || !isValidPubkey(pos.mint)) {
+          if (!invalidPositionWarned.has(pos.id)) {
+            invalidPositionWarned.add(pos.id);
+            dbStore.saveLog({
+              timestamp: new Date().toISOString(),
+              level: "WARN",
+              component: "RISK_ENGINE",
+              message:
+                `[POSIÇÃO INVÁLIDA] ${pos.token ?? pos.id} tem mint que não é uma pubkey base58 válida ` +
+                `("${pos.mint ?? "(vazio)"}"). Não será consultada no RPC.`,
+              correlationId: `corr_invalid_mint_${pos.id}`,
+            });
+          }
+          continue;
+        }
+
+        /**
+         * 1. CONSULTA DE PREÇO — CASCATA COM FONTES VERIFICÁVEIS.
+         *
+         * AUDITORIA 2026-10-02 (achado C25): a versão anterior tentava dois hosts MORTOs
+         * (`api.jup.ag/v6/price`) e, se ambos respondessem, convertia USD->SOL usando um
+         * fallback hardcoded de 140.0 dólares quando a segunda chamada falhasse — ou seja,
+         * podia inventar um preço de SOL. De quebra, a terceira tentativa assumia
+         * `amount=1000000` = 1 token inteiro, isto é, SÓ funciona para mints de 6 decimais;
+         * em um token de 9 decimais o preço sairia 1000x maior, disparando stop/alvo
+         * imediatamente e vendendo a posição por engano.
+         *
+         * Agora: (1) DexScreener; (2) cotação Jupiter REAL na quantidade exata de 1 token
+         * inteiro — com os decimais lidos do mint (imutáveis, cacheados por processo).
+         * Se os decimais não puderem ser lidos, a fonte é DESCARTADA: preço ausente é
+         * tratado pelo fluxo como "sem telemetria" (SL/TP pulados). Preço errado é pior
+         * do que preço nenhum — ele dispara uma venda real por engano.
+         */
+        // Respeita o backoff: sem telemetria, insistir a cada 3s não produz informação.
+        const priceBackoff = priceTelemetryBackoff.get(pos.id);
+        if (priceBackoff && Date.now() < priceBackoff.nextPollAt) {
+          continue;
+        }
+
         let currentPriceSol = 0;
         let priceSource = "";
 
         const isMockMint = !pos.mint || pos.mint.includes("...") || pos.mint.length < 32;
 
         if (!isMockMint) {
-          // Attempt 1: Fetch from DexScreener
+          // Attempt 1: DexScreener (host vem da configuração, não hardcoded)
           try {
-            const dexRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${pos.mint}`);
+            const dexRes = await fetch(`${DEXSCREENER_BASE_URL}/tokens/${pos.mint}`);
             if (dexRes.ok) {
               const dexData = await dexRes.json();
               if (dexData && dexData.pairs && dexData.pairs.length > 0) {
                 const solPairs = dexData.pairs.filter((p: any) => p.chainId === "solana");
-                if (solPairs.length > 0) {
-                  currentPriceSol = parseFloat(solPairs[0].priceNative) || 0;
+                const native = solPairs.find((p: any) => Number.isFinite(parseFloat(p.priceNative)));
+                if (native && parseFloat(native.priceNative) > 0) {
+                  currentPriceSol = parseFloat(native.priceNative);
                   priceSource = "DexScreener API";
                 }
               }
             }
           } catch (err: any) {
-            // DexScreener unavailable
+            // DexScreener indisponível: cai para a cotação real.
           }
 
-          // Attempt 2: Consult alternative source: Jupiter Price API
+          // Attempt 2: cotação REAL da Jupiter para exatamente 1 token inteiro.
           if (currentPriceSol === 0) {
-            try {
-              const jupPriceRes = await fetch(`https://api.jup.ag/v6/price?ids=${pos.mint}`);
-              if (jupPriceRes.ok) {
-                const jupPriceData = await jupPriceRes.json();
-                if (jupPriceData && jupPriceData.data && jupPriceData.data[pos.mint]) {
-                  const usdPrice = parseFloat(jupPriceData.data[pos.mint].price) || 0;
-                  
-                  // Convert USD price to SOL price by fetching SOL price in USD
-                  const solPriceRes = await fetch("https://api.jup.ag/v6/price?ids=So11111111111111111111111111111111111111112");
-                  if (solPriceRes.ok) {
-                    const solPriceData = await solPriceRes.json();
-                    const solUsd = parseFloat(solPriceData.data["So11111111111111111111111111111111111111112"]?.price) || 140.0;
-                    if (solUsd > 0) {
-                      currentPriceSol = usdPrice / solUsd;
-                      priceSource = "Jupiter Price API";
-                    }
-                  }
+            const decimals = await getMintDecimals(pos.mint);
+            if (decimals === null) {
+              console.warn(
+                `[Price] Não foi possível determinar os decimais de ${pos.mint}; fonte de cotação descartada ` +
+                  `(converter sem decimais produziria preço errado por ordens de magnitude).`
+              );
+            } else {
+              try {
+                const oneTokenRaw = Math.pow(10, decimals);
+                const q = await JupiterIntegration.getQuote(
+                  pos.mint,
+                  "So11111111111111111111111111111111111111112",
+                  oneTokenRaw,
+                  100
+                );
+                const solPerToken = parseFloat(q.outAmount) / 1e9;
+                if (Number.isFinite(solPerToken) && solPerToken > 0) {
+                  currentPriceSol = solPerToken;
+                  priceSource = `Jupiter Quote API (${decimals} decimais)`;
                 }
+              } catch (err: any) {
+                // Sem rota/erro de rede: permanece sem preço (tratado abaixo).
               }
-            } catch (err: any) {
-              // Jupiter Price API unavailable
-            }
-          }
-
-          // Attempt 3: Consult alternative source: Jupiter Quote API
-          if (currentPriceSol === 0) {
-            try {
-              const tempQuote = `https://quote-api.jup.ag/v6/quote?inputMint=${pos.mint}&outputMint=So11111111111111111111111111111111111111112&amount=1000000&slippageBps=100`;
-              const qRes = await fetch(tempQuote);
-              if (qRes.ok) {
-                const qData = await qRes.json();
-                if (qData && qData.outAmount) {
-                  currentPriceSol = (parseFloat(qData.outAmount) / 1e9) / (1000000 / 1e6);
-                  priceSource = "Jupiter Quote API";
-                }
-              }
-            } catch (err: any) {
-              // Jupiter Quote API unavailable
             }
           }
         }
 
-        // If all real sources fail, keep previous price or entry price
-        if (currentPriceSol === 0) {
-          currentPriceSol = pos.currentPrice || pos.entryPrice || 0.0001;
-          priceSource = isMockMint ? "Stale Price (Mock Token)" : "Stale Price";
+        /**
+         * SEM PREÇO NÃO HÁ GESTÃO DE RISCO — E ISSO PRECISA SER DITO EM VOZ ALTA.
+         *
+         * O código anterior, quando todas as fontes falhavam, reaproveitava o último
+         * preço conhecido e seguia. Consequência: com preço congelado o PnL congela, o
+         * stop-loss nunca dispara, e o operador não recebe nenhum sinal de que o bot
+         * perdeu telemetria de preço de uma posição ABERTA com capital real.
+         *
+         * Agora: preço ausente ou velho => escalamos alerta e NÃO avaliamos SL/TP com
+         * dado inválido. Preferimos dizer "não sei" a fingir que sei.
+         */
+        const priceQuote: PriceQuote | undefined =
+          currentPriceSol > 0 ? { priceSol: currentPriceSol, source: priceSource, fetchedAt: Date.now() } : undefined;
+        const freshness = assessPriceFreshness(priceQuote);
+
+        if (riskActionForFreshness(freshness) === "escalate") {
+          // Registra a falha e afasta a próxima tentativa (backoff exponencial com teto).
+          const misses = (priceTelemetryBackoff.get(pos.id)?.misses ?? 0) + 1;
+          const backoffMs = Math.min(3000 * Math.pow(2, misses - 1), 60_000);
+          priceTelemetryBackoff.set(pos.id, { misses, nextPollAt: Date.now() + backoffMs });
+
+          const lastAlertAt = (pos as any).lastPriceAlertAt || 0;
+          if (Date.now() - lastAlertAt > 60_000) {
+            (pos as any).lastPriceAlertAt = Date.now();
+            (pos as any).priceTelemetry = {
+              status: freshness,
+              lastAttemptAt: new Date().toISOString(),
+              consecutiveMisses: misses,
+              nextPollInMs: backoffMs,
+            };
+            dbStore.savePosition(pos);
+            dbStore.saveLog({
+              timestamp: new Date().toISOString(),
+              level: "CRITICAL",
+              component: "RISK_ENGINE",
+              message:
+                `[TELEMETRIA DE PREÇO PERDIDA] Posição $${pos.token} está ABERTA e não há preço ` +
+                `confiável (status: ${freshness}). Stop-loss/take-profit NÃO estão sendo avaliados. ` +
+                `Intervenção manual necessária — o bot não consegue proteger esta posição sem preço.`,
+              correlationId: `corr_price_${pos.id}_${Date.now()}`,
+            });
+          }
+          continue;
         }
 
-        console.log(`[On-Chain Price Monitor] Fetched real price of ${currentPriceSol} SOL for $${pos.token} via ${priceSource}`);
+        // Telemetria recuperada: zera o backoff desta posição.
+        if (priceTelemetryBackoff.has(pos.id)) priceTelemetryBackoff.delete(pos.id);
+
+        console.log(`[On-Chain Price Monitor] ${currentPriceSol} SOL para $${pos.token} via ${priceSource}`);
 
         // 2. Cálculo de PnL usando preço real
         pos.currentPrice = currentPriceSol;
@@ -2362,29 +3342,54 @@ async function startAutonomousPositionManager(): Promise<void> {
         // Save current price & PnL directly to database
         dbStore.savePosition(pos);
 
+        // SÉRIE DE PREÇOS PARA REPLAY.
+        // Esta é a matéria-prima do backtest: sem gravar o preço em cada observação, não
+        // existe como responder depois "a estratégia de saída tinha edge?". Gravar aqui
+        // custa um append em JSONL; não gravar custa a capacidade de validar qualquer coisa.
+        recorder.recordPriceObservation({
+          positionId: pos.id,
+          mint: pos.mint,
+          priceSol: currentPriceSol,
+          source: priceSource,
+          ageMs: 0, // a observação é rotulada 'fresh' pelo assessPriceFreshness acima
+          pnlPercent: pos.pnlPercent,
+        });
+
         const correlationId = `corr_pos_${pos.id}_${Date.now()}`;
 
-        // 3. Stop Loss real
+        // 3. Stop Loss
         const slThreshold = pos.stopLossPercent || -5.0;
         if (pos.pnlPercent <= slThreshold) {
-          await executeAutonomousExit(pos, "Stop-Loss Real On-Chain", pos.pnlPercent, correlationId);
+          if (isPaper) {
+            recordPaperClose(pos, "Stop-Loss (shadow)", pos.pnlPercent);
+          } else {
+            await executeAutonomousExit(pos, "Stop-Loss Real On-Chain", pos.pnlPercent, correlationId);
+          }
           continue;
         }
 
-        // 4. Take Profit real
+        // 4. Take Profit
         const tpThreshold = pos.takeProfitPercent || 15.0;
         if (pos.pnlPercent >= tpThreshold) {
-          await executeAutonomousExit(pos, "Take Profit Alvo Real", pos.pnlPercent, correlationId);
+          if (isPaper) {
+            recordPaperClose(pos, "Take Profit (shadow)", pos.pnlPercent);
+          } else {
+            await executeAutonomousExit(pos, "Take Profit Alvo Real", pos.pnlPercent, correlationId);
+          }
           continue;
         }
 
-        // 5. Trailing Stop real
+        // 5. Trailing Stop
         if (pos.trailingStopActive) {
           const trailingOffset = pos.trailingStopOffsetPercent || 2.5;
           const drawdownPercent = ((pos.highestPrice - currentPriceSol) / pos.highestPrice) * 100;
           
           if (drawdownPercent >= trailingOffset && pos.pnlPercent > 1.0) {
-            await executeAutonomousExit(pos, `Trailing Stop Real (${trailingOffset}% Drawdown)`, pos.pnlPercent, correlationId);
+            if (isPaper) {
+              recordPaperClose(pos, `Trailing Stop ${trailingOffset}% (shadow)`, pos.pnlPercent);
+            } else {
+              await executeAutonomousExit(pos, `Trailing Stop Real (${trailingOffset}% Drawdown)`, pos.pnlPercent, correlationId);
+            }
             continue;
           }
         }
@@ -2395,39 +3400,51 @@ async function startAutonomousPositionManager(): Promise<void> {
   }
 }
 
-// ETAPA 12 — Real On-Chain Liquidation and Swap Execution
-async function fetchJupiterQuoteWithRetry(url: string, retries = 2, delayMs = 500): Promise<any> {
-  let lastError: any = null;
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) {
-        return await res.json();
-      }
-      throw new Error(`Jupiter Quote API returned status ${res.status}`);
-    } catch (err: any) {
-      lastError = err;
-      if (attempt < retries - 1) {
-        await new Promise(resolve => setTimeout(resolve, delayMs * Math.pow(2, attempt)));
-      }
+/**
+ * Decimais de um mint, lidos do RPC e CACHEADOS pelo resto do processo.
+ *
+ * Por que cachear sem TTL: os decimais de um mint são imutáveis por definição do SPL Token.
+ * Não existe invalidação possível, e uma chamada de rede por poll (a cada 3s por posição)
+ * seria desperdício puro.
+ *
+ * Devolve `null` quando não foi possível LER. Nunca assume 9 (o default perigoso): assumir
+ * decimais errados multiplica ou divide o preço interpretado por 10^n, e esse preço alimenta
+ * stop-loss e take-profit reais.
+ */
+const mintDecimalsCache = new Map<string, number>();
+async function getMintDecimals(mint: string): Promise<number | null> {
+  const cached = mintDecimalsCache.get(mint);
+  if (cached !== undefined) return cached;
+  const conn = globalConnection;
+  if (!conn) return null; // sem conexão não há leitura — e não vamos adivinhar decimais
+  try {
+    const info = await conn.getParsedAccountInfo(new PublicKey(mint));
+    const parsed: any = (info.value as any)?.data?.parsed;
+    const decimals = parsed?.info?.decimals;
+    if (parsed?.type === "mint" && typeof decimals === "number" && decimals >= 0 && decimals <= 18) {
+      mintDecimalsCache.set(mint, decimals);
+      return decimals;
     }
+  } catch (err: any) {
+    console.warn(`[Price] getParsedAccountInfo(${mint}) falhou: ${err.message}`);
   }
-  throw lastError;
+  return null;
 }
 
-async function fetchJupiterSwapWithRetry(body: any, retries = 2, delayMs = 500): Promise<any> {
+// ETAPA 12 — Real On-Chain Liquidation and Swap Execution
+
+/**
+ * Retry com backoff exponencial sobre a MESMA operação idempotente.
+ *
+ * Retry só é seguro para COTAÇÃO (leitura). A construção do swap também é leitura
+ * (devolve transação não assinada), portanto pode ser repetida. O ENVIO nunca é
+ * repetido aqui — reenviar um bundle já aceito pode liquidar duas vezes.
+ */
+async function withRetry<T>(label: string, fn: () => Promise<T>, retries = 2, delayMs = 500): Promise<T> {
   let lastError: any = null;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      const res = await fetch("https://quote-api.jup.ag/v6/swap", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-      if (res.ok) {
-        return await res.json();
-      }
-      throw new Error(`Jupiter Swap API returned status ${res.status}`);
+      return await fn();
     } catch (err: any) {
       lastError = err;
       if (attempt < retries - 1) {
@@ -2435,10 +3452,94 @@ async function fetchJupiterSwapWithRetry(body: any, retries = 2, delayMs = 500):
       }
     }
   }
-  throw lastError;
+  throw new Error(`${label} falhou após ${retries} tentativas: ${lastError?.message ?? lastError}`);
+}
+
+/** Cotação da Jupiter com retry, no host configurado (nunca em host hardcoded). */
+async function fetchJupiterQuoteWithRetry(
+  inputMint: string,
+  outputMint: string,
+  amountLamports: number,
+  slippageBps: number,
+  retries = 2
+): Promise<any> {
+  return withRetry(
+    "Jupiter quote",
+    () => JupiterIntegration.getQuote(inputMint, outputMint, amountLamports, slippageBps),
+    retries
+  );
+}
+
+/** Construção da transação de swap com retry (não assina, não envia). */
+async function fetchJupiterSwapWithRetry(quoteResponse: any, userPublicKeyStr: string, retries = 2): Promise<VersionedTransaction> {
+  return withRetry(
+    "Jupiter swap build",
+    () => JupiterIntegration.buildSwapTransaction(quoteResponse, userPublicKeyStr),
+    retries
+  );
+}
+
+/**
+ * Mede o resultado REAL de uma saída a partir da transação confirmada.
+ *
+ * Por que isto existe: o código anterior reportava "PnL Realizado" calculado sobre o
+ * `outAmount` da COTAÇÃO da Jupiter. Cotação não é fill: ignora slippage efetivo,
+ * Jito tip, priority fee, base fee e taxas da AMM. Em posições pequenas, esses custos
+ * (tip fixo de 0.003 SOL = 300 bps em 0.1 SOL) dominam o resultado.
+ *
+ * Aqui lemos `preBalances`/`postBalances` da carteira na transação confirmada. Isto é
+ * o fluxo de caixa efetivo, incluindo TODOS os custos. É a única medida em que confiamos.
+ */
+async function measureExitEconomics(
+  signature: string,
+  wallet: PublicKey
+): Promise<{ measured: boolean; solDeltaSol: number; feeSol: number; error?: string }> {
+  const conn = globalConnection;
+  if (!conn) return { measured: false, solDeltaSol: 0, feeSol: 0, error: "sem conexão RPC" };
+  try {
+    const tx = await conn.getTransaction(signature, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (!tx || !tx.meta) {
+      return { measured: false, solDeltaSol: 0, feeSol: 0, error: "transação não retornada pelo RPC" };
+    }
+
+    let index = -1;
+    const message: any = tx.transaction.message;
+    if (typeof message.getAccountKeys === "function") {
+      const keys = message.getAccountKeys({ accountKeysFromLookups: tx.meta.loadedAddresses });
+      for (let i = 0; i < keys.length; i++) {
+        if (keys.get(i)?.equals(wallet)) {
+          index = i;
+          break;
+        }
+      }
+    } else {
+      index = message.staticAccountKeys.findIndex((k: PublicKey) => k.equals(wallet));
+    }
+
+    if (index < 0 || !tx.meta.preBalances || !tx.meta.postBalances) {
+      return { measured: false, solDeltaSol: 0, feeSol: 0, error: "carteira não localizada nos saldos da tx" };
+    }
+
+    return {
+      measured: true,
+      solDeltaSol: (tx.meta.postBalances[index] - tx.meta.preBalances[index]) / 1_000_000_000,
+      feeSol: (tx.meta.fee || 0) / 1_000_000_000,
+    };
+  } catch (err: any) {
+    return { measured: false, solDeltaSol: 0, feeSol: 0, error: err.message };
+  }
 }
 
 async function executeAutonomousExit(pos: any, reason: string, pnlPercent: number, correlationId: string): Promise<void> {
+  /**
+   * Trilha de latência da SAÍDA. O caminho de saída é o que decide se a perda para no
+   * stop ou vira prejuízo grande — medir cada estágio é o mínimo para poder discuti-lo.
+   * A amostra é gravada tanto no sucesso quanto na falha (falha também é resultado).
+   */
+  const trace = new LatencyTrace(`exit_${pos.id}_${Date.now()}`, undefined, null, null);
   // 1. Thread-safe concurrency check (Double sell / Race condition prevention)
   if (exitLocks.has(pos.id) || pos.status === "exit_pending" || pos.status === "closed") {
     console.warn(`[Risk Engine Lock] Aborting exit. Position ${pos.id} is already in exit process or closed. Status: ${pos.status}`);
@@ -2491,7 +3592,18 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       console.log(`[On-Chain Exit] Local token balance was 0. Proceeding with position qty ${qtyFloat} units.`);
     }
 
-    const jitoTip = 0.003; // Real Jito tip in SOL
+    // Tip LIMITADO por bps do capital (mesmo motivo do fechamento manual).
+    const { tipSol: jitoTip, clamped: tipClamped } = clampTipSol(
+      0.003,
+      pos.sizeSol,
+      Number(process.env.MAX_TIP_BPS ?? 50)
+    );
+    if (tipClamped) {
+      console.warn(
+        `[Tip Limitado] Tip de saída de $${pos.token} reduzido para ${jitoTip.toFixed(6)} SOL ` +
+          `(teto de ${process.env.MAX_TIP_BPS ?? 50} bps sobre ${pos.sizeSol} SOL).`
+      );
+    }
     const jitoSender = new JitoBundleSender(connection);
     
     let signature = "";
@@ -2521,23 +3633,16 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
           correlationId
         });
 
-        // 3. Consulta de cotação real da Jupiter Quote API com re-tentativa robusta e slippage dinâmico
-        const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${pos.mint}&outputMint=So11111111111111111111111111111111111111112&amount=${rawAmount}&slippageBps=${currentSlippageBps}`;
-        quoteData = await fetchJupiterQuoteWithRetry(quoteUrl);
+        // 3. Cotação (host configurado + retry com backoff) e 4. construção do swap.
+        quoteData = await fetchJupiterQuoteWithRetry(
+          pos.mint,
+          "So11111111111111111111111111111111111111112",
+          rawAmount,
+          currentSlippageBps
+        );
+        trace.mark("built");
 
-        // 4. Construção da transação de venda real via Jupiter Swap API com re-tentativa robusta
-        const swapResponseData = await fetchJupiterSwapWithRetry({
-          quoteResponse: quoteData,
-          userPublicKey: walletPublicKey.toBase58(),
-          wrapAndUnwrapSol: true,
-          dynamicComputeUnitLimit: true,
-          prioritizationFeeLamports: "auto"
-        });
-        const { swapTransaction } = swapResponseData;
-
-        // Deserializar para VersionedTransaction
-        const txBuffer = Buffer.from(swapTransaction, "base64");
-        const transaction = VersionedTransaction.deserialize(txBuffer);
+        const transaction = await fetchJupiterSwapWithRetry(quoteData, walletPublicKey.toBase58());
 
         dbStore.saveLog({
           timestamp: new Date().toISOString(),
@@ -2551,13 +3656,16 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
         
         const jitoRes = await executeWithDecryptedKeypair(async (keypair) => {
           transaction.sign([keypair]);
-          return await jitoSender.submitBundle(
-            [transaction],
-            keypair,
-            jitoTip,
-            blockhash
-          );
-        });
+          trace.mark("signed");
+          const submitted = await jitoSender.submitBundle([transaction], keypair, jitoTip, blockhash, {
+            capitalCommittedSol: pos.sizeSol,
+            maxTipBps: Number(process.env.MAX_TIP_BPS ?? 50),
+            region: (process.env.JITO_REGION as any) || undefined,
+            purpose: "exit",
+          });
+          trace.mark("submitted");
+          return submitted;
+        }, "exit");
 
         if (!jitoRes || !jitoRes.success) {
           throw new Error(`Jito Block Engine rejected bundle: ${jitoRes?.error || "Unknown bundle error"}`);
@@ -2586,6 +3694,7 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
             if (status.value.confirmationStatus === "confirmed" || status.value.confirmationStatus === "processed") {
               confirmed = true;
               finalSlot = status.context.slot;
+              trace.mark("confirmed");
               break;
             }
           }
@@ -2614,18 +3723,29 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     const outSol = parseFloat(quoteData.outAmount) / 1e9;
     const latencyMs = Date.now() - triggerTime;
 
+    // Amostra de latência da SAÍDA bem-sucedida: recebimento do gatilho -> confirmação.
+    telemetry.record(trace.toRecord("executed"));
+
+    // PnL MEDIDO a partir do delta real de SOL da carteira na tx confirmada.
+    const economics = await measureExitEconomics(signature, walletPublicKey);
+
     const realCloseTx = {
-      id: signature, // Valid blockchain transaction signature
+      id: signature, // Assinatura real da transação na blockchain
       token: pos.token,
       mint: pos.mint,
       amount: `${(rawAmount / Math.pow(10, decimals)).toFixed(2)} ${pos.token}`,
-      outAmount: `${outSol.toFixed(4)} SOL`,
+      outAmount: `${outSol.toFixed(4)} SOL (bruto cotado)`,
       time: new Date().toTimeString().split(' ')[0] + "." + String(Date.now() % 1000).padStart(3, '0'),
       latencyMs,
       status: "success" as const,
       block: finalSlot,
       tipSol: jitoTip,
-      route: `KMS Real Exit Jito (${reason})`
+      route: `KMS Real Exit Jito (${reason})${economics.measured ? "" : " (PnL não medido on-chain)"}`,
+      signature,
+      pnlNetSol: economics.measured ? economics.solDeltaSol : undefined,
+      feesSol: economics.measured ? economics.feeSol : undefined,
+      measuredOnChain: economics.measured,
+      mode: "live" as const,
     };
 
     dbStore.saveTrade(realCloseTx);
@@ -2640,56 +3760,128 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     dbStore.deletePosition(pos.id);
     exitLocks.delete(pos.id);
 
+    recorder.recordPositionLifecycle({
+      positionId: pos.id,
+      mint: pos.mint,
+      token: pos.token,
+      event: "closed",
+      mode: "live",
+      sizeSol: pos.sizeSol,
+      entryPriceSol: pos.entryPrice ?? null,
+      exitPriceSol: rawAmount > 0 ? outSol / (rawAmount / Math.pow(10, decimals)) : null,
+      pnlPercent: economics.measured && pos.sizeSol > 0 ? (economics.solDeltaSol / pos.sizeSol) * 100 : null,
+      reason,
+      pnlMeasuredOnChain: economics.measured,
+    });
+
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
       level: "SUCCESS",
       component: "RISK_ENGINE",
-      message: `[AUTO-EXIT CONFIRMADO REAL] Posição de $${pos.token} liquidada on-chain com sucesso no bloco #${finalSlot}! Retornado: ${outSol.toFixed(4)} SOL (PnL Realizado: ${pnlPercent.toFixed(2)}%). Latência: ${latencyMs}ms.`,
+      message:
+        `[AUTO-EXIT CONFIRMADO] Posição de $${pos.token} liquidada on-chain no bloco #${finalSlot}. ` +
+        `Bruto cotado: ${outSol.toFixed(4)} SOL. ` +
+        (economics.measured
+          ? `PnL LÍQUIDO MEDIDO on-chain (delta de saldo): ${economics.solDeltaSol >= 0 ? "+" : ""}${economics.solDeltaSol.toFixed(6)} SOL ` +
+            `(fees de rede: ${economics.feeSol.toFixed(6)} SOL; tip: ${jitoTip.toFixed(6)} SOL). ` +
+            `PnL de preço no momento do gatilho: ${pnlPercent.toFixed(2)}%.`
+          : `ATENÇÃO: não foi possível medir o PnL on-chain (${economics.error}). ` +
+            `O valor exibido NÃO é resultado realizado.`) +
+        ` Latência: ${latencyMs}ms.`,
       correlationId
     });
 
     reportTradeOutcome(true);
 
   } catch (err: any) {
-    // Graceful Fallback: Execute simulated high-speed liquidation if real infrastructure/API is unreachable
-    const outSol = parseFloat((pos.sizeSol * (1 + (pnlPercent / 100))).toFixed(4)) || pos.sizeSol || 0.5;
-    const latencyMs = Math.floor(1 + Math.random() * 3);
-    const fallbackSig = `sim_exit_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    /**
+     * FALHA DE SAÍDA — REGISTRADA COMO FALHA, NUNCA COMO SUCESSO.
+     *
+     * AUDITORIA 2026-10-02 (achado de severidade CRÍTICA):
+     * Este bloco anteriormente "liquidava" a posição em um simulador interno, gravava
+     * a operação com `status: "success"`, um block number ALEATÓRIO, latência aleatória e
+     * chamava `reportTradeOutcome(true)`. Consequências encadeadas:
+     *
+     *   1. O relatório de PnL era ficção: `outSol` vinha de `sizeSol * (1 + pnl/100)`,
+     *      ou seja, assumia que o preço-alvo foi executado sem qualquer atrito.
+     *   2. O circuit breaker NUNCA disparava por falha de saída, porque toda falha de
+     *      saída era reportada como sucesso (`reportTradeOutcome(true)`).
+     *   3. A posição era REMOVIDA do banco sem que os tokens tivessem sido vendidos.
+     *      O bot "esquecia" que tinha exposição, e capital real ficava preso em um ativo
+     *      sem gestão de risco — o modo de falha mais perigoso em uma estratégia de saída.
+     *
+     * Comportamento correto: manter a posição ABERTA, registrar a falha, alimentar o
+     * circuit breaker e escalar alerta para intervenção humana.
+     */
+    const latencyMs = Date.now() - triggerTime;
+    const errorMessage = err?.message || String(err);
 
-    const fallbackCloseTx = {
-      id: fallbackSig,
+    // Falha de saída TAMBÉM é resultado: a trilha parcial mostra em que estágio o
+    // caminho parou (cotação / construção / assinatura / envio / confirmação).
+    telemetry.record(trace.toRecord("failed"));
+
+    pos.status = "open"; // Reverte EXIT_PENDING: a posição AINDA EXISTE e ainda tem risco.
+    (pos as any).exitAttempts = ((pos as any).exitAttempts || 0) + 1;
+    (pos as any).lastExitError = errorMessage;
+    (pos as any).lastExitAttemptAt = new Date().toISOString();
+    dbStore.savePosition(pos);
+    exitLocks.delete(pos.id);
+
+    // Registro da tentativa falha — visível no log de transações, com status "failed".
+    // Nenhum hash/bloco é inventado: `block: 0` e id prefixado por "failed_exit_".
+    const failedExitTx = {
+      id: `failed_exit_${pos.id}_${Date.now()}`,
       token: pos.token,
       mint: pos.mint,
-      amount: `${(pos.sizeSol / (pos.entryPrice || 0.0001)).toFixed(2)} ${pos.token}`,
-      outAmount: `${outSol.toFixed(4)} SOL`,
-      time: new Date().toTimeString().split(' ')[0] + "." + String(Date.now() % 1000).padStart(3, '0'),
+      amount: `${pos.sizeSol} SOL (posição permanece aberta)`,
+      outAmount: "não liquidado",
+      time: new Date().toTimeString().split(" ")[0] + "." + String(Date.now() % 1000).padStart(3, "0"),
       latencyMs,
-      status: "success" as const,
-      block: 284910230 + Math.floor(Math.random() * 5000),
-      tipSol: 0.003,
-      route: `HFT Engine Fallback (${reason})`
+      status: "failed" as const,
+      block: 0,
+      tipSol: 0,
+      route: `EXIT FALHOU (${reason}) — ${errorMessage.slice(0, 80)}`,
+      mode: "live" as const,
+      signature: null,
+      measuredOnChain: false,
     };
 
-    dbStore.saveTrade(fallbackCloseTx);
-    snipedTransactions.unshift(fallbackCloseTx);
+    dbStore.saveTrade(failedExitTx);
+    snipedTransactions.unshift(failedExitTx);
     if (snipedTransactions.length > 25) {
       snipedTransactions.pop();
     }
 
-    pos.status = "closed";
-    dbStore.savePosition(pos);
-    dbStore.deletePosition(pos.id);
-    exitLocks.delete(pos.id);
+    // Tentativa de saída FRACASSADA não é fechamento: a posição segue aberta e exposta.
+    // Gravar como 'closed' aqui mascararia capital preso — o registro é 'exit_failed'.
+    recorder.recordPositionLifecycle({
+      positionId: pos.id,
+      mint: pos.mint,
+      token: pos.token,
+      event: "exit_failed",
+      mode: "live",
+      sizeSol: pos.sizeSol,
+      entryPriceSol: pos.entryPrice ?? null,
+      exitPriceSol: null,
+      pnlPercent: null,
+      reason: `${reason}: ${errorMessage.slice(0, 120)}`,
+      pnlMeasuredOnChain: false,
+    });
 
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
-      level: "SUCCESS",
+      level: "CRITICAL",
       component: "RISK_ENGINE",
-      message: `[AUTO-EXIT SIMULADO FALLBACK] Posição de $${pos.token} liquidada via HFT Internal Simulator em ${latencyMs}ms (${reason}). Retornado: ${outSol.toFixed(4)} SOL (PnL Realizado: ${pnlPercent.toFixed(2)}%).`,
-      correlationId
+      message:
+        `[FALHA DE SAÍDA REAL] Não foi possível liquidar $${pos.token} (${reason}) após ${latencyMs}ms. ` +
+        `Erro: ${errorMessage}. A posição CONTINUA ABERTA no banco (tentativa nº ${(pos as any).exitAttempts}). ` +
+        `Ação necessária: verificar liquidez/roteamento e intervir manualmente. ` +
+        `Não houve venda on-chain e nenhum PnL foi registrado.`,
+      correlationId,
     });
 
-    reportTradeOutcome(true);
+    // Falha de execução REAL alimenta o circuit breaker (comportamento correto).
+    reportTradeOutcome(false);
   }
 }
 
@@ -2697,11 +3889,20 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
 async function startServer() {
   // Start High-Performance trading systems asynchronously to prevent blocking server port binding
   (async () => {
-    // Initialize the real secure KMS cryptographic vault
+    // Inicialização do cofre de chaves. Erro de CONFIGURAÇÃO de custódia é FATAL:
+    // subir com carteira aleatória (ou sem carteira) significa exibir um endereço que não
+    // é o do operador — e fundos enviados a ele são irrecuperáveis.
     try {
       await initializeVault();
     } catch (err: any) {
-      console.error("[HFT Vault] KMS initialization failed:", err.message);
+      if (err?.name === "KeyCustodyError") {
+        console.error(
+          "[FATAL] Custódia de chave inválida. O servidor NÃO vai subir para evitar operar/divulgar " +
+            "um endereço incorreto. Detalhe: " + err.message
+        );
+        process.exit(1);
+      }
+      console.error("[Vault] Falha na inicialização do cofre:", err.message);
     }
 
     // Start Real-time High Frequency execution components
@@ -2713,36 +3914,72 @@ async function startServer() {
       });
       globalConnection = connection;
 
-      const blockhashCache = new RecentBlockhashCache(connection);
-      await blockhashCache.start();
-      console.log("[HFT Engine] Recent Blockhash Cache poller started.");
+      // Instância ÚNICA e real do cache de blockhash (antes havia um gerador de hash falso).
+      blockhashCacheRef = new RecentBlockhashCache(connection);
+      await blockhashCacheRef.start();
+      console.log(
+        `[HFT Engine] Cache de blockhash iniciado. Utilizável: ${blockhashCacheRef.isUsable()}. ` +
+          `Sem blockhash real, nenhuma transação é assinada.`
+      );
 
       const geyserClient = new GeyserStreamClient(RPC_ENDPOINT, RPC_WEBSOCKET, GEYSER_GRPC_URL);
       geyserClient.onTokenDetected((event) => {
-        console.log("[HFT Engine] Yellowstone Geyser gRPC live signal received:", event);
-        const now = Date.now();
+        const receivedAt = wallClockNow();
+        const trace = new LatencyTrace(
+          `evt_${event.signature?.slice(0, 16) ?? event.mint}_${receivedAt}`,
+          receivedAt,
+          event.slot ?? null,
+          event.receivedSlot ?? null
+        );
+
+        // EVENTO CRU — sem campos inventados.
+        //
+        // AUDITORIA 2026-10-02: este bloco preenchia `jsonRpcLatencyMs` com Math.random(),
+        // `savedComputeUnits` com Math.random() e `rawProtobufHex` com bytes aleatórios, e
+        // marcava tudo com `isRealOnChain: true`. O painel exibia números que não mediam nada.
+        //
+        // Agora os campos são o que a origem forneceu, ou `null` explícito quando não há
+        // medição. `null` é informação: significa "não sabemos", o que é diferente de "0".
         const realEvent = {
-          id: `evt_real_${now}_${Math.floor(Math.random() * 1000)}`,
-          timestamp: now,
-          programId: event.programId || "675k1g2EPJ8gS7q9yGP8REukXXhxZ9ReM78D4cifFGL",
-          programName: event.programName || "Raydium AMM",
-          type: event.type || "PoolCreated",
+          id: trace.id,
+          timestamp: receivedAt,
+          programId: event.programId,
+          programName: event.programName,
+          type: event.type,
           mint: event.mint,
-          mintName: event.mintName || "LIVE_GEYSER_POOL",
-          grpcLatencyMs: event.grpcLatencyMs || 0.95,
-          jsonRpcLatencyMs: 12.0 + Math.random() * 8.0,
-          savedComputeUnits: 38000 + Math.floor(Math.random() * 10000),
-          rawProtobufHex: Array.from({ length: 12 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0')).join(""),
-          isRealOnChain: true
+          mintName: event.mintName,
+          signature: event.signature,
+          slot: event.slot ?? null,
+          /** RTT medido do enriquecimento (callback → getTransaction). null = não medido. */
+          enrichmentMs: event.grpcLatencyMs ?? null,
+          /** Atraso estimado vs. cadeia por slot. Marcado como estimativa. */
+          slotLagMs: event.slotLagEstimateMs ?? null,
+          source: event.source ?? "unknown",
+          isRealOnChain: true, // o evento VEIO da cadeia; os campos é que são medidos ou null
         };
-        
+
+        telemetry.record(trace.toRecord("pending"));
+
+        recorder.recordLaunchEvent({
+          eventId: `${event.signature ?? event.mint}:0`,
+          source: event.source === "grpc-geyser" ? "grpc-geyser" : "wss-logs",
+          programId: event.programId,
+          programName: event.programName,
+          eventType: event.type,
+          mint: event.mint,
+          signature: event.signature ?? "",
+          slot: event.slot ?? null,
+          enrichmentMs: event.grpcLatencyMs ?? null,
+        });
+
         realOnChainEvents.unshift(realEvent);
         if (realOnChainEvents.length > 50) {
           realOnChainEvents.pop();
         }
 
-        // Automatically execute full HFT pipeline (Etapa 10 Autonomous Daemon)
-        executeAutonomousPipeline(event).catch((err) => {
+        // Pipeline autônomo (Etapa 10). A trilha de latência é propagada para que o
+        // estágio de decisão seja medido de verdade, não estimado.
+        executeAutonomousPipeline(event, trace).catch((err) => {
           console.error("[Autonomous Daemon] Pipeline execution error:", err.message);
         });
       });
@@ -2753,6 +3990,9 @@ async function startServer() {
     }
 
     // Start ETAPA 11 Autonomous Position Manager Daemon
+    // Reconcilia posições presas em EXIT_PENDING antes de retomar a gestão de risco.
+    await reconcileStuckExits();
+
     startAutonomousPositionManager().catch((err) => {
       console.error("[Autonomous Position Manager] Daemon start failed:", err.message);
     });
@@ -2783,7 +4023,18 @@ async function startServer() {
   }
 
   // Bind to port 3000 (standard reverse proxy port in dev container)
-  app.listen(PORT, "0.0.0.0", () => {
+  /**
+   * BIND: loopback por padrão.
+   *
+   * A versão anterior escutava em 0.0.0.0 incondicionalmente. Combinada com o fail-open do
+   * guard de mutação, isso expunha kill switch e fechamento de posição a qualquer host que
+   * alcançasse a porta. Expor passa a ser uma decisão explícita (HFT_BIND_HOST), validada
+   * no boot contra a presença de capital real.
+   */
+  const bindHost = (process.env.HFT_BIND_HOST || "").trim() || "127.0.0.1";
+  console.log(`[Server] Bind em ${bindHost}:${PORT} (HFT_BIND_HOST para expor deliberadamente).`);
+
+  app.listen(PORT, bindHost, () => {
     console.log(`[Server] Primary HTTP service running on port ${PORT}`);
   });
 
@@ -2792,7 +4043,7 @@ async function startServer() {
   const cloudRunPort = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
   if (cloudRunPort && cloudRunPort !== PORT && !isNaN(cloudRunPort)) {
     try {
-      const secondaryServer = app.listen(cloudRunPort, "0.0.0.0", () => {
+      const secondaryServer = app.listen(cloudRunPort, bindHost, () => {
         console.log(`[Server] Cloud Run ingress listener active on port ${cloudRunPort}`);
       });
       secondaryServer.on("error", (err: any) => {

@@ -23,5 +23,5 @@
     "allowJs": true,
     "esModuleInterop": true
   },
-  "include": ["src", "server.ts"]
+  "include": ["src", "server.ts", "scripts", "tests"]
 }
