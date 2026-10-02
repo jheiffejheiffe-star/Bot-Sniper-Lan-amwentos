@@ -1117,3 +1117,32 @@ npm run smoke -- --quick  → 13 estágios, 3 falhas de REDE declaradas (sandbox
 - Pendências que continuam no roadmap: S6 (entrada real por IDL, com canary de 0,01 SOL — **exige
   autorização**), S7 (gRPC Yellowstone A/B vs WSS), S8 (envio paralelo Jito/staked), S9 (filtro com
   rótulos), S10 (Postgres/multi-processo/guarda on-chain), S11 (ShredStream), S12 (Rust).
+
+### 7. Complemento (commit `000f580`) — feed do geyser e slot de referência
+
+Enquanto validava o S5 na produção, encontrei a mesma família de defeito (C40) no painel do
+Geyser e a corrigi no mesmo escopo:
+
+- `/api/geyser-stream` calculava o slot exibido com `278913410 + (Date.now()/400) % 100000`.
+  Agora usa a **última medição real** de slot (nós RPC do laço de infraestrutura; fallback para a
+  amostra local de `getSlot`) e devolve `currentSlot: null` + `currentSlotMeasured: false` quando
+  não há medição — a UI mostra "— (não medido)" em vez de um número que parece telemetria.
+- Os eventos decorativos passaram a se declarar no payload (`simulated: true`, `source: "MOCK/RNG"`)
+  e a resposta conta `feed: { real, simulated }`. Antes, saber que eram falsos exigia conhecer a
+  convenção interna do prefixo `evt_mock_`.
+- `GeyserGrpcRadar.tsx`: saíram o selo "CO-LOCATED (SHREDSTREAM ACTIVE)", o subtítulo "sub-50ms",
+  o rodapé "SHREDSTREAM CO-LOCATED (EQUINIX LD4) / ingest sub-1.2ms" e os cards "Stream Rate" e
+  "System Ingestion Load" (todos alimentados por RNG do servidor). No lugar: ingestão declarada
+  como logsSubscribe via WSS, contagem real vs decorativa e selo "MOCK" por evento.
+- **Teste por propriedade** (novo): todo slot derivado do relógio no `server.ts` precisa estar
+  dentro de endpoint que `/api/system-truth` já declara como SIMULADO. É a forma correta de
+  tolerar painel decorativo — proibindo a string, o teste quebraria; permitindo em qualquer lugar,
+  a fabricação voltaria a se esconder.
+
+**Limite honesto desta correção:** os painéis `/api/hft-telemetry`, `/api/jito-leader-schedule`,
+`/api/submit-bundle`, `/api/co-location`, `/api/predictive-score`, `/api/simulate-*` e
+`/api/geyser-stream` (parte decorativa) **continuam fabricados** — eles estão DECLARADOS como
+simulados em `/api/system-truth` e o `TruthBanner` avisa na tela. Rotulá-los painel a painel
+(em vez de num único banner) é o S9 do roadmap; não foi feito aqui.
+
+`npm run test` → 98/98. `npm run lint` → exit 0. `npm run build` → ok.
