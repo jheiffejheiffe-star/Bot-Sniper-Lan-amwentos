@@ -2136,6 +2136,10 @@ async function main(): Promise<void> {
     );
     assert.ok(serverSrc.includes('trace?.mark("gate_ok")'), "o portão rápido precisa ser marcado");
     assert.ok(
+      /\/api\/health[\s\S]{0,2000}hotPath: detection\.hotPath/.test(serverSrc),
+      "os contadores do caminho quente precisam aparecer também em /api/health (primeira parada do operador)"
+    );
+    assert.ok(
       /hotPath\.note|hotPath: \{/.test(serverSrc) && serverSrc.includes("deepFilterFailures"),
       "os contadores do caminho quente precisam estar expostos para o operador"
     );

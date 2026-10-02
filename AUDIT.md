@@ -1146,3 +1146,11 @@ simulados em `/api/system-truth` e o `TruthBanner` avisa na tela. Rotulá-los pa
 (em vez de num único banner) é o S9 do roadmap; não foi feito aqui.
 
 `npm run test` → 98/98. `npm run lint` → exit 0. `npm run build` → ok.
+
+### 8. Complemento (mesmo escopo) — contadores também em `/api/health`
+
+O bloco `hotPath` (contadores do caminho quente) existia só em `/api/system-truth`. Como
+`/api/health` é a primeira parada do operador e a sonda do smoke test, os contadores foram
+expostos lá também — instrumentação que só aparece no segundo endpoint continua invisível para
+quem olha o básico. `npm run test` 98/98 (a verificação nova entrou como asserção adicional no
+teste de regressão do caminho quente).

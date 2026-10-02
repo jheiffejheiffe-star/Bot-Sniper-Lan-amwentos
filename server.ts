@@ -225,6 +225,12 @@ app.get("/api/health", (_req, res) => {
           lastEventAt: detection.lastEventAt,
           sinceLastEventMs: detection.sinceLastEventMs,
           recentErrors: detection.recentErrors,
+          /**
+           * O /api/health é a PRIMEIRA parada do operador (e a sonda do smoke test): se os
+           * contadores do caminho quente só aparecessem em /api/system-truth, a perda de
+           * lançamento continuaria invisível exatamente em quem olha o básico.
+           */
+          hotPath: detection.hotPath,
         }
       : null,
     detectionNote:
