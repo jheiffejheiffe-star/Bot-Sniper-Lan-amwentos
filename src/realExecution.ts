@@ -14,11 +14,22 @@ import {
   PROGRAMS,
   discriminatorToBytes,
   jitoBlockEngineUrl,
+  jitoHeaders,
   jupiterBaseUrl,
   jupiterHeaders,
   isValidPubkey,
   type JitoRegion
 } from "./solanaConfig.js";
+import {
+  MAX_BUNDLE_IDS_PER_REQUEST,
+  JITO_MIN_REQUEST_INTERVAL_MS,
+  isPlausibleBundleId,
+  parseBundleStatuses,
+  parseInflightStatuses,
+  type BundleStatusEntry,
+  type InflightStatusEntry,
+  type JitoStatusQueryResult,
+} from "./jitoStatus.js";
 import { BASE_FEE_LAMPORTS, clampTipSol, type CostBreakdown, emptyCosts } from "./accounting.js";
 import { assertCanSign, type OperationPurpose } from "./runtimeMode.js";
 
@@ -718,10 +729,55 @@ export interface BundleSubmitOptions {
  *        matematicamente posições pequenas (300 bps em 0.1 SOL).
  *   [C7] verificação estrutural do tip account antes de transferir SOL.
  */
+/**
+ * Opções do cliente do Jito.
+ *
+ * Existem para que a política de rate limit seja explícita e TESTÁVEL: o comportamento padrão
+ * respeita o limite documentado (1 req/s/IP/região) e os testes podem encurtar a espera.
+ */
+export interface JitoSenderOptions {
+  /** Intervalo mínimo entre consultas de status. Default: 1000ms (rate limit documentado). */
+  minStatusIntervalMs?: number;
+  /**
+   * Espera máxima enfileirada antes de desistir. Acima disso, devolvemos erro de throttle em
+   * vez de acumular fila: um cliente que aceita fila ilimitada transforma "rate limit" em
+   * "latência crescente e imprevisível".
+   */
+  maxStatusWaitMs?: number;
+}
+
 export class JitoBundleSender {
   private tipAccountsCache: { accounts: string[]; fetchedAt: number } | null = null;
+  /** Horário RESERVADO da última consulta de status (ver `reserveStatusSlot`). */
+  private lastStatusQueryAt = 0;
 
-  constructor(_connection: Connection) {}
+  constructor(
+    _connection: Connection,
+    private readonly options: JitoSenderOptions = {}
+  ) {}
+
+  /**
+   * Rate limit do block engine: 1 requisição/segundo/IP/região (doc).
+   *
+   * Estratégia "reserve-then-wait": reservamos o horário da requisição IMEDIATAMENTE (antes de
+   * qualquer await), de modo que duas chamadas concorrentes não escolham o mesmo instante —
+   * depois esperamos a diferença. A versão anterior FALHAVA a segunda chamada; falhar uma
+   * consulta legítima por causa de outra consulta nossa é defeito de cliente, não rate limit.
+   *
+   * Se a espera necessária passar de `maxStatusWaitMs`, aí sim devolvemos erro de throttle —
+   * mas com a fila declarada, em vez de silenciosamente estourar o limite do provedor.
+   */
+  private async reserveStatusSlot(): Promise<{ ok: true; waitMs: number } | { ok: false; waitMs: number }> {
+    const minInterval = this.options.minStatusIntervalMs ?? JITO_MIN_REQUEST_INTERVAL_MS;
+    const maxWait = this.options.maxStatusWaitMs ?? 1_500;
+    const now = Date.now();
+    const reservedAt = Math.max(now, this.lastStatusQueryAt + minInterval);
+    this.lastStatusQueryAt = reservedAt;
+    const waitMs = reservedAt - now;
+    if (waitMs > maxWait) return { ok: false, waitMs };
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    return { ok: true, waitMs };
+  }
 
   /** Busca os tip accounts oficiais. Cache de 10 min. Fallback: lista publicada. */
   public async getTipAccounts(region: JitoRegion = DEFAULT_JITO_REGION): Promise<string[]> {
@@ -923,6 +979,128 @@ export class JitoBundleSender {
    * Só use quando a alternativa for não executar a saída (ficar preso no ativo).
    * Para SAÍDA, ficar preso é pior que tomar sandwich — por isso o fallback existe.
    */
+  /**
+   * ───────────────────────────────────────────────────────────────────────────
+   * STATUS DE LANDING (Etapa S3)
+   * ───────────────────────────────────────────────────────────────────────────
+   *
+   * POR QUE ISTO EXISTE
+   * `sendBundle` devolve um `bundle_id` e a doc é explícita: "This does not guarantee the
+   * bundle will be processed or land on-chain." Sem consultar o status, o sistema tratava
+   * "aceito pelo block engine" como "executado" — a mesma classe de erro que produziu PnL
+   * fabricado nesta base. Estes dois métodos são a CONSULTA; a interpretação (incluindo a
+   * regra "Landed ≠ confirmado") vive em `src/jitoStatus.ts`, testada sem rede.
+   *
+   * READ-ONLY: não assinam, não enviam, não pagam tip. Funcionam em qualquer modo de execução,
+   * inclusive PAPER/SHADOW, onde servem para medir antes de existir capital em risco.
+   *
+   * THROTTLE: o block engine documenta 1 requisição/segundo/IP/região. Insistir acelera o
+   * bloqueio; uma chamada dentro do intervalo mínimo devolve `ok: false` com o motivo, em vez
+   * de ser disparada.
+   */
+  public async getBundleStatuses(
+    bundleIds: string[],
+    region: JitoRegion = DEFAULT_JITO_REGION
+  ): Promise<JitoStatusQueryResult<BundleStatusEntry>> {
+    return this.queryBundleStatus("getBundleStatuses", bundleIds, region, parseBundleStatuses);
+  }
+
+  public async getInflightBundleStatuses(
+    bundleIds: string[],
+    region: JitoRegion = DEFAULT_JITO_REGION
+  ): Promise<JitoStatusQueryResult<InflightStatusEntry>> {
+    return this.queryBundleStatus("getInflightBundleStatuses", bundleIds, region, parseInflightStatuses);
+  }
+
+  private async queryBundleStatus<T>(
+    method: "getBundleStatuses" | "getInflightBundleStatuses",
+    bundleIds: string[],
+    region: JitoRegion,
+    parser: (raw: unknown, requestedIds: string[]) => JitoStatusQueryResult<T>
+  ): Promise<JitoStatusQueryResult<T>> {
+    const ids = [...new Set((bundleIds || []).map((id) => String(id).trim()))].filter(Boolean);
+
+    if (ids.length === 0) {
+      return { ok: false, entries: [], missingIds: [], problems: ["nenhum bundle id informado"] };
+    }
+    if (ids.length > MAX_BUNDLE_IDS_PER_REQUEST) {
+      return {
+        ok: false,
+        entries: [],
+        missingIds: ids,
+        problems: [
+          `${ids.length} ids excede o máximo de ${MAX_BUNDLE_IDS_PER_REQUEST} por requisição ` +
+            `(limite documentado do método). Divida em lotes.`,
+        ],
+      };
+    }
+    const invalid = ids.filter((id) => !isPlausibleBundleId(id));
+    if (invalid.length > 0) {
+      return {
+        ok: false,
+        entries: [],
+        missingIds: ids,
+        problems: [
+          `id(s) com formato implausível: ${invalid.map((i) => i.slice(0, 16)).join(", ")}. ` +
+            `A doc do Jito mostra o id como SHA-256 hex (64 chars) num exemplo e como base58 no outro; ` +
+            `o código aceita ambos e recusa o resto.`,
+        ],
+      };
+    }
+
+    const slot = await this.reserveStatusSlot();
+    if (!slot.ok) {
+      return {
+        ok: false,
+        entries: [],
+        missingIds: ids,
+        problems: [
+          `throttle local: a próxima consulta precisaria esperar ${slot.waitMs}ms, acima do ` +
+            `máximo de ${this.options.maxStatusWaitMs ?? 1_500}ms. O rate limit documentado do ` +
+            `block engine é 1 req/s/IP/região — consulte com espaçamento.`,
+        ],
+      };
+    }
+
+    try {
+      const res = await fetch(`${jitoBlockEngineUrl(region)}/api/v1/${method}`, {
+        method: "POST",
+        headers: jitoHeaders(),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: [ids] }),
+        signal: AbortSignal.timeout(8_000),
+      });
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        return {
+          ok: false,
+          entries: [],
+          missingIds: ids,
+          problems: [`block engine HTTP ${res.status}: ${body.slice(0, 200)}`],
+        };
+      }
+
+      const contentType = res.headers.get("content-type") || "";
+      if (!contentType.includes("json")) {
+        return {
+          ok: false,
+          entries: [],
+          missingIds: ids,
+          problems: [`resposta não-JSON (content-type "${contentType}") — host errado ou block page`],
+        };
+      }
+
+      return parser(await res.json(), ids);
+    } catch (err: any) {
+      return {
+        ok: false,
+        entries: [],
+        missingIds: ids,
+        problems: [`falha de rede ao consultar ${method}: ${err?.message ?? String(err)}`],
+      };
+    }
+  }
+
   public async submitViaRpc(
     connection: Connection,
     transaction: VersionedTransaction,

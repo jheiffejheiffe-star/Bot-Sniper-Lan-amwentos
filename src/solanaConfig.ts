@@ -203,6 +203,21 @@ export function jitoBlockEngineUrl(region: JitoRegion = "ny"): string {
   return `https://${region}.mainnet.block-engine.jito.wtf`;
 }
 
+/**
+ * Headers do block engine do Jito.
+ *
+ * A doc (docs.jito.wtf/lowlatencytxnsend) diz que envios padrão NÃO exigem chave de
+ * autenticação ("You no longer need an approved auth key for default sends"). Quando existir
+ * uma chave (plano com limite próprio), ela vai no header `x-jito-auth` — a doc também aceita
+ * `?uuid=` na query, mas header mantém a credencial fora de logs de URL.
+ */
+export function jitoHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const uuid = (process.env.JITO_UUID || "").trim();
+  if (uuid) headers["x-jito-auth"] = uuid;
+  return headers;
+}
+
 /* -------------------------------------------------------------------------- */
 /* 5. ENDPOINTS DE DADOS EXTERNOS                                              */
 /* -------------------------------------------------------------------------- */

@@ -1077,6 +1077,404 @@ async function main(): Promise<void> {
     assert.equal(inventory.length, 1, "o inventário de quarentena precisa existir");
   });
 
+  /* ------------------------------------------------------------------ */
+  console.log("\n[12] Status de landing do Jito e oráculo de tip (fim dos números inventados)");
+
+  await test("id de bundle: aceita os DOIS formatos da doc e recusa o resto", async () => {
+    const { isPlausibleBundleId } = await import("../src/jitoStatus.js");
+    // Exemplo da doc de getBundleStatuses: SHA-256 em hex.
+    assert.equal(
+      isPlausibleBundleId("892b79ed49138bfb3aa5441f0df6e06ef34f9ee8f3976c15b323605bae0cf51d"),
+      true
+    );
+    // Exemplo da doc de sendBundle: base58 (formato de assinatura). A doc se contradiz — não adivinhamos.
+    assert.equal(
+      isPlausibleBundleId("2id3YC2jK9G5Wo2phDx4gJVAew8DcY5NAojnVuao8rkxwPYPe8cSwE5GzhEgJA2y8fVjDEo6iR6ykBvDxrTQrtpb"),
+      true
+    );
+    // "x"*64 NÃO serve como caso inválido: 'x' é caractere válido do alfabeto base58.
+    for (const bad of ["", "   ", "curto", "0OIl" + "a".repeat(60), "l".repeat(64), "!", null, undefined, 42]) {
+      assert.equal(isPlausibleBundleId(bad as any), false, `deveria recusar: ${String(bad).slice(0, 20)}`);
+    }
+  });
+
+  await test("parseBundleStatuses: lê a resposta da doc, null como não-encontrado e erro relativo", async () => {
+    const { parseBundleStatuses } = await import("../src/jitoStatus.js");
+    const ID_HEX = "892b79ed49138bfb3aa5441f0df6e06ef34f9ee8f3976c15b323605bae0cf51d";
+    const OUTRO = "b31e5fae4923f345218403ac1ab242b46a72d4f2a38d131f474255ae88f1ec9a";
+
+    const raw = {
+      jsonrpc: "2.0",
+      result: {
+        context: { slot: 242806119 },
+        value: [
+          {
+            bundle_id: ID_HEX,
+            transactions: ["3bC2M9fiACSjkTXZDgeNAuQ4ScTsdKGwR42ytFdhUvikqTmBheUxfsR1fDVsM5ADCMMspuwGkdm1uKbU246x5aE3"],
+            slot: 242804011,
+            confirmation_status: "finalized",
+            err: { Ok: null },
+          },
+          null, // id não encontrado / fora da janela
+        ],
+      },
+      id: 1,
+    };
+
+    const parsed = parseBundleStatuses(raw, [ID_HEX, OUTRO]);
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.entries.length, 2);
+    const found = parsed.entries.find((e) => e.bundleId === ID_HEX)!;
+    assert.equal(found.found, true);
+    assert.equal(found.confirmationStatus, "finalized");
+    assert.equal(found.slot, 242804011);
+    assert.equal(found.signatures.length, 1);
+    assert.equal(found.err, null, "err {Ok: null} significa SEM erro relatado");
+    const missing = parsed.entries.find((e) => e.bundleId === OUTRO)!;
+    assert.equal(missing.found, false, "null em result.value = não encontrado (NÃO é falha)");
+    assert.deepEqual(parsed.missingIds, [OUTRO]);
+
+    // Formato alternativo: a tabela da doc usa confirmationStatus (camelCase).
+    const camel = parseBundleStatuses(
+      { result: { value: [{ bundle_id: ID_HEX, transactions: [], slot: 1, confirmationStatus: "confirmed" }] } },
+      [ID_HEX]
+    );
+    assert.equal(camel.entries[0].confirmationStatus, "confirmed");
+
+    // Resposta sem result.value: problema declarado, nenhum erro inventado por item.
+    const quebrado = parseBundleStatuses({ result: {} }, [ID_HEX]);
+    assert.equal(quebrado.ok, false);
+    assert.ok(quebrado.problems.some((p) => /result\.value/.test(p)));
+    assert.deepEqual(quebrado.missingIds, [ID_HEX]);
+
+    // Status desconhecido: não é aceito silenciosamente.
+    const estranho = parseBundleStatuses(
+      { result: { value: [{ bundle_id: ID_HEX, transactions: [], slot: 1, confirmation_status: "quase" }] } },
+      [ID_HEX]
+    );
+    assert.equal(estranho.entries[0].confirmationStatus, null);
+    assert.ok(estranho.problems.some((p) => /desconhecido/.test(p)));
+  });
+
+  await test("parseInflightStatuses: Invalid/Pending/Failed/Landed com landed_slot", async () => {
+    const { parseInflightStatuses } = await import("../src/jitoStatus.js");
+    const A = "b31e5fae4923f345218403ac1ab242b46a72d4f2a38d131f474255ae88f1ec9a";
+    const B = "e3c4d7933cf3210489b17307a14afbab2e4ae3c67c9e7157156f191f047aa6e8";
+    const C = "a7abecabd9a165bc73fd92c809da4dc25474e1227e61339f02b35ce91c9965e2";
+
+    const parsed = parseInflightStatuses(
+      {
+        result: {
+          context: { slot: 280999028 },
+          value: [
+            { bundle_id: A, status: "Invalid", landed_slot: null },
+            { bundle_id: B, status: "Landed", landed_slot: 280999010 },
+            { bundle_id: C, status: "Pending", landed_slot: null },
+          ],
+        },
+      },
+      [A, B, C]
+    );
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.entries.map((e) => e.status), ["Invalid", "Landed", "Pending"]);
+    assert.equal(parsed.entries[1].landedSlot, 280999010);
+    assert.equal(parsed.entries[0].landedSlot, null);
+  });
+
+  await test("RECONCILIAÇÃO: \"Landed\" do Jito NÃO é confirmação on-chain (R6)", async () => {
+    const { reconcileLanding } = await import("../src/jitoStatus.js");
+    const ID = "b31e5fae4923f345218403ac1ab242b46a72d4f2a38d131f474255ae88f1ec9a";
+
+    // 1. Só o inflight diz Landed → entrou em bloco, sem confirmação.
+    const soInflight = reconcileLanding({
+      bundleId: ID,
+      inflight: { bundleId: ID, found: true, status: "Landed", landedSlot: 280999010 },
+    });
+    assert.equal(soInflight.verdict, "landed_unconfirmed");
+    assert.equal(soInflight.authority, "jito");
+    assert.ok(
+      soInflight.reasons.some((r) => /NÃO que a confirmação|não que a confirmação|NÃO é confirmação/i.test(r)),
+      `a razão precisa ser explícita: ${soInflight.reasons.join(" | ")}`
+    );
+    assert.notEqual(soInflight.verdict, "confirmed_on_chain", "Landed nunca pode virar confirmação");
+
+    // 2. RPC confirma → aí sim.
+    const comRpc = reconcileLanding({
+      bundleId: ID,
+      inflight: { bundleId: ID, found: true, status: "Landed", landedSlot: 280999010 },
+      rpcConfirmation: { signature: "sig", confirmationStatus: "confirmed", slot: 280999010, err: null },
+    });
+    assert.equal(comRpc.verdict, "confirmed_on_chain");
+    assert.equal(comRpc.authority, "rpc");
+
+    // 3. RPC em "processed" = confirmação OTIMISTA, ainda não é fato.
+    const otimista = reconcileLanding({
+      bundleId: ID,
+      rpcConfirmation: { signature: "sig", confirmationStatus: "processed", slot: 123, err: null },
+    });
+    assert.equal(otimista.verdict, "landed_unconfirmed");
+    assert.ok(otimista.reasons.some((r) => /OTIMISTA/.test(r)));
+
+    // 4. getBundleStatuses com finalized → confirmado, mas a autoridade declarada é o Jito
+    //    (é o RPC deles); a razão precisa apontar que o SEU RPC é a autoridade para capital.
+    const viaBundle = reconcileLanding({
+      bundleId: ID,
+      bundleStatus: { bundleId: ID, found: true, slot: 999, confirmationStatus: "finalized", signatures: ["s1"], err: null, retryable: null },
+    });
+    assert.equal(viaBundle.verdict, "confirmed_on_chain");
+    assert.equal(viaBundle.authority, "jito");
+    assert.ok(viaBundle.reasons.some((r) => /SEU RPC/.test(r)));
+
+    // 5. Estados negativos e ausência de informação.
+    assert.equal(
+      reconcileLanding({ bundleId: ID, inflight: { bundleId: ID, found: true, status: "Failed", landedSlot: null } }).verdict,
+      "failed"
+    );
+    assert.equal(
+      reconcileLanding({ bundleId: ID, inflight: { bundleId: ID, found: true, status: "Invalid", landedSlot: null } }).verdict,
+      "invalid"
+    );
+    const nada = reconcileLanding({ bundleId: ID });
+    assert.equal(nada.verdict, "not_found");
+    assert.equal(nada.authority, "none");
+
+    // 6. Falha de CONSULTA não pode virar "não encontrado".
+    const indisponivel = reconcileLanding({
+      bundleId: ID,
+      sourceErrors: { inflight: "fetch failed", bundleStatus: "fetch failed" },
+    });
+    assert.equal(indisponivel.verdict, "unknown", "não conseguir perguntar ≠ não existir");
+    assert.ok(indisponivel.reasons.some((r) => /não foi possível consultar/.test(r)));
+    // Falha parcial: a conclusão usa a fonte que respondeu e isso fica declarado.
+    const parcial = reconcileLanding({
+      bundleId: ID,
+      inflight: { bundleId: ID, found: true, status: "Landed", landedSlot: 42 },
+      sourceErrors: { bundleStatus: "fetch failed" },
+    });
+    assert.equal(parcial.verdict, "landed_unconfirmed");
+    assert.ok(parcial.reasons.some((r) => /se apoia apenas na fonte que respondeu/.test(r)));
+    assert.ok(
+      nada.reasons.some((r) => /não sei|Não sei/.test(r)),
+      "ausência de informação precisa ser declarada como tal, não como falha"
+    );
+  });
+
+  await test("tip floor: lê a resposta da doc e não inventa percentil ausente", async () => {
+    const { parseTipFloor, computeRecommendedTip } = await import("../src/jitoStatus.js");
+    const docSample = [
+      {
+        time: "2024-09-01T12:58:00Z",
+        landed_tips_25th_percentile: 6.001000000000001e-6,
+        landed_tips_50th_percentile: 1e-5,
+        landed_tips_75th_percentile: 3.6196500000000005e-5,
+        landed_tips_95th_percentile: 0.0014479055000000002,
+        landed_tips_99th_percentile: 0.010007999,
+        ema_landed_tips_50th_percentile: 9.836078125000002e-6,
+      },
+    ];
+    const parsed = parseTipFloor(docSample);
+    assert.ok(parsed.sample);
+    assert.equal(parsed.sample!.p75, 3.6196500000000005e-5);
+    assert.equal(parsed.sample!.time, "2024-09-01T12:58:00Z");
+
+    const rec = computeRecommendedTip(parsed.sample!, "p75");
+    assert.equal(rec.rawTipSol, 3.6196500000000005e-5);
+    assert.equal(rec.substituted, false);
+    assert.equal(rec.usedPolicy, "p75");
+
+    // Política sem valor no sample → substituição DECLARADA por outro percentil real.
+    const semEma = parseTipFloor([{ landed_tips_50th_percentile: 1e-5 }]);
+    assert.ok(semEma.sample);
+    const sub = computeRecommendedTip(semEma.sample!, "ema50");
+    assert.equal(sub.substituted, true);
+    assert.equal(sub.usedPolicy, "p50");
+    assert.equal(sub.rawTipSol, 1e-5);
+
+    // Nenhum percentil utilizável → null explícito (nunca zero, nunca constante).
+    assert.equal(parseTipFloor([{ time: "x" }]).sample, null);
+    assert.equal(parseTipFloor([]).sample, null);
+    assert.equal(parseTipFloor({ nope: true }).sample, null);
+    // Valor negativo/NaN é rejeitado e reportado.
+    const invalido = parseTipFloor([{ landed_tips_50th_percentile: -5, landed_tips_75th_percentile: "abc" }]);
+    assert.equal(invalido.sample, null);
+    assert.ok(invalido.problems.length >= 2);
+  });
+
+  await test("oráculo de tip: cache, throttle e falha honesta (fetch injetado)", async () => {
+    const { JitoTipOracle } = await import("../src/jitoStatus.js");
+    const docBody = JSON.stringify([
+      { time: "2024-09-01T12:58:00Z", landed_tips_50th_percentile: 1e-5, landed_tips_75th_percentile: 3.6e-5 },
+    ]);
+
+    let calls = 0;
+    let clock = 100_000;
+    const okFetch = (async () => {
+      calls++;
+      return { ok: true, status: 200, json: async () => JSON.parse(docBody) };
+    }) as unknown as typeof fetch;
+
+    const oracle = new JitoTipOracle({ fetchFn: okFetch, now: () => clock, cacheTtlMs: 10_000 });
+
+    const first = await oracle.getTipFloor();
+    assert.equal(first.available, true);
+    assert.equal(calls, 1);
+    assert.equal(first.available && first.fromCache, false);
+
+    // Dentro do TTL: serve do cache, sem nova requisição (rate limit é 1 req/s).
+    const cached = await oracle.getTipFloor();
+    assert.equal(cached.available && cached.fromCache, true);
+    assert.equal(calls, 1, "não pode bater na fonte dentro do TTL");
+
+    // Depois do TTL, mas dentro do intervalo mínimo → throttle DECLARADO (sem inventar valor).
+    const throttledOracle = new JitoTipOracle({ fetchFn: okFetch, now: () => clock, cacheTtlMs: 0 });
+    clock += 100;
+    const t1 = await throttledOracle.getTipFloor();
+    assert.equal(t1.available, true, "primeira chamada passa");
+    const before = calls;
+    clock += 200; // 200ms < 1000ms de intervalo mínimo
+    const t2 = await throttledOracle.getTipFloor();
+    assert.equal(t2.available, false);
+    assert.ok(!t2.available && /throttle/i.test(t2.error), t2.available ? "" : t2.error);
+    assert.equal(calls, before, "throttle não pode disparar requisição");
+    // Passado o intervalo, volta a consultar.
+    clock += 2_000;
+    const t3 = await throttledOracle.getTipFloor();
+    assert.equal(t3.available, true);
+    assert.equal(calls, before + 1);
+
+    // Fonte fora do ar: available false, erro declarado, e NENHUM número.
+    const failing = new JitoTipOracle({
+      fetchFn: (async () => {
+        throw new Error("fetch failed");
+      }) as unknown as typeof fetch,
+      now: () => clock,
+      cacheTtlMs: 0,
+    });
+    const down = await failing.getTipFloor();
+    assert.equal(down.available, false);
+    assert.ok(!down.available && /inacessível/.test(down.error));
+    assert.equal(down.lastKnown, null, "sem histórico: nada a servir, nada a inventar");
+    const recDown = await failing.recommendTip({ capitalSol: 0.1, maxTipBps: 50, policy: "p75" });
+    assert.equal(recDown.available, false);
+    assert.equal(recDown.tipSol, null, "sem dado de mercado não existe recomendação de tip");
+    assert.equal(recDown.tipLamports, null);
+  });
+
+  await test("recomendação de tip: teto em bps vence e abaixo do mínimo do Jito é AVISADO", async () => {
+    const { JitoTipOracle, MIN_JITO_TIP_LAMPORTS } = await import("../src/jitoStatus.js");
+    const body = JSON.stringify([{ landed_tips_50th_percentile: 1e-5, landed_tips_75th_percentile: 3.6e-5 }]);
+    let clock = 0;
+    const oracle = new JitoTipOracle({
+      fetchFn: (async () => ({ ok: true, status: 200, json: async () => JSON.parse(body) })) as unknown as typeof fetch,
+      now: () => (clock += 5_000),
+    });
+
+    // Capital grande o bastante: o tip do percentil cabe no teto de 50 bps.
+    const folgado = await oracle.recommendTip({ capitalSol: 0.1, maxTipBps: 50, policy: "p75" });
+    assert.equal(folgado.available, true);
+    assert.equal(folgado.cappedByBps, false, "3.6e-5 SOL cabe em 50 bps de 0.1 SOL");
+    assert.equal(folgado.tipLamports, 36_000);
+    assert.equal(folgado.belowJitoMinimum, false);
+
+    // Capital pequeno: o teto corta o tip e isso é DECLARADO (nunca subimos acima do teto).
+    const cortado = await oracle.recommendTip({ capitalSol: 0.001, maxTipBps: 50, policy: "p75" });
+    assert.equal(cortado.available, true);
+    assert.equal(cortado.cappedByBps, true);
+    assert.equal(cortado.tipSol, (0.001 * 50) / 10_000);
+    assert.ok(cortado.warnings.some((w) => /teto de 50 bps/.test(w)));
+
+    // Teto abaixo do mínimo do Jito: avisa que provavelmente NÃO será considerado, e mantém o teto.
+    const minusculo = await oracle.recommendTip({ capitalSol: 0.0001, maxTipBps: 50, policy: "p75" });
+    assert.equal(minusculo.available, true);
+    assert.equal(minusculo.belowJitoMinimum, true);
+    assert.ok(minusculo.tipLamports! < MIN_JITO_TIP_LAMPORTS);
+    assert.ok(
+      minusculo.warnings.some((w) => /NÃO será considerado/.test(w) && /teto de risco não foi violado/.test(w)),
+      `o trade-off precisa ser explícito: ${minusculo.warnings.join(" | ")}`
+    );
+  });
+
+  await test("JitoBundleSender: recusa lote grande/ID inválido e nunca fabrica status", async () => {
+    const { JitoBundleSender } = await import("../src/realExecution.js");
+    const { Connection } = await import("@solana/web3.js");
+    const sender = new JitoBundleSender(new Connection("https://127.0.0.1:1"));
+
+    const vazio = await sender.getBundleStatuses([]);
+    assert.equal(vazio.ok, false);
+    assert.ok(vazio.problems.some((p) => /nenhum bundle id/.test(p)));
+
+    const muitos = await sender.getBundleStatuses(Array.from({ length: 6 }, (_, i) => i.toString(16).repeat(64).slice(0, 64)));
+    assert.equal(muitos.ok, false);
+    assert.ok(muitos.problems.some((p) => /excede o máximo de 5/.test(p)), "limite documentado precisa ser aplicado");
+
+    const invalido = await sender.getBundleStatuses(["nao-e-id"]);
+    assert.equal(invalido.ok, false);
+    assert.ok(invalido.problems.some((p) => /implausível/.test(p)));
+
+    // Com id válido, a chamada TENTA a rede. Substituímos o fetch por um stub que falha para
+    // (a) não depender de egress e (b) provar que falha de rede vira problema declarado —
+    // nunca um status inventado.
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async () => {
+        throw new Error("test-stub: sem rede");
+      }) as unknown as typeof fetch;
+      const ID = "892b79ed49138bfb3aa5441f0df6e06ef34f9ee8f3976c15b323605bae0cf51d";
+      const semRede = await sender.getBundleStatuses([ID]);
+      assert.equal(semRede.ok, false);
+      assert.ok(semRede.problems.some((p) => /falha de rede/.test(p)));
+      assert.deepEqual(semRede.entries, [], "sem rede não existe entrada de status");
+      assert.deepEqual(semRede.missingIds, [ID]);
+
+      // Imediatamente depois: o cliente ESPERA e respeita o rate limit de 1 req/s (em vez de
+      // disparar a segunda requisição imediatamente, o que aceleraria o bloqueio da chave).
+      const t0 = Date.now();
+      const segunda = await sender.getBundleStatuses([ID]);
+      const esperou = Date.now() - t0;
+      assert.equal(segunda.ok, false);
+      assert.ok(esperou >= 900, `deveria esperar ~1s entre consultas (esperou ${esperou}ms)`);
+      assert.ok(
+        segunda.problems.some((p) => /falha de rede/.test(p)),
+        `a segunda consulta precisa CHEGAR na rede (não ser recusada pelo nosso próprio limite): ${segunda.problems.join(" | ")}`
+      );
+
+      // Fila longa demais: aí sim recusa, declarando a espera (não acumula fila infinita).
+      const { JitoBundleSender: Sender } = await import("../src/realExecution.js");
+      const apertado = new Sender(new Connection("https://127.0.0.1:1"), {
+        minStatusIntervalMs: 1000,
+        maxStatusWaitMs: 10,
+      });
+      await apertado.getBundleStatuses([ID]); // ocupa o slot
+      const semFila = await apertado.getBundleStatuses([ID]);
+      assert.equal(semFila.ok, false);
+      assert.ok(semFila.problems.some((p) => /throttle local/.test(p) && /1 req\/s/.test(p)));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  await test("o endpoint /api/jito-tips perdeu as constantes inventadas (regressão)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const jitoSrc = fs.readFileSync(path.join(repoRoot, "src", "jitoStatus.ts"), "utf8");
+
+    for (const proibido of ["low: 0.0005", "medium: 0.0015", "high: 0.005", "extreme: 0.02"]) {
+      assert.ok(!serverSrc.includes(proibido), `a constante fabricada "${proibido}" não pode voltar`);
+    }
+    assert.ok(
+      jitoSrc.includes("https://bundles.jito.wtf/api/v1/bundles/tip_floor"),
+      "o tip floor é REST em bundles.jito.wtf, host separado do block engine"
+    );
+
+    // Nenhum número aleatório: o módulo inteiro lê dados, não gera.
+    const code = jitoSrc
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    assert.ok(!code.includes("Math.random"), "oráculo de tip não pode conter RNG");
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

@@ -40,6 +40,16 @@ import {
 } from "./src/runtimeMode.js";
 import { LatencyTrace, monotonicNow, telemetry, wallClockNow } from "./src/telemetry.js";
 import { simulateEntry, type ShadowEntryResult } from "./src/shadowEntry.js";
+import {
+  JitoTipOracle,
+  TIP_FLOOR_URL,
+  MIN_JITO_TIP_LAMPORTS,
+  TIP_POLICIES,
+  reconcileLanding,
+  type TipPercentilePolicy,
+  type RpcConfirmation,
+  type JitoConfirmationStatus,
+} from "./src/jitoStatus.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
 import { compareStrategies, DEFAULT_STRATEGIES } from "./src/replay.js";
 import bs58 from "bs58";
@@ -557,6 +567,17 @@ const exitLocks = new Set<string>();
 
 /** Avisos de posição inválida: 1 por posição, para não inundar o log a cada 3s. */
 const invalidPositionWarned = new Set<string>();
+
+/**
+ * ORÁCULO DE TIP (S3).
+ *
+ * Substitui as constantes fixas que a versão anterior servia em `/api/jito-tips`
+ * (0.0005 / 0.0015 / 0.005 / 0.02) — números que não mediam nada e eram apresentados como
+ * "tips atuais". Aqui o valor vem do tip floor REAL do Jito, com throttle/cache (o rate limit
+ * documentado é 1 req/s/IP/região) e, quando a fonte não responde, `available: false` — sem
+ * número de recheio.
+ */
+const jitoTipOracle = new JitoTipOracle({ fetchFn: fetch, now: () => Date.now() });
 
 /**
  * BACKOFF DE TELEMETRIA DE PREÇO (por posição).
@@ -1438,15 +1459,165 @@ app.get("/api/alerts", (_req, res) => {
 });
 
 // 2. API: Current Jito Tip levels in SOL
-app.get("/api/jito-tips", (_req, res) => {
+/**
+ * GET /api/jito-tips — tip floor REAL do Jito (S3).
+ *
+ * ANTES: devolvia quatro constantes fixas (0.0005 / 0.0015 / 0.005 / 0.02) rotuladas como
+ * "low/medium/high/extreme". Não vinham de lugar nenhum: o operador decidia o tip com base em
+ * números inventados.
+ *
+ * AGORA: lê `https://bundles.jito.wtf/api/v1/bundles/tip_floor` (REST, host separado do block
+ * engine — não é método JSON-RPC) e devolve os percentis PUBLICADOS, sem arredondar para
+ * valores "bonitos". Quando a fonte não responde, a resposta é `available: false` com o motivo
+ * e o último valor conhecido COM A IDADE — nunca um número inventado.
+ *
+ * Parâmetros opcionais (não alteram a leitura, só adicionam uma recomendação):
+ *   ?capital=0.1&maxTipBps=50&policy=p75
+ */
+app.get("/api/jito-tips", async (req, res) => {
+  const policyRaw = String(req.query.policy ?? process.env.JITO_TIP_PERCENTILE ?? "p75");
+  const policy = (TIP_POLICIES as readonly string[]).includes(policyRaw)
+    ? (policyRaw as TipPercentilePolicy)
+    : "p75";
+
+  const floor = await jitoTipOracle.getTipFloor();
+
+  const capital = Number(req.query.capital ?? process.env.MAX_POSITION_SOL ?? 0);
+  const maxTipBps = Number(req.query.maxTipBps ?? process.env.MAX_TIP_BPS ?? 50);
+  const wantsRecommendation = capital > 0 && Number.isFinite(capital);
+
+  // Passa o floor já lido: sem isso, a recomendação faria uma segunda chamada dentro do mesmo
+  // request e cairia no throttle (1 req/s), escondendo o erro real da fonte.
+  const recommendation = wantsRecommendation
+    ? await jitoTipOracle.recommendTip({ capitalSol: capital, maxTipBps, policy }, floor)
+    : null;
+
   return res.json({
     timestamp: Date.now(),
-    tips: {
-      low: 0.0005,
-      medium: 0.0015,
-      high: 0.005,
-      extreme: 0.02
+    source: TIP_FLOOR_URL,
+    isJsonRpcMethod: false,
+    note:
+      "Tip floor é REST em bundles.jito.wtf (host separado do block engine). Percentis são os " +
+      "publicados pelo Jito; 'available: false' significa que a fonte não respondeu — nenhum " +
+      "valor é inventado. Tip mínimo considerado pelo Jito: " +
+      `${MIN_JITO_TIP_LAMPORTS} lamports.`,
+    available: floor.available,
+    percentilesSol: floor.available
+      ? {
+          p25: floor.sample.p25,
+          p50: floor.sample.p50,
+          p75: floor.sample.p75,
+          p95: floor.sample.p95,
+          p99: floor.sample.p99,
+          ema50: floor.sample.ema50,
+        }
+      : null,
+    sampleTime: floor.available ? floor.sample.time : null,
+    ageMs: floor.available ? floor.ageMs : (floor.lastKnown?.ageMs ?? null),
+    fromCache: floor.available ? floor.fromCache : false,
+    problems: floor.available ? floor.problems : [],
+    error: floor.available ? null : floor.error,
+    lastKnownPercentilesSol: !floor.available && floor.lastKnown
+      ? { p50: floor.lastKnown.sample.p50, p75: floor.lastKnown.sample.p75, p95: floor.lastKnown.sample.p95 }
+      : null,
+    recommendation,
+  });
+});
+
+/**
+ * GET /api/jito/bundle-status — status de landing de bundles (S3).
+ *
+ * Read-only e sem autenticação (não muda estado). Duas fontes, com papéis DIFERENTES:
+ *   - `getInflightBundleStatuses`: janela de 5 min, estados Invalid/Pending/Failed/**Landed**;
+ *   - `getBundleStatuses`: histórico recente do RPC do Jito, com `confirmation_status`
+ *     (processed/confirmed/finalized).
+ *
+ * Use `?signatures=…` para que a AUTORIDADE seja o SEU RPC (`getSignatureStatuses`).
+ * "Landed" do Jito significa que entrou em um bloco — NÃO é confirmação e NÃO garante o efeito
+ * esperado da transação (a doc do Jito alerta sobre blocos "uncled"). O veredito devolvido
+ * declara de onde veio a evidência (`authority`) e por quê.
+ *
+ * Exemplo: /api/jito/bundle-status?ids=<bundleId>&signatures=<assinaturaDaTx>
+ */
+app.get("/api/jito/bundle-status", async (req, res) => {
+  const idsRaw = String(req.query.ids ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const sigsRaw = String(req.query.signatures ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+
+  if (idsRaw.length === 0) {
+    return res.status(400).json({
+      error: "Informe ?ids=<bundleId>[,<bundleId>…] (máximo 5 por requisição).",
+      maxPerRequest: 5,
+    });
+  }
+
+  const sender = new JitoBundleSender(globalConnection ?? new Connection(RPC_ENDPOINT));
+  const [inflight, definitive] = await Promise.all([
+    sender.getInflightBundleStatuses(idsRaw),
+    sender.getBundleStatuses(idsRaw),
+  ]);
+
+  // Confirmação no SEU RPC: é a autoridade para decisão de capital.
+  const rpcConfirmations = new Map<string, RpcConfirmation>();
+  if (sigsRaw.length > 0 && globalConnection) {
+    try {
+      const statuses = await globalConnection.getSignatureStatuses(sigsRaw, { searchTransactionHistory: true });
+      sigsRaw.forEach((signature, i) => {
+        const value: any = statuses?.value?.[i];
+        if (!value) return;
+        const rawStatus = value.confirmationStatus;
+        const status: JitoConfirmationStatus =
+          rawStatus === "confirmed" || rawStatus === "finalized" ? rawStatus : "processed";
+        rpcConfirmations.set(signature, {
+          signature,
+          confirmationStatus: status,
+          slot: Number.isFinite(Number(value.slot)) ? Number(value.slot) : null,
+          err: value.err ? JSON.stringify(value.err).slice(0, 200) : null,
+        });
+      });
+    } catch (err: any) {
+      return res.status(502).json({
+        error: `Falha ao consultar o RPC para confirmar assinaturas: ${err?.message ?? String(err)}`,
+        inflight,
+        bundleStatuses: definitive,
+      });
     }
+  }
+
+  const reconciliations = idsRaw.map((id) => {
+    const inflightEntry = inflight.entries.find((e) => e.bundleId === id) ?? null;
+    const definitiveEntry = definitive.entries.find((e) => e.bundleId === id) ?? null;
+    const signatures = definitiveEntry?.signatures ?? [];
+    // Usa a confirmação do RPC cuja assinatura pertence a ESTE bundle (quando conhecida).
+    const corroborating = signatures
+      .map((s) => rpcConfirmations.get(s))
+      .find((c): c is RpcConfirmation => Boolean(c)) ?? null;
+    return reconcileLanding({
+      bundleId: id,
+      inflight: inflightEntry,
+      bundleStatus: definitiveEntry,
+      rpcConfirmation: corroborating,
+      // Sem isto, uma falha de rede das duas fontes viraria "não encontrado" — que é
+      // exatamente o tipo de conclusão otimista/errada que esta auditoria remove.
+      sourceErrors: {
+        inflight: inflight.ok ? null : inflight.problems.join("; "),
+        bundleStatus: definitive.ok ? null : definitive.problems.join("; "),
+      },
+    });
+  });
+
+  return res.json({
+    queriedAt: new Date().toISOString(),
+    authority:
+      "O RPC é a autoridade final. 'Landed' do Jito indica inclusão em bloco, não confirmação, " +
+      "e não prova o efeito esperado da transação.",
+    inflight,
+    bundleStatuses: definitive,
+    rpcChecked: sigsRaw.length > 0 && Boolean(globalConnection),
+    reconciliations,
+    note:
+      "getInflightBundleStatuses cobre 5 minutos; getBundleStatuses usa getSignatureStatuses " +
+      "com searchTransactionHistory=false (~300 slots enraizados). 'not_found' significa que " +
+      "nenhuma dessas janelas contém o bundle — não que ele falhou.",
   });
 });
 

@@ -621,3 +621,121 @@ npm run quarantine -- --file <fixture> --apply → move, inventaria e preserva a
   `GET /api/shadow-entries` (`built`, `simulation.ok`, `unitsConsumed`) e `data/events.jsonl`.
 - O caminho de **entrada real** segue inexistente (nenhuma compra é assinada em nenhum ponto do
   código). O shadow é pré-condição para construí-lo com evidência, não substituto dele.
+
+
+---
+
+## Adendo 5 (2026-10-02) — S3: status de landing do Jito e oráculo de tip
+
+**Motivação.** `sendBundle()` devolve um `bundle_id`, e a doc do Jito é explícita: *"This does not
+guarantee the bundle will be processed or land on-chain."* Mesmo assim o código não tinha NENHUMA
+consulta de status: "aceito pelo block engine" era o fim do caminho. E o valor do tip vinha de
+quatro constantes fixas expostas como se fossem medição. As duas coisas juntas significam: decisão
+de capital baseada em suposição, com número inventado.
+
+### C32 — `/api/jito-tips` servia constantes fabricadas
+
+Antes:
+
+```json
+{ "timestamp": …, "tips": { "low": 0.0005, "medium": 0.0015, "high": 0.005, "extreme": 0.02 } }
+```
+
+Esses quatro números não vinham de lugar nenhum — não eram um percentil, uma mediana, uma EMA, nem
+uma leitura do tip floor. Um operador ajustando tip com base neles estaria calibrando por adivinhação
+de terceiro.
+
+Agora: leitura do **tip floor real** (`https://bundles.jito.wtf/api/v1/bundles/tip_floor`, REST em
+host SEPARADO do block engine — não é método JSON-RPC), com percentis publicados pelo Jito
+(`p25/p50/p75/p95/p99/ema50`) e política configurável (`JITO_TIP_PERCENTILE`, default `p75`).
+Quando a fonte não responde, a resposta é `available: false` com o motivo e, se houver, o último
+valor conhecido **com a idade declarada** — nunca um número de recheio. Verificado no sandbox:
+
+```
+GET /api/jito-tips?capital=0.1  →  available: false, error: "tip floor inacessível: fetch failed",
+                                   percentilesSol: null, recommendation.tipSol: null
+```
+
+### C33 — não existia status de landing (e "Landed" seria confundido com confirmação)
+
+Novos métodos read-only em `JitoBundleSender` (`getBundleStatuses`, `getInflightBundleStatuses`) e
+`src/jitoStatus.ts` com parsers puros e reconciliação. O centro da correção é a **regra de
+autoridade**:
+
+| Evidência | Veredito | Autoridade declarada |
+|---|---|---|
+| `confirmation_status` = confirmed/finalized no **seu** RPC | `confirmed_on_chain` | `rpc` |
+| `getBundleStatuses` = confirmed/finalized (RPC do Jito) | `confirmed_on_chain` | `jito` (+ aviso de que o seu RPC é a autoridade) |
+| RPC em nível `processed` (confirmação otimista) | `landed_unconfirmed` | `rpc` |
+| inflight = **`Landed`** | `landed_unconfirmed` | `jito` |
+| inflight = `Failed` / `Pending` / `Invalid` | `failed` / `pending` / `invalid` | `jito` |
+| nenhuma das duas fontes respondeu | **`unknown`** | `none` |
+
+Dois modos de erro foram fechados explicitamente, ambos com teste:
+
+1. **`Landed` virava confirmação.** "Entrou em um bloco" não é confirmação no nível
+   `confirmed`/`finalized` e não prova o efeito esperado — a própria doc do Jito alerta sobre blocos
+   *uncled*, onde as transações podem ser rebroadcast fora da atomicidade do bundle. `Landed` fica em
+   `landed_unconfirmed` com a razão escrita na resposta.
+2. **Falha de consulta virava "não encontrado".** Se as duas fontes falham, o veredito é `unknown`
+   ("não foi possível consultar"), não `not_found`. Verificado no endpoint com o sandbox sem egress:
+
+```
+GET /api/jito/bundle-status?ids=<id>  →  verdict: "unknown"
+   - Consulta ao inflight falhou: falha de rede ...
+   - Consulta a getBundleStatuses falhou: falha de rede ...
+   - Nenhuma das duas fontes respondeu. Isto significa "não foi possível consultar", e NÃO
+     "o bundle não existe".
+```
+
+**Correção acoplada (rate limit).** A doc documenta **1 requisição/segundo/IP/região**. A primeira
+versão do meu cliente *falhava* a segunda consulta feita dentro do mesmo segundo — defeito de
+cliente: recusar uma consulta legítima por causa de outra consulta nossa não é respeitar limite, é
+quebrar o diagnóstico. Passou a usar **reserve-then-wait**: o horário é reservado antes de qualquer
+`await` (sem corrida entre chamadas concorrentes) e a requisição espera a vez; só se a espera passar
+de `maxStatusWaitMs` (default 1,5 s) o cliente recusa, declarando a fila. Medido no teste: a segunda
+consulta espera ~1 s e **chega** na rede.
+
+### Formato do `bundle_id`: a doc se contradiz — e isso está no código
+
+O exemplo de `sendBundle` mostra base58 (`2id3YC2jK9G5Wo2…`, formato de assinatura); o de
+`getBundleStatuses` mostra SHA-256 em hex (`892b79ed…`). Em vez de escolher um e rejeitar bundles
+legítimos do outro formato, `isPlausibleBundleId` aceita **os dois** e recusa o resto, com o motivo
+escrito no código e no teste. O parser nunca depende do formato para inferir mais nada.
+
+### Descoberta operacional: dado gitignored não persiste neste workspace
+
+Ao reiniciar o servidor, o banco operacional não existia mais e o boot registrou
+`No valid database or backup found. Creating fresh atomic operational state on disk.` O mesmo
+aconteceu com `data/` (o JSONL de medição) e com o inventário de quarentena do Adendo 4. Causa: o
+snapshot deste workspace **não carrega conteúdo gitignored** (`node_modules/` também precisa de
+`npm install` a cada sessão). Não houve perda de código — só de dados de runtime:
+
+- o banco do repositório (que continha as 12 posições fabricadas quarentenadas) **não existe mais
+  aqui**; o banco atual é novo e vazio. Isso é conveniente, mas aconteceu por comportamento do
+  ambiente, **não** por decisão de arquitetura;
+- a limpeza que importa roda no SEU ambiente: `npm run quarantine` (dry-run) e depois `--apply`;
+- `data/events.jsonl` recomeça vazio — o que também significa que qualquer métrica de replay é por
+  ambiente, nunca herdada.
+
+### Estado verificado
+
+```
+npm run lint        → limpo
+npm run test        → 64/64 (novo grupo [12] com 9 testes: ids, parsers, reconciliação,
+                       tip floor, oráculo com cache/throttle, recomendação com teto em bps,
+                       validação do cliente, regressão das constantes removidas)
+GET /api/jito-tips               → available: false honesto (sandbox sem egress), sem números
+GET /api/jito/bundle-status?id=… → verdict "unknown" com as duas falhas de consulta declaradas
+```
+
+### O que continua NÃO verificado
+
+- **Egress bloqueado**: nenhuma resposta real do tip floor nem do block engine foi lida. Toda a
+  evidência de parsing vem dos exemplos da documentação oficial, com `fetch` injetado nos testes.
+- O primeiro teste com rede real é: `curl https://bundles.jito.wtf/api/v1/bundles/tip_floor` do
+  **seu** servidor e `GET /api/jito-tips` — se `available: true`, os percentis são reais.
+- **Nenhum bundle real foi enviado** (o caminho de entrada real ainda não existe), então a
+  reconciliação nunca rodou contra um bundle de verdade. Ela está pronta para ser usada em S4/S5.
+- `getBundleStatuses` cobre ~300 slots enraizados e o inflight cobre 5 minutos: bundle antigo volta
+  `null`/`Invalid`, e isso NÃO é falha — está escrito na resposta do endpoint.
