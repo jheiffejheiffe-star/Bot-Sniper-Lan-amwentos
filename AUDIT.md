@@ -530,3 +530,94 @@ DEPOIS: 1 linha informativa na 1ª falha; tentativas em 1s, 2s, 4s … 60s (~60 
 O que isso **não** resolve: com o WebSocket fora, não há detecção de lançamentos por nenhum
 caminho alternativo — o sistema segue cego e agora **diz isso** em `/api/health`. O caminho para
 latência competitiva continua sendo o canal gRPC (Yellowstone), ainda não implementado.
+
+
+---
+
+## Adendo 4 (2026-10-02) — S0 (quarentena) e S2 (entrada em shadow simulada)
+
+**Contexto.** O plano de sequência (Adendo 3) fixou: antes de qualquer capital, (a) separar o
+histórico fabricado do operacional e (b) provar que a entrada é **construível** — rota existe,
+transação monta, compute cabe. Sem (b), "pronto para comprar" era uma afirmação sem evidência:
+o caminho de entrada aprovada registrava preço de referência e criava posição paper **sem nunca
+verificar se havia rota de execução**.
+
+### S0 — quarentena do banco operacional (`src/dbQuarantine.ts` + `npm run quarantine`)
+
+Classificação **estrutural**, sem consulta on-chain:
+
+| Balde | Critério | Efeito |
+|---|---|---|
+| `invalid` | `sizeSol <= 0` ou mint ausente/não-base58 | entra no plano por padrão |
+| `suspect` | sem campo `mode` (`paper`/`live`) | entra só com `--include-unmigrated` |
+| `ok` | nada a apontar | nunca tocado |
+
+Dry-run é o comportamento **padrão**: não grava nada e sai com código **2** quando há
+`invalid` (o problema aparece em qualquer pipeline em vez de depender de alguém ler a saída).
+O `--apply` escreve um **inventário** (`hft_operational_db.quarantine.<timestamp>.json`) e marca
+as posições movidas com `status: "quarantined"` + `quarantineReasons` + `quarantinedAt`, em
+escrita atômica (`tmp` + `rename`). **Nada é apagado.**
+
+Execução real no banco do repositório (dry-run, sem gravar):
+
+```
+Posições: 12 (inválidas: 8, suspeitas: 4, ok: 0)
+  [invalid] 8 posições com sizeSol=0 e mint que não é base58 (MEME_KING, PEPE_SOL, ALPHA_AI, ...)
+  [suspect] 4 posições (pos_auto_*) sem campo `mode`, mints "…pump" estruturalmente válidos
+```
+
+As 4 `suspect` são exatamente as que mantinham o loop de gestão consultando preço a cada rodada
+(elas têm `sizeSol = 0.1`, portanto passam pelo corte de tamanho). Quarentená-las exige decisão
+explícita do operador (`--include-unmigrated`), porque o critério é "sem modo gravado", não
+"impossível de gerir".
+
+### S2 — entrada em shadow (`src/shadowEntry.ts` + `GET /api/shadow-entries`)
+
+Quando um sinal é **aprovado** pelo risk engine, o pipeline agenda (fire-and-forget, fora do
+caminho crítico de latência) a validação de construibilidade:
+
+```
+cotação REAL (Jupiter) → transação MONTADA → simulateTransaction (sigVerify=false,
+replaceRecentBlockhash=true, commitment=processed) → resultado tipado
+```
+
+O resultado é gravado em `data/events.jsonl` (`kind: shadow-entry`), no log operacional
+(componente `SHADOW_ENTRY`) e num histórico de 20 entradas exposto em `/api/shadow-entries`
+com `simulationOnly: true`.
+
+**Garantia por construção de tipo, não por disciplina:** `ShadowEntryDeps` recebe apenas três
+capacidades — `getQuote`, `buildSwapTransaction`, `simulateTransaction`. Não existe campo para
+assinar ou enviar, e um teste faz **varredura do código-fonte** (`tests/safety.test.ts`, grupo
+`[11]`) falhando se aparecerem `signTransaction`, `partialSign`, `sendTransaction`,
+`sendRawTransaction`, `sendBundle`, `Keypair`, `secretKey` ou `privateKey` no módulo. Também é
+verificado que a transação simulada é a **mesma** que o builder devolveu.
+
+O que a simulação **não** prova, declarado no próprio resultado e no endpoint:
+
+1. **Não é execução** — o estado muda entre simular e enviar (TOCTOU);
+2. **Não valida blockhash** — ele é substituído por um recente de propósito (medimos
+   programa/compute, não frescor); o campo `blockhashReplaced: true` deixa isso explícito;
+3. **Não diz nada sobre lucro** — só que a rota é montável.
+
+`skippedReason` é resposta legítima e esperada em três casos: modo `SIMULATION` (não há dado
+real), modo `LIVE` (o caminho é o real, não o shadow) e ausência de chave operacional — este
+último porque o módulo **nunca** cria chave efêmera para "ter o que simular".
+
+### Estado verificado
+
+```
+npx tsc --noEmit                              → limpo
+npm run test                                  → 55/55 (grupo [11] com 8 testes novos)
+npm run quarantine                            → dry-run no banco real: 8 inválidas, 4 suspeitas, NADA gravado
+npm run quarantine -- --file <fixture> --apply → move, inventaria e preserva as saudáveis (teste automatizado)
+```
+
+### O que continua NÃO verificado
+
+- **Egress bloqueado no sandbox**: nenhuma cotação, construção ou simulação real foi executada
+  contra a rede. O que está provado é o **encanamento** (tipos, medição, registro, ausência de
+  caminho de assinatura) com dependências injetadas — não que o Jupiter responde.
+- A primeira execução com rede real é o teste que importa: rode o bot em PAPER/SHADOW e olhe
+  `GET /api/shadow-entries` (`built`, `simulation.ok`, `unitsConsumed`) e `data/events.jsonl`.
+- O caminho de **entrada real** segue inexistente (nenhuma compra é assinada em nenhum ponto do
+  código). O shadow é pré-condição para construí-lo com evidência, não substituto dele.

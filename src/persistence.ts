@@ -88,7 +88,15 @@ export interface DBLog {
   id: string;
   timestamp: string;
   level: "INFO" | "WARN" | "ERROR" | "CRITICAL" | "SUCCESS";
-  component: "RPC_INFRA" | "RISK_ENGINE" | "JITO_BUNDLE" | "SECURITY_SHIELD" | "MEMPOOL_SCANNER" | "SYSTEM";
+  component:
+    | "RPC_INFRA"
+    | "RISK_ENGINE"
+    | "JITO_BUNDLE"
+    | "SECURITY_SHIELD"
+    | "MEMPOOL_SCANNER"
+    /** Entradas em shadow: cotação + transação simulada (nunca assinada/enviada). */
+    | "SHADOW_ENTRY"
+    | "SYSTEM";
   message: string;
   correlationId?: string;
   metadata?: any;

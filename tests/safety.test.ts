@@ -838,6 +838,245 @@ async function main(): Promise<void> {
     client.disconnect();
   });
 
+  /* ------------------------------------------------------------------ */
+  console.log("\n[11] Entrada em shadow (simulada, nunca assinada) e quarentena do banco");
+
+  await test("shadow entry: cotação + construção + simulação devolvem resultado tipado e medido", async () => {
+    const { simulateEntry } = await import("../src/shadowEntry.js");
+
+    let clock = 1000;
+    const calls: string[] = [];
+    const fakeTx = { serialize: () => new Uint8Array([1, 2, 3]) };
+
+    const deps = {
+      now: () => (clock += 100),
+      getQuote: async (inputMint: string, outputMint: string, amount: number) => {
+        calls.push(`quote:${inputMint}->${outputMint}:${amount}`);
+        return {
+          inputMint,
+          outputMint,
+          outAmount: "123456789",
+          priceImpactPct: 1.23,
+          routePlan: [{ swapInfo: { label: "Pump.fun" } }, { swapInfo: { label: "Raydium" } }, { swapInfo: { label: "Pump.fun" } }],
+        };
+      },
+      buildSwapTransaction: async (quote: any, userPublicKey: string) => {
+        calls.push(`build:${quote.outAmount}:${userPublicKey}`);
+        return fakeTx;
+      },
+      simulateTransaction: async (tx: any) => {
+        calls.push(`simulate:${tx === fakeTx}`);
+        return { value: { err: null, unitsConsumed: 47_000, logs: ["Program log: ok", "Program consumption: 47000 units"] } };
+      },
+    };
+
+    const result = await simulateEntry(deps, {
+      mint: "MintShadow111111111111111111111111111111111",
+      sizeSol: 0.05,
+      userPublicKey: "Wallet1111111111111111111111111111111111111",
+      mode: "PAPER",
+    });
+
+    assert.equal(result.built, true, `deveria ter construído: ${result.skippedReason}`);
+    assert.equal(result.skippedReason, null);
+    assert.equal(result.simulation?.ok, true);
+    assert.equal(result.simulation?.unitsConsumed, 47_000);
+    assert.equal(result.simulation?.blockhashReplaced, true, "simulação substitui blockhash — precisa ser declarado");
+    assert.deepEqual(result.quote?.routeLabels, ["Pump.fun", "Raydium"], "rótulos de rota deduplicados");
+    assert.equal(result.quote?.outAmount, "123456789");
+    // 0.05 SOL = 50.000.000 lamports — a quantidade cotada é a solicitada, não um valor fixo.
+    assert.ok(calls.includes("quote:So11111111111111111111111111111111111111112->MintShadow111111111111111111111111111111111:50000000"));
+    assert.ok(calls.some((c) => c.startsWith("build:123456789:")));
+    assert.ok(calls.includes("simulate:true"), "a transação DO builder precisa ser a simulada");
+    // Tempos medidos com o relógio injetado: cada etapa custa exatamente 100ms; o total é o
+    // tempo real da chamada inteira (inclui os guardas), portanto >= soma das etapas.
+    assert.equal(result.timingsMs.quote, 100);
+    assert.equal(result.timingsMs.build, 100);
+    assert.equal(result.timingsMs.simulate, 100);
+    assert.ok(result.timingsMs.total >= 300, `total ${result.timingsMs.total} menor que a soma das etapas`);
+  });
+
+  await test("shadow entry: erro de programa na simulação é REPORTADO, não escondido", async () => {
+    const { simulateEntry } = await import("../src/shadowEntry.js");
+    const deps = {
+      now: () => 0,
+      getQuote: async () => ({ outAmount: "1", routePlan: [] }),
+      buildSwapTransaction: async () => ({ serialize: () => new Uint8Array() }),
+      simulateTransaction: async () => ({
+        value: { err: { InstructionError: [3, { Custom: 6001 }] }, unitsConsumed: 12_345, logs: ["Program log: slippage exceeded"] },
+      }),
+    };
+    const result = await simulateEntry(deps, {
+      mint: "MintShadow222222222222222222222222222222222",
+      sizeSol: 0.01,
+      userPublicKey: "Wallet1111111111111111111111111111111111111",
+      mode: "SHADOW",
+    });
+    assert.equal(result.built, true);
+    assert.equal(result.simulation?.ok, false, "err != null é falha, mesmo com a tx construída");
+    assert.match(JSON.stringify(result.simulation?.err), /6001/);
+    assert.ok(result.simulation?.logsTail.some((l) => /slippage exceeded/.test(l)));
+  });
+
+  await test("shadow entry: cotação falha vira resultado tipado (sem exceção, sem simulação)", async () => {
+    const { simulateEntry } = await import("../src/shadowEntry.js");
+    let simulated = false;
+    const result = await simulateEntry(
+      {
+        now: () => 0,
+        getQuote: async () => {
+          const err: any = new Error("HTTP 404");
+          err.code = "JUPITER_NO_ROUTE";
+          throw err;
+        },
+        buildSwapTransaction: async () => {
+          throw new Error("não deveria construir");
+        },
+        simulateTransaction: async () => {
+          simulated = true;
+          return {};
+        },
+      },
+      { mint: "MintShadow333333333333333333333333333333333", sizeSol: 0.02, userPublicKey: "W", mode: "PAPER" }
+    );
+    assert.equal(result.built, false);
+    assert.match(result.skippedReason || "", /JUPITER_NO_ROUTE/);
+    assert.equal(simulated, false, "sem cotação não há o que simular");
+    assert.equal(result.simulation, null);
+  });
+
+  await test("shadow entry: recusa em LIVE e sem carteira — e nunca cria chave efêmera", async () => {
+    const { simulateEntry } = await import("../src/shadowEntry.js");
+    const deps = {
+      now: () => 0,
+      getQuote: async () => {
+        throw new Error("não deveria cotar");
+      },
+      buildSwapTransaction: async () => {
+        throw new Error("não deveria construir");
+      },
+      simulateTransaction: async () => ({}),
+    };
+    const live = await simulateEntry(deps, { mint: "MintShadow444444444444444444444444444444444", sizeSol: 0.01, userPublicKey: "W", mode: "LIVE" });
+    assert.match(live.skippedReason || "", /LIVE/);
+    const semCarteira = await simulateEntry(deps, { mint: "MintShadow444444444444444444444444444444444", sizeSol: 0.01, userPublicKey: null, mode: "PAPER" });
+    assert.match(semCarteira.skippedReason || "", /sem chave operacional/);
+  });
+
+  await test("shadow entry NÃO PODE assinar nem enviar (regressão por varredura de código)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const source = fs.readFileSync(path.join(repoRoot, "src", "shadowEntry.ts"), "utf8");
+    // Remove comentários para não acusar a própria documentação do módulo.
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    for (const forbidden of [
+      "signTransaction",
+      "partialSign",
+      "sendTransaction",
+      "sendRawTransaction",
+      "sendBundle",
+      "Keypair",
+      "secretKey",
+      "privateKey",
+    ]) {
+      assert.ok(
+        !code.includes(forbidden),
+        `shadowEntry.ts não pode conter "${forbidden}": o caminho shadow é de simulação, não de execução`
+      );
+    }
+  });
+
+  await test("quarentena: classifica por estrutura (tamanho, mint, modo) sem consultar rede", async () => {
+    const { classifyPosition, planQuarantine } = await import("../src/dbQuarantine.js");
+    const MINT_OK = "So11111111111111111111111111111111111111112";
+
+    assert.equal(classifyPosition({ id: "a", mint: MINT_OK, sizeSol: 0, mode: "paper" }).verdict, "invalid");
+    assert.equal(classifyPosition({ id: "b", mint: "nao-e-pubkey", sizeSol: 0.1, mode: "paper" }).verdict, "invalid");
+    assert.equal(classifyPosition({ id: "c", mint: MINT_OK, sizeSol: 0.1 }).verdict, "suspect");
+    assert.equal(classifyPosition({ id: "d", mint: MINT_OK, sizeSol: 0.1, mode: "paper" }).verdict, "ok");
+
+    const plan = planQuarantine([
+      { id: "a", mint: MINT_OK, sizeSol: 0, mode: "paper" },
+      { id: "c", mint: MINT_OK, sizeSol: 0.1 },
+      { id: "d", mint: MINT_OK, sizeSol: 0.1, mode: "paper" },
+    ]);
+    assert.equal(plan.invalid.length, 1);
+    assert.equal(plan.suspect.length, 1);
+    assert.equal(plan.ok.length, 1);
+    assert.deepEqual(
+      plan.toMove.map((c) => c.id),
+      ["a"],
+      "sem --include-unmigrated, apenas os estruturalmente inválidos entram no plano"
+    );
+    const comSuspeitos = planQuarantine([{ id: "c", mint: MINT_OK, sizeSol: 0.1 }], { includeUnmigrated: true });
+    assert.deepEqual(comSuspeitos.toMove.map((c) => c.id), ["c"]);
+  });
+
+  await test("quarentena: aplica status e motivos SEM apagar nada", async () => {
+    const { applyQuarantine, planQuarantine } = await import("../src/dbQuarantine.js");
+    const MINT_OK = "So11111111111111111111111111111111111111112";
+    const positions = [
+      { id: "a", mint: MINT_OK, sizeSol: 0, mode: "paper", token: "X" },
+      { id: "d", mint: MINT_OK, sizeSol: 0.1, mode: "paper", token: "Y" },
+    ];
+    const plan = planQuarantine(positions);
+    const { next, moved } = applyQuarantine(positions, plan, "2026-10-02T00:00:00.000Z");
+
+    assert.equal(next.length, 2, "nenhuma posição pode ser removida do banco");
+    const a: any = next.find((p: any) => p.id === "a")!;
+    assert.equal(a.status, "quarantined");
+    assert.equal(a.quarantinedAt, "2026-10-02T00:00:00.000Z");
+    assert.ok(Array.isArray(a.quarantineReasons) && a.quarantineReasons.length > 0);
+    assert.equal(a.sizeSol, 0, "os dados originais permanecem para auditoria");
+    const d: any = next.find((p: any) => p.id === "d")!;
+    assert.equal(d.status, undefined, "posição saudável não é tocada");
+    assert.equal(moved.length, 1);
+  });
+
+  await test("CLI de quarentena: dry-run não escreve nada (e sinaliza com exit 2)", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const tsxBin = path.join(repoRoot, "node_modules", ".bin", "tsx");
+    if (!fs.existsSync(tsxBin)) {
+      console.log("     (tsx ausente — teste de CLI pulado)");
+      return;
+    }
+    const MINT_OK = "So11111111111111111111111111111111111111112";
+    const dbPath = path.join(sandboxDir, "quarantine-db.json");
+    const db = {
+      version: "v4",
+      positions: [
+        { id: "pos_invalida", token: "MEME", mint: "King777123912Aasdasdsa8912hads9812hasdH", sizeSol: 0, status: "open" },
+        { id: "pos_ok", token: "OK", mint: MINT_OK, sizeSol: 0.1, mode: "paper", status: "open" },
+      ],
+    };
+    fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+    const before = fs.readFileSync(dbPath, "utf8");
+
+    const dry = spawnSync(tsxBin, [path.join(repoRoot, "scripts", "quarantine-db.ts"), "--file", dbPath], { encoding: "utf8" });
+    assert.equal(fs.readFileSync(dbPath, "utf8"), before, "dry-run NÃO pode alterar o banco");
+    assert.equal(dry.status, 2, `dry-run com posição inválida deve sinalizar (status=${dry.status})`);
+    assert.match(dry.stdout, /pos_invalida/);
+
+    const applied = spawnSync(
+      tsxBin,
+      [path.join(repoRoot, "scripts", "quarantine-db.ts"), "--file", dbPath, "--apply"],
+      { encoding: "utf8" }
+    );
+    assert.equal(applied.status, 0, `--apply deveria concluir (status=${applied.status}): ${applied.stderr}`);
+    const after = JSON.parse(fs.readFileSync(dbPath, "utf8"));
+    const invalida = after.positions.find((p: any) => p.id === "pos_invalida");
+    assert.equal(invalida.status, "quarantined");
+    assert.ok(invalida.quarantineReasons.length > 0);
+    assert.equal(after.positions.length, 2, "nada apagado");
+    assert.equal(after.positions.find((p: any) => p.id === "pos_ok").status, "open", "posição saudável intacta");
+    const inventory = fs.readdirSync(sandboxDir).filter((f) => /^quarantine-db\.quarantine\..*\.json$/.test(f));
+    assert.equal(inventory.length, 1, "o inventário de quarentena precisa existir");
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

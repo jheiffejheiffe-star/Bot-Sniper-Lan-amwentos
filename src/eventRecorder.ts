@@ -106,11 +106,39 @@ export interface RecordedPositionLifecycle {
   pnlMeasuredOnChain: boolean;
 }
 
+/**
+ * Resultado de uma ENTRADA EM SHADOW: rota cotada, transação construída e SIMULADA.
+ *
+ * Gravado porque é a evidência que separa "o bot decidiu comprar" de "a compra é
+ * construível e o compute cabe". Nenhum campo aqui vem de assinatura ou envio — este
+ * registro é sempre de simulação, e `pnlMeasuredOnChain`-like não existe porque não há PnL.
+ */
+export interface RecordedShadowEntry {
+  kind: "shadow-entry";
+  recordedAt: string;
+  mint: string;
+  token: string | null;
+  mode: string;
+  sizeSol: number;
+  built: boolean;
+  skippedReason: string | null;
+  routeLabels: string[];
+  outAmount: string | null;
+  priceImpactPct: number | null;
+  simulationOk: boolean | null;
+  simulationErr: string | null;
+  unitsConsumed: number | null;
+  quoteMs: number | null;
+  buildMs: number | null;
+  simulateMs: number | null;
+}
+
 export type RecordedRecord =
   | RecordedLaunchEvent
   | RecordedAssessment
   | RecordedPriceObservation
-  | RecordedPositionLifecycle;
+  | RecordedPositionLifecycle
+  | RecordedShadowEntry;
 
 /* -------------------------------------------------------------------------- */
 /* RECORDER                                                                    */
@@ -132,6 +160,7 @@ export class EventRecorder {
     assessment: 0,
     "price-observation": 0,
     "position-lifecycle": 0,
+    "shadow-entry": 0,
   };
   private writeErrors = 0;
   private seenEventIds = new Set<string>();
@@ -182,6 +211,11 @@ export class EventRecorder {
 
   recordPositionLifecycle(lifecycle: Omit<RecordedPositionLifecycle, "kind" | "recordedAt">): void {
     this.write({ kind: "position-lifecycle", recordedAt: new Date().toISOString(), ...lifecycle });
+  }
+
+  /** Registra uma entrada em shadow (cotação + construção + simulação, sem assinatura). */
+  recordShadowEntry(entry: Omit<RecordedShadowEntry, "kind" | "recordedAt">): void {
+    this.write({ kind: "shadow-entry", recordedAt: new Date().toISOString(), ...entry });
   }
 
   /**
@@ -246,6 +280,8 @@ export interface BacktestDataset {
     rejected: number;
     priceObservations: number;
     positionLifecycles: number;
+    /** Entradas em shadow registradas (simulações; nunca operações). */
+    shadowEntries: number;
     mintsWithoutPrices: number;
     acceptanceRate: number;
   };
@@ -270,6 +306,7 @@ export function loadBacktestDataset(filePath?: string): BacktestDataset {
   let rejected = 0;
   let priceObservations = 0;
   let positionLifecycles = 0;
+  let shadowEntries = 0;
 
   const episodeFor = (mint: string): BacktestEpisode => {
     let ep = episodes.get(mint);
@@ -307,6 +344,10 @@ export function loadBacktestDataset(filePath?: string): BacktestDataset {
         positionLifecycles++;
         episodeFor(rec.mint).lifecycle.push(rec);
         break;
+      case "shadow-entry":
+        // Contado, não misturado com trades: uma simulação bem-sucedida NÃO é uma operação.
+        shadowEntries++;
+        break;
     }
   }
 
@@ -329,6 +370,7 @@ export function loadBacktestDataset(filePath?: string): BacktestDataset {
       rejected,
       priceObservations,
       positionLifecycles,
+      shadowEntries,
       mintsWithoutPrices: all.filter((e) => e.prices.length === 0).length,
       acceptanceRate: assessments > 0 ? round4(accepted / assessments) : 0,
     },

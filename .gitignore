@@ -16,6 +16,8 @@ server.js
 # anterior do código (ver AUDIT.md). Recomenda-se quarentená-lo.
 hft_operational_db.json
 hft_operational_db.json.bak
+# Inventários de quarentena: dado operacional (não pertence ao repositório)
+hft_operational_db.quarantine.*.json
 logs/
 *.log
 

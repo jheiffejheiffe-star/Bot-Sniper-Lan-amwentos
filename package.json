@@ -13,7 +13,8 @@
     "test:all": "npm run lint && npm run test",
     "verify:endpoints": "tsx scripts/verify-endpoints.ts",
     "test:destructive": "tsx test-production.ts",
-    "replay": "tsx scripts/replay.ts"
+    "replay": "tsx scripts/replay.ts",
+    "quarantine": "tsx scripts/quarantine-db.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

@@ -38,7 +38,8 @@ import {
   getRuntimeModeResolution,
   validateRuntimeConfiguration,
 } from "./src/runtimeMode.js";
-import { LatencyTrace, telemetry, wallClockNow } from "./src/telemetry.js";
+import { LatencyTrace, monotonicNow, telemetry, wallClockNow } from "./src/telemetry.js";
+import { simulateEntry, type ShadowEntryResult } from "./src/shadowEntry.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
 import { compareStrategies, DEFAULT_STRATEGIES } from "./src/replay.js";
 import bs58 from "bs58";
@@ -696,6 +697,24 @@ app.get("/api/latency", (_req, res) => {
 });
 
 /**
+ * GET /api/shadow-entries — últimas entradas em SHADOW (cotação + construção + simulação).
+ *
+ * Leitura pura. Existe para responder, sem arqueologia: "o bot consegue montar a entrada do
+ * que ele aprovou?" e "o compute cabe?". `built: false` + `skippedReason` é resposta legítima.
+ * NENHUMA dessas entradas foi assinada ou enviada — ver o campo `simulationOnly`.
+ */
+app.get("/api/shadow-entries", (_req, res) => {
+  res.json({
+    simulationOnly: true,
+    note:
+      "Entradas em shadow: rota cotada e transação SIMULADA contra o RPC, sem assinatura e sem " +
+      "envio. Simulação bem-sucedida NÃO garante execução (o estado muda entre simular e enviar).",
+    count: shadowEntryHistory.length,
+    entries: shadowEntryHistory,
+  });
+});
+
+/**
  * GET /api/replay — compara estratégias de saída sobre os dados JÁ GRAVADOS.
  *
  * Lê `data/events.jsonl`, monta episódios por mint (INCLUINDO os sinais rejeitados) e
@@ -775,8 +794,22 @@ app.get("/api/replay", (req, res) => {
   }
 });
 
-app.get("/api/positions", (_req, res) => {
-  return res.json(dbStore.getPositions());
+/**
+ * GET /api/positions — posições do banco operacional.
+ *
+ * Por padrão, posições com `status: "quarantined"` NÃO são devolvidas: elas são resíduo de
+ * histórico fabricado (ver `npm run quarantine`), não posições ativas. Devolvê-las faria o
+ * painel exibir "12 posições ativas" quando nenhuma delas é gerível — exatamente o tipo de
+ * contagem otimista que esta auditoria remove. Para auditoria, use
+ * `GET /api/positions?include=quarantined`.
+ */
+app.get("/api/positions", (req, res) => {
+  const includeQuarantined = String(req.query.include ?? "") === "quarantined";
+  const positions = dbStore.getPositions();
+  const visible = includeQuarantined
+    ? positions
+    : positions.filter((p: any) => p.status !== "quarantined");
+  return res.json(visible);
 });
 
 app.post("/api/positions/update-risk", (req, res) => {
@@ -3002,6 +3035,11 @@ Respond in a short, scannable JSON object with these keys:
     pnlMeasuredOnChain: false,
   });
 
+  // Validação de CONSTRUIBILIDADE da entrada (Etapa S2): roda em paralelo, não bloqueia.
+  void runShadowEntry(tokenMint, paperSizeSol, tokenName).catch((err) =>
+    console.error("[Shadow Entry] Falha inesperada:", err?.message ?? err)
+  );
+
   reportSignalAccepted();
 }
 
@@ -3059,6 +3097,108 @@ function estimatePaperRoundTrip(priceSol: number, sizeSol: number): number {
   const total = jitoTipSol * 2 + priorityFeeSol + baseFeeSol + ammFeeSol + slippageSol;
   void priceSol;
   return (total / sizeSol) * 100;
+}
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * ENTRADA EM SHADOW (Etapa S2) — a rota existe? a transação é construível? o compute cabe?
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * POR QUE ISTO EXISTE
+ * Até aqui, o caminho de "entrada aprovada" registrava preço de referência e criava a posição
+ * paper — sem NUNCA verificar se havia rota de execução. Ou seja: o sistema podia se declarar
+ * pronto para comprar um token para o qual o router não monta transação nenhuma.
+ *
+ * O que este caminho faz: pede cotação real, pede a transação montada e roda
+ * `simulateTransaction` SEM assinar. O resultado é tipado e gravado (JSONL + histórico em
+ * memória + `/api/shadow-entries`). Nenhuma assinatura, nenhum envio, nenhum tip pago.
+ *
+ * POR QUE FIRE-AND-FORGET
+ * Cotação + montagem + simulação são três chamadas de rede. Se entrassem no caminho síncrono
+ * do instante de decisão, adicionariam latência exatamente onde ela mais custa. O evento é
+ * aceito primeiro; a validação de construibilidade corre em paralelo e vira evidência.
+ *
+ * O QUE ELE *NÃO* PROVA (declarado de propósito)
+ * 1. Simulação ≠ execução: o estado muda entre simular e enviar (TOCTOU).
+ * 2. O blockhash é substituído por um recente na simulação, então frescor de blockhash NÃO é
+ *    validado aqui.
+ * 3. Uma simulação bem-sucedida não diz nada sobre lucro — só que a rota é montável.
+ */
+const shadowEntryHistory: ShadowEntryResult[] = [];
+const MAX_SHADOW_HISTORY = 20;
+
+async function runShadowEntry(mint: string, sizeSol: number, tokenName: string): Promise<void> {
+  const mode = getRuntimeModeResolution().mode;
+
+  let userPublicKey: string | null = null;
+  try {
+    userPublicKey = getActiveWalletPublicKey()?.toBase58() ?? null;
+  } catch {
+    userPublicKey = null; // sem carteira provisionada: o módulo devolve `skipped` com o motivo
+  }
+
+  const deps = {
+    getQuote: (inputMint: string, outputMint: string, amountLamports: number, slippageBps: number, timeoutMs?: number) =>
+      JupiterIntegration.getQuote(inputMint, outputMint, amountLamports, slippageBps, timeoutMs),
+    buildSwapTransaction: (quote: any, userPk: string, timeoutMs?: number) =>
+      JupiterIntegration.buildSwapTransaction(quote, userPk, timeoutMs),
+    simulateTransaction: async (tx: any) => {
+      const conn = globalConnection;
+      if (!conn) throw new Error("RPC indisponível (globalConnection nulo)");
+      // sigVerify=false + replaceRecentBlockhash: medimos programa/compute, não assinatura
+      // nem validade do blockhash (que pode estar propositalmente vencido em shadow).
+      return conn.simulateTransaction(tx, {
+        commitment: "processed",
+        sigVerify: false,
+        replaceRecentBlockhash: true,
+      });
+    },
+    now: monotonicNow,
+  };
+
+  const result = await simulateEntry(deps, {
+    mint,
+    sizeSol,
+    userPublicKey,
+    mode,
+    slippageBps: Number(process.env.SHADOW_SLIPPAGE_BPS ?? 300),
+  });
+
+  shadowEntryHistory.unshift(result);
+  if (shadowEntryHistory.length > MAX_SHADOW_HISTORY) shadowEntryHistory.pop();
+
+  recorder.recordShadowEntry({
+    mint: result.mint,
+    token: tokenName ? tokenName.toUpperCase() : null,
+    mode: result.mode,
+    sizeSol: result.sizeSol,
+    built: result.built,
+    skippedReason: result.skippedReason,
+    routeLabels: result.quote?.routeLabels ?? [],
+    outAmount: result.quote?.outAmount ?? null,
+    priceImpactPct: result.quote?.priceImpactPct ?? null,
+    simulationOk: result.simulation ? result.simulation.ok : null,
+    simulationErr: result.simulation?.err ? String((result.simulation.err as any)?.message ?? result.simulation.err) : null,
+    unitsConsumed: result.simulation?.unitsConsumed ?? null,
+    quoteMs: result.timingsMs.quote,
+    buildMs: result.timingsMs.build,
+    simulateMs: result.timingsMs.simulate,
+  });
+
+  const simOk = result.simulation?.ok === true;
+  dbStore.saveLog({
+    timestamp: new Date().toISOString(),
+    level: result.built && simOk ? "INFO" : "WARN",
+    component: "SHADOW_ENTRY",
+    message: result.skippedReason
+      ? `[SHADOW] ${tokenName.toUpperCase()} — simulação não executada: ${result.skippedReason}`
+      : `[SHADOW] ${tokenName.toUpperCase()} — rota ${result.quote?.routeLabels.join(">") || "?"} ` +
+        `(impacto ${result.quote?.priceImpactPct ?? "n/d"}), simulação ${simOk ? "OK" : `FALHOU: ${result.simulation?.err ?? "?"}`}` +
+        `${result.simulation?.unitsConsumed != null ? `, ${result.simulation.unitsConsumed} CU` : ""}` +
+        `${result.simulation?.logsTail?.length ? `, última linha: ${result.simulation.logsTail[result.simulation.logsTail.length - 1]?.slice(0, 120)}` : ""}. ` +
+        `NENHUMA assinatura, NENHUM envio.`,
+    correlationId: `corr_shadow_${mint.slice(0, 8)}_${Date.now()}`,
+  });
 }
 
 /**
