@@ -2147,6 +2147,150 @@ async function main(): Promise<void> {
     assert.ok(releases.length >= 7, `todo caminho de saída precisa liberar o mint (encontrados ${releases.length})`);
   });
 
+  // ---------------------------------------------------------------------------
+  // [17] ORÇAMENTO DE COTA — a camada gratuita não falha por latência, falha por 429
+  // ---------------------------------------------------------------------------
+  console.log("\n[17] Orçamento de cota (grátis)");
+
+  await test("janela deslizante: aceita até o teto e volta a aceitar quando a janela passa", async () => {
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const b = new RateBudget({ name: "t", limit: 2, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(), true);
+    assert.equal(b.tryAcquire(), true);
+    assert.equal(b.tryAcquire(), false, "acima do teto é recusado");
+    assert.equal(b.rejected, 1);
+    now = 999;
+    assert.equal(b.tryAcquire(), false, "dentro da janela ainda não libera");
+    now = 1001;
+    assert.equal(b.tryAcquire(), true, "fora da janela libera de novo");
+    assert.equal(b.used(), 1, "as duas antigas saíram da janela");
+  });
+
+  await test("custo por chamada: uma chamada pode ocupar várias vagas", async () => {
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    // Alchemy: getTransaction custa 40 CU contra 10 de getAccountInfo = 4x
+    const b = new RateBudget({ name: "c", limit: 10, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(4), true, "4 de 10");
+    assert.equal(b.tryAcquire(4), true, "8 de 10");
+    assert.equal(b.tryAcquire(4), false, "8+4 > 10: recusado (sem estourar a cota)");
+    assert.equal(b.used(), 8);
+    assert.equal(b.tryAcquire(2), true, "cabe exatamente no que sobrou");
+  });
+
+  await test("waitMsUntilNextSlot aponta a espera e zera quando há vaga", async () => {
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 10_000;
+    const b = new RateBudget({ name: "w", limit: 1, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.waitMsUntilNextSlot(), 0, "livre: sem espera");
+    assert.equal(b.tryAcquire(), true);
+    assert.equal(b.waitMsUntilNextSlot(), 1000, "precisa esperar a janela inteira");
+    now += 400;
+    assert.equal(b.waitMsUntilNextSlot(), 600);
+    now += 600;
+    assert.equal(b.waitMsUntilNextSlot(), 0);
+  });
+
+  await test("withBudget: prioridade normal espera até o teto e depois PULA (contabilizado)", async () => {
+    const { RateBudget, withBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const sleeps: number[] = [];
+    const b = new RateBudget({ name: "j", limit: 1, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(), true, "consome a única vaga");
+
+    // Espera curta o suficiente para caber: executa.
+    const ok = await withBudget(b, async () => "executou", {
+      maxWaitMs: 1200,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+    });
+    assert.equal(ok.ok, true);
+    assert.equal(ok.value, "executou");
+    assert.equal(sleeps.length, 1, "esperou a cota liberar");
+
+    // Agora com espera insuficiente: PULA e conta — nunca estoura a cota.
+    // (A vaga da chamada anterior ainda está na janela: avança o relógio para liberá-la.)
+    now += 1000;
+    assert.equal(b.tryAcquire(), true, "vaga liberada depois da janela");
+    let called = false;
+    const skip = await withBudget(b, async () => ((called = true), "não devia"), {
+      maxWaitMs: 50,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
+    assert.equal(skip.ok, false, "sem cota e sem espera suficiente, a chamada NÃO é feita");
+    assert.equal(called, false);
+    assert.ok(/cota de "j" esgotada/.test(String(skip.skippedReason)));
+    assert.equal(b.skipped, 1);
+  });
+
+  await test("withBudget: SAÍDA nunca é bloqueada por cota (bypass contado)", async () => {
+    const { RateBudget, withBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const b = new RateBudget({ name: "exit", limit: 1, windowMs: 60_000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(), true);
+    // Vinte saídas acima da cota: todas executam (fechar posição é reduzir risco).
+    for (let i = 0; i < 20; i++) {
+      const r = await withBudget(b, async () => "fechou", { priority: "exit" });
+      assert.equal(r.ok, true, "saída nunca é pulada");
+      assert.equal(r.bypassed, true, "e o bypass é registrado");
+    }
+    assert.equal(b.bypassed, 20);
+    assert.equal(b.skipped, 0, "nenhuma saída entra em `skipped`");
+  });
+
+  await test("withBudget: FUNDO não espera nada (cede a cota ao caminho quente)", async () => {
+    const { RateBudget, withBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const b = new RateBudget({ name: "bg", limit: 1, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(), true);
+    let slept = false;
+    const r = await withBudget(b, async () => "mediria", {
+      priority: "background",
+      maxWaitMs: 5000,
+      sleep: async () => {
+        slept = true;
+      },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(slept, false, "fundo não pode consumir tempo do processo esperando cota");
+  });
+
+  await test("presets: todo teto tem ORIGEM declarada e valor positivo", async () => {
+    const { RPC_PROFILES, MARKET_BUDGET_SPECS, buildBudgetRegistry } = await import("../src/rateBudget.js");
+    for (const [name, spec] of Object.entries(RPC_PROFILES)) {
+      assert.ok(spec.limit > 0, `${name}: limite positivo`);
+      assert.ok(/helius|alchemy|quicknode|syndica|público|public/i.test(spec.source), `${name}: origem citada`);
+    }
+    for (const [name, spec] of Object.entries(MARKET_BUDGET_SPECS)) {
+      assert.ok(spec.limit > 0, `${name}: limite positivo`);
+      assert.ok(spec.source.length > 20, `${name}: origem precisa ser legível, não vazia`);
+    }
+    const reg = buildBudgetRegistry({ rpcProfile: "helius" });
+    assert.equal(reg.rpc.spec.limit, RPC_PROFILES.helius.limit);
+    const snap = reg.snapshot();
+    assert.equal(snap.length, 5, "rpc + 4 provedores de mercado");
+  });
+
+  await test("perfil desconhecido cai em `public` (fail-safe, nunca sem teto)", async () => {
+    const { buildBudgetRegistry, RPC_PROFILES } = await import("../src/rateBudget.js");
+    const reg = buildBudgetRegistry({ rpcProfile: "provedor-que-nao-existe" });
+    assert.equal(reg.rpc.spec.limit, RPC_PROFILES.public.limit);
+    assert.ok(/público|public/i.test(reg.rpc.spec.source));
+  });
+
+  await test("orçamento desligado: continua CONTANDO o volume (não vira ponto cego)", async () => {
+    const { buildBudgetRegistry } = await import("../src/rateBudget.js");
+    const reg = buildBudgetRegistry({ disabled: true });
+    for (let i = 0; i < 50; i++) reg.rpc.tryAcquire();
+    assert.equal(reg.rpc.snapshot().accepted, 50);
+    assert.ok(/DESLIGADO/.test(reg.rpc.spec.source), "a origem precisa dizer que o teto está desligado");
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

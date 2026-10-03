@@ -71,6 +71,7 @@ import {
   resolveSendOptions,
   type HotPathStats,
 } from "./src/hotPath.js";
+import { buildBudgetRegistry, withBudget } from "./src/rateBudget.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
 import { compareStrategies, DEFAULT_STRATEGIES } from "./src/replay.js";
 import bs58 from "bs58";
@@ -233,6 +234,11 @@ app.get("/api/health", (_req, res) => {
           hotPath: detection.hotPath,
         }
       : null,
+    /**
+     * Resumo de cotas: quem opera em plano gratuito precisa ver isto ANTES de culpar o mercado.
+     * `skipped > 0` no dexscreener, por exemplo, significa "faltou dado por cota".
+     */
+    budgets: budgets.resumo(),
     detectionNote:
       "connected=true apenas indica que as subscrições de logs foram ACEITAS pelo RPC. " +
       "A prova de que a detecção funciona é `eventCount` crescendo — não o log de boot.",
@@ -404,10 +410,25 @@ const chaosState: { [nodeId: string]: { status?: string; latency?: number; slotL
  * Carga do provedor e perda de pacote NÃO são mensuráveis via JSON-RPC HTTP.
  * Antes eram inventados; agora são reportados como 0/desconhecidos em `metricsSource`.
  */
+let rpcMeasureSkippedByBudget = 0;
+
 async function measureRpcNode(node: RpcNode): Promise<void> {
   const metrics = rpcMetrics[node.id];
   if (!metrics || isPlaceholderRpcUrl(node.url)) {
     if (metrics) metrics.consecutiveFailures++;
+    return;
+  }
+
+  /**
+   * TELEMETRIA CEDE A COTA (prioridade `background`).
+   *
+   * No plano gratuito, medir RTT de vários nós a cada 5 s consome a MESMA cota que o
+   * enriquecimento de lançamentos. Se o orçamento estourou, a medição é ADIADA — e o adiamento
+   * é contado (`rpcMeasureSkippedByBudget`), para não confundir "RPC lento" com "não medimos".
+   */
+  if (!budgets.rpc.tryAcquire()) {
+    budgets.rpc.skipped++;
+    rpcMeasureSkippedByBudget++;
     return;
   }
 
@@ -626,6 +647,27 @@ const hotPathInFlight = new InFlightMints();
  */
 /** Instante de boot do processo — base para uptime medido (nunca estimado). */
 const processStartAt = Date.now();
+
+/**
+ * ORÇAMENTOS DE COTA (camada GRATUITA).
+ *
+ * O plano gratuito não falha por latência: falha por `429`. E o padrão de falha é perverso —
+ * o polling de fundo consome a cota e o erro aparece justamente durante um lançamento, quando
+ * a decisão depende daquele dado. Aqui cada provedor tem teto baseado no limite PUBLICADO
+ * (ver `src/rateBudget.ts`) e as chamadas de SAÍDA têm precedência sobre as de FUNDO.
+ */
+const budgets = buildBudgetRegistry({
+  rpcProfile: process.env.HFT_RPC_PROFILE,
+  disabled: process.env.HFT_BUDGET_DISABLED === "1",
+});
+/** Perfil de RPC efetivo (para o operador saber QUAL teto está valendo). */
+const HFT_RPC_PROFILE_EFETIVO = (process.env.HFT_RPC_PROFILE || "public").toLowerCase();
+if (process.env.HFT_BUDGET_DISABLED === "1") {
+  console.warn(
+    "[Cota] HFT_BUDGET_DISABLED=1 — orçamentos DESLIGADOS. Em plano gratuito isto troca uma " +
+      "falha previsível (sinal pulado e contado) por 429 no meio do lançamento."
+  );
+}
 
 const sendPolicy = resolveSendOptions({
   preSimulated: true,
@@ -1077,6 +1119,17 @@ app.get("/api/system-truth", (_req, res) => {
       "Nada de execução on-chain existe enquanto o caminho de entrada real não estiver implementado.",
     realSources,
     simulatedEndpoints,
+    budgets: {
+      perfilRpc: HFT_RPC_PROFILE_EFETIVO,
+      desligado: process.env.HFT_BUDGET_DISABLED === "1",
+      rpcMeasureSkippedByBudget,
+      snapshot: budgets.snapshot(),
+      note:
+        "Teto de chamadas por provedor (janela deslizante) baseado no limite PUBLICADO da camada " +
+        "gratuita — a origem de cada número está em `source`. `skipped` = chamada NÃO feita por falta " +
+        "de cota (pular com número é melhor que tomar 429 no meio de um lançamento). `bypassed` = " +
+        "chamada de SAÍDA executada acima da cota de propósito: reduzir risco não depende de cota.",
+    },
     hotPath: {
       deepFilterBudgetMs: DEEP_FILTER_BUDGET_MS,
       inFlightMints: hotPathInFlight.size(),
@@ -1309,12 +1362,22 @@ app.post("/api/positions/close", async (req, res) => {
         // proteção de capital do sistema e apontava para um endpoint morto. Agora usa o
         // cliente único (host configurável por JUPITER_BASE_URL, header x-api-key quando
         // houver chave, timeout e falha dura quando o host devolve HTML em vez de JSON).
-        quoteData = await JupiterIntegration.getQuote(
-          pos.mint,
-          "So11111111111111111111111111111111111111112",
-          rawAmount,
-          currentSlippageBps
+        // Saída: mesma prioridade — cota não bloqueia fechamento.
+        const exitQuoteCall = await withBudget(
+          budgets.jupiter,
+          () =>
+            JupiterIntegration.getQuote(
+              pos.mint,
+              "So11111111111111111111111111111111111111112",
+              rawAmount,
+              currentSlippageBps
+            ),
+          { priority: "exit" }
         );
+        if (!exitQuoteCall.ok) {
+          throw new Error(exitQuoteCall.skippedReason ?? "cotação de saída bloqueada por orçamento");
+        }
+        quoteData = exitQuoteCall.value;
 
         let transaction: VersionedTransaction;
         let blockhash: string;
@@ -2937,10 +3000,18 @@ async function fetchRealOnChainTokenData(tokenMint: string, tokenName?: string):
 
   // 2. Mercado: DexScreener, escolhendo o par de MAIOR liquidez.
   try {
-    const dexRes = await fetch(`${DEXSCREENER_BASE_URL}/tokens/${tokenMint}`, {
-      signal: AbortSignal.timeout(6000),
-    });
-    if (dexRes.ok) {
+    /**
+     * COTA (DexScreener: 300 req/min). Se o minuto já foi consumido, espera-se até 250 ms;
+     * sem vaga, a chamada é PULADA e contabilizada — a decisão segue com o que existe, e o
+     * contador mostra que faltou dado por COTA, não que o mercado estava vazio.
+     */
+    const dexCall = await withBudget(
+      budgets.dexscreener,
+      () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${tokenMint}`, { signal: AbortSignal.timeout(6000) }),
+      { maxWaitMs: 250 }
+    );
+    const dexRes = dexCall.value;
+    if (dexRes?.ok) {
       const dexData = await dexRes.json();
       const solPairs = Array.isArray(dexData?.pairs)
         ? dexData.pairs.filter((p: any) => p.chainId === "solana")
@@ -2964,7 +3035,9 @@ async function fetchRealOnChainTokenData(tokenMint: string, tokenName?: string):
       }
     } else {
       missingChecks.push("consulta DexScreener");
-      evidence.market = `HTTP ${dexRes.status}`;
+      evidence.market = dexRes
+        ? `HTTP ${dexRes.status}`
+        : `chamada não feita — cota do minuto esgotada (contabilizado em budgets.dexscreener.skipped)`;
     }
   } catch (err: any) {
     missingChecks.push("consulta DexScreener");
@@ -3833,10 +3906,15 @@ async function fetchReferenceMarketPrice(
 ): Promise<{ priceSol: number; source: string; liquidityUsd: number; fetchedAt: number } | null> {
   if (!isValidPubkey(mint)) return null;
   try {
-    const res = await fetch(`${DEXSCREENER_BASE_URL}/tokens/${mint}`, {
-      signal: AbortSignal.timeout(6000),
-    });
-    if (!res.ok) return null;
+    // Mesma política de cota do filtro profundo (ver comentário lá): sem vaga em 250 ms, o
+    // preço de referência é declarado AUSENTE e a entrada paper é recusada — nunca inventada.
+    const dexCall = await withBudget(
+      budgets.dexscreener,
+      () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${mint}`, { signal: AbortSignal.timeout(6000) }),
+      { maxWaitMs: 250 }
+    );
+    const res = dexCall.value;
+    if (!res || !res.ok) return null;
     const data = await res.json();
     const pairs = Array.isArray(data?.pairs)
       ? data.pairs.filter((p: any) => p.chainId === "solana" && typeof p.priceNative === "string")
@@ -4584,8 +4662,19 @@ async function startAutonomousPositionManager(): Promise<void> {
         if (!isMockMint) {
           // Attempt 1: DexScreener (host vem da configuração, não hardcoded)
           try {
-            const dexRes = await fetch(`${DEXSCREENER_BASE_URL}/tokens/${pos.mint}`);
-            if (dexRes.ok) {
+            /**
+             * PRIORIDADE DE SAÍDA: este preço alimenta stop-loss/take-profit. Posição sem
+             * telemetria é posição sem gestão de risco — bloquear isso por cota trocaria risco
+             * de mercado por risco de infraestrutura. Sem vaga, a chamada passa mesmo assim e o
+             * excesso é CONTADO (`bypassed`).
+             */
+            const dexCall = await withBudget(
+              budgets.dexscreener,
+              () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${pos.mint}`),
+              { priority: "exit" }
+            );
+            const dexRes = dexCall.value;
+            if (dexRes?.ok) {
               const dexData = await dexRes.json();
               if (dexData && dexData.pairs && dexData.pairs.length > 0) {
                 const solPairs = dexData.pairs.filter((p: any) => p.chainId === "solana");
@@ -4611,13 +4700,20 @@ async function startAutonomousPositionManager(): Promise<void> {
             } else {
               try {
                 const oneTokenRaw = Math.pow(10, decimals);
-                const q = await JupiterIntegration.getQuote(
-                  pos.mint,
-                  "So11111111111111111111111111111111111111112",
-                  oneTokenRaw,
-                  100
+                // Fallback de preço para a gestão de risco: mesma prioridade de SAÍDA.
+                const jupCall = await withBudget(
+                  budgets.jupiter,
+                  () =>
+                    JupiterIntegration.getQuote(
+                      pos.mint,
+                      "So11111111111111111111111111111111111111112",
+                      oneTokenRaw,
+                      100
+                    ),
+                  { priority: "exit" }
                 );
-                const solPerToken = parseFloat(q.outAmount) / 1e9;
+                const q = jupCall.value;
+                const solPerToken = q ? parseFloat(q.outAmount) / 1e9 : Number.NaN;
                 if (Number.isFinite(solPerToken) && solPerToken > 0) {
                   currentPriceSol = solPerToken;
                   priceSource = `Jupiter Quote API (${decimals} decimais)`;
@@ -4810,11 +4906,24 @@ async function fetchJupiterQuoteWithRetry(
   slippageBps: number,
   retries = 2
 ): Promise<any> {
-  return withRetry(
-    "Jupiter quote",
-    () => JupiterIntegration.getQuote(inputMint, outputMint, amountLamports, slippageBps),
-    retries
+  /**
+   * Esta função só é usada no caminho de SAÍDA (fechar posição). Portanto: prioridade de
+   * saída — cota esgotada não pode impedir reduzir risco; o bypass aparece em `bypassed`.
+   */
+  const call = await withBudget(
+    budgets.jupiter,
+    () =>
+      withRetry(
+        "Jupiter quote",
+        () => JupiterIntegration.getQuote(inputMint, outputMint, amountLamports, slippageBps),
+        retries
+      ),
+    { priority: "exit" }
   );
+  if (!call.ok) {
+    throw new Error(call.skippedReason ?? "cotação bloqueada por orçamento de cota");
+  }
+  return call.value;
 }
 
 /** Construção da transação de swap com retry (não assina, não envia). */

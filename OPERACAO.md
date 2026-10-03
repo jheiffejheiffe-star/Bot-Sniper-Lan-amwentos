@@ -46,6 +46,10 @@ npm run lint
 npm run test                 # 86 testes de segurança/regressão
 
 # 4. PROVA DE FUNCIONAMENTO no SEU ambiente (read-only: nada é assinado/enviado)
+> **Plano gratuito:** para rodar tudo com camadas gratuitas (RPC/mercado/execução),
+> siga `GRATIS.md` e meça a sua rede com `npm run free:check` — ele imprime p50/p95 do RPC,
+> notificações do WebSocket, latência de DexScreener/Jupiter/Jito e os tetos de cota aplicados.
+
 npm run smoke                # --quick pula os estágios de rede mais lentos
 
 # 5. verificação de endpoints (RPC, programas on-chain, Jito, Jupiter)
