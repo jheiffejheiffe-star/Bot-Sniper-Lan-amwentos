@@ -1650,3 +1650,113 @@ o endpoint **declare** `simulated: true` e que o slot venha de `rpcMetrics[].las
 - `HFT_RPC_PROFILE` continua sendo **declaração** do operador: a guarda verifica **coerência**
   (perfil × host), não a cota contratada. Cota real se confere no painel do provedor.
 - Nada muda em PAPER/SHADOW, quarentena ou no gate de entrada — entrada real (S6) segue não autorizada.
+
+## Adendo 15 — S6: entrada real on-chain, com canário de 0,01 SOL e travas declaradas (2026-10-03)
+
+Autorização: *"S6 OK, autorizado"*. O S6 era, desde o Adendo 9, o item que **exige capital**
+(nenhum tier gratuito paga taxa de rede ou tip). Ele estava descrito como "entrada real por IDL,
+com canary de 0,01 SOL". Este adendo registra o que foi implementado, **o que NÃO foi** e por quê.
+
+### 1. Uma correção de premissa antes de escrever código
+
+A formulação original do S6 dizia "entrada real **por IDL**". Ao levantar o estado real do
+programa do pump.fun antes de implementar, o IDL público (`pump-fun/pump-public-docs`) mostrou um
+layout **que mudou de novo**: além de `fee_config`/`fee_program` (índices 14/15 no buy) e dos dois
+`volume_accumulator` (12/13), há instruções novas (`init_user_volume_accumulator`,
+`sync_user_volume_accumulator`), o `global_volume_accumulator` deixou de exigir writable, e a
+documentação mais recente afirma que `user_volume_accumulator` passou a ser **obrigatório para
+compras e vendas**. O IDL também já traz `quote_mint`/`add_quote_mint` (suporte a outros ativos de
+cotação), o que indica mudança de programa em curso.
+
+Montar bytes de instrução "de cabeça" contra um alvo que muda é a forma mais garantida de queimar
+taxa e perder a oportunidade — e o próprio código deste repositório já havia decidido isso
+(`NATIVE_BUILDER_DISABLED`, achado C4). **Decisão tomada, e ela é a parte mais importante deste
+adendo: o caminho real de entrada usa o AGREGADOR (Jupiter), cuja instrução é construída e mantida
+por quem opera o programa, e o builder nativo por IDL vira a etapa S6b (otimização de latência),
+com o IDL fixado por hash + dry-run em devnet antes de valer dinheiro.** Correção antes de latência
+— a ordem de prioridades declarada neste projeto.
+
+### 2. `src/realEntry.ts` (novo) — o caminho de entrada, com o perigo isolado
+
+- **O módulo não tem acesso a chave.** Não importa `@solana/web3.js`, `security`, `telemetry` nem
+  toca `process.env`: todo efeito externo é injetado. Assinar+enviar é **uma** capacidade
+  (`signAndSubmit`), e o teste [24] varre o arquivo e falha se `Keypair`,
+  `OPERATIONAL_PRIVATE_KEY`, `executeWithDecryptedKeypair` ou `sendTransaction` aparecerem ali.
+- **Ordem das operações (cada uma com tempo medido):** gate puro → barreira de assinatura →
+  cotação SOL→mint → construção → **pré-flight obrigatório** → blockhash monitorado → assinar+enviar
+  → confirmar → ler o fill.
+- **A cotação de ENTRADA é SOL → mint.** A inversão (mint → SOL) não seria pega pelo pré-flight se
+  houvesse saldo: seria uma VENDA cotada como compra. Há teste de regressão específico para a ordem
+  dos argumentos, porque este erro é invisível em revisão de código.
+- **`confirmed` exige slot.** `submitted_unconfirmed` é estado próprio: o bundle foi aceito pelo
+  block engine e a doc do Jito diz que isso não garante execução. Colapsar em "sucesso" é o erro
+  que produziu PnL fabricado nesta base (Adendo 2).
+- **Fill medido da cadeia** (`parseEntryFill`): delta de `pre/postTokenBalances` do dono e do mint.
+  Transação com `meta.err` é **medição** (0 recebido), não ausência de dado. Saldo que DIMINUIU na
+  entrada é inconsistência declarada, nunca quantidade negativa "arredondada" para zero.
+- **`num()` corrigido por teste:** `Number("")` é 0 e `Number.isFinite(0)` é true — sem um caso
+  explícito de ausência, um ambiente sem `HFT_CANARY_MAX_SOL` teria teto canário **0** e sem
+  `HFT_ENTRY_SLIPPAGE_BPS` teria slippage **0** (rejeição garantida). O teste de default pegou isso.
+
+### 3. As travas (e por que cada uma existe)
+
+| Trava | Variável / regra | Efeito |
+|---|---|---|
+| Caminho ligado | `HFT_REAL_ENTRY_ENABLED=1` | default DESLIGADO; sem ela, `ENTRY_PATH_DISABLED` |
+| Modo | `RUNTIME_MODE=LIVE` + `LIVE_TRADING_ENABLED=true` | as duas declarações que já existiam |
+| Autonomia | `HFT_AUTONOMOUS_ENTRY=1` | sem ela, só `POST /api/real-entry` (operador no comando) |
+| Teto canário | `HFT_CANARY_MAX_SOL` (default **0,01 SOL**) | TETO DURO por entrada, conferido no gate |
+| Uma tentativa | `HFT_CANARY_ONE_ENTRY=1` (default) | consome a tentativa só quem **assinou** (`countLandedEntryAttempts`) |
+| Impacto | `HFT_ENTRY_MAX_PRICE_IMPACT_BPS` (default 1500 = 15%) | recusa antes de construir |
+| Slippage | `HFT_ENTRY_SLIPPAGE_BPS` (default 300) | vai NA INSTRUÇÃO: a AMM rejeita fora da banda |
+| Tip | `MAX_TIP_BPS` (default 50 bps do capital) | tip clamp que já existia, agora aplicado à entrada |
+| Pré-flight | `HFT_ENTRY_REQUIRE_PREFLIGHT=1` (default) | nenhuma taxa gasta para descobrir o que a simulação diria |
+| Exposição | `MAX_TOTAL_EXPOSURE_SOL` | soma das posições abertas + esta entrada |
+
+A regra de consumo do canário é uma decisão de operação, não um detalhe: **falha antes de assinar
+(cotação, construção, simulação, blockhash) não consome a tentativa**, porque não tocou a cadeia.
+Sem isso, uma oscilação de rede bloquearia o canário até alguém editar o banco à mão.
+
+### 4. Fiação no servidor
+
+- O bloco que **recusava** entrada em LIVE ("entrada on-chain não está implementada") virou o
+  caminho real: `runRealEntry` é chamado pelo pipeline quando o modo é LIVE, e só registra posição
+  com slot observado. Contadores e motivos vão para o log com componente próprio `REAL_ENTRY`.
+- **Intenção persistida antes de assinar** (`createExecutionIntent`/`advanceIntentOrKeep`), com
+  `blockhash` + `lastValidBlockHeight`: sem prova de expiração, a política de retry não autoriza
+  reconstruir — e a trava de voo único impede uma segunda compra.
+- **`POST /api/real-entry`** (canário manual, autenticado por `x-admin-token`) e **`GET /api/real-entry`**
+  (política vigente + prontidão + resultados). O painel `/api/system-truth` ganhou o bloco
+  `realEntry` com `wouldEnterNow` e os códigos que bloqueiam AGORA, e `summary.liveExecutionPath`
+  deixou de dizer "não implementado" para dizer o estado real — o teste que exigia a frase antiga
+  foi **substituído por asserções mais específicas** (estado + `wouldEnterNow`), não enfraquecido.
+
+### 5. Evidências (medidas, não declaradas)
+
+`npm run lint` → 0 erros · `npm run test` → **195/195** (eram 175; grupo [24] com 20 testes) ·
+`npm run build` → ok.
+
+Boot e rota, verificados de verdade:
+
+| Cenário | Resultado observado |
+|---|---|
+| PAPER, caminho desligado (default) | `POST /api/real-entry` → 409, código `ENTRY_PATH_DISABLED` + `MODE_NOT_LIVE` |
+| `/api/system-truth` | `liveExecutionPath="implementado mas DESLIGADO (modo PAPER…)"`; `realEntry.blockingCodes=[ENTRY_PATH_DISABLED, AUTONOMOUS_ENTRY_DISABLED, MODE_NOT_LIVE]` |
+| LIVE + 3 declarações, 0,01 SOL | gate **abre**; pipeline avança até a cotação; sem egress no sandbox → `quote_failed: fetch failed` com **`signature: null`** (falhou antes de assinar) |
+| Mesma tentativa repetida | permitida de novo: falha pré-assinatura **não** consumiu o canário |
+| 0,5 SOL (50× o teto) | 409, `CANARY_CAP_EXCEEDED` — o teto é duro |
+
+### 6. O que continua aberto (e continua exigindo decisão)
+
+- **Rota é o agregador.** Latência maior que um builder nativo; S6b (IDL fixado + hash + dry-run em
+  devnet) é a próxima otimização — não implementada aqui de propósito.
+- **Primeira entrada real exige o VPS do operador**: este sandbox não tem egress, então a evidência
+  acima termina em `quote_failed`, não em fill. O primeiro canário de verdade precisa: chave
+  operacional dedicada com ≥ 0,02 SOL (0,01 de entrada + taxa/tip/rent da ATA), `RPC_ENDPOINT` real,
+  `RPC_WEBSOCKET` real e `ADMIN_TOKEN`.
+- **Custo mínimo não é zero**: taxa de rede, priority fee, tip Jito (mínimo 1.000 lamports) e rent da
+  ATA (~0,002 SOL) são gastos reais — nenhum tier gratuito cobre isso, e é por isso que o S6 estava
+  bloqueado até aqui.
+- **`3 declarações` não é burocracia**: cada uma responde a uma pergunta diferente (posso operar?
+  estou em modo real? deve ENTRAR agora?). Um único booleano respondendo às três é como se produz
+  um modo paper que assina.

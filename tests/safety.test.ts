@@ -1877,9 +1877,28 @@ async function main(): Promise<void> {
         `o painel simulado ${path_} precisa aparecer na declaração de veracidade`
       );
     }
+    /**
+     * ATUALIZADO EM S6 (autorizado em 2026-10-03). A asserção anterior exigia a string
+     * "não implementado" — ela era VERDADEIRA até o S6 e deixou de ser: o caminho de entrada
+     * real existe agora. Trocar a asserção por uma mais FRACA ("existe alguma menção")
+     * seria rebaixar o teste; o que se exige agora é mais forte e mais específico:
+     *   - a declaração precisa continuar existindo (`liveExecutionPath`), e
+     *   - precisa dizer o ESTADO real (habilitado × desligado), não uma frase fixa, e
+     *   - o bloco `realEntry` precisa expor os códigos que bloqueiam entrada AGORA.
+     * Assim, ou o caminho é declarado desligado (hoje), ou é declarado habilitado — nunca
+     * "não implementado" quando implementado, nem "habilitado" quando bloqueado.
+     */
     assert.ok(
-      serverSrc.includes("liveExecutionPath") && /não implementado/.test(serverSrc),
-      "o endpoint precisa declarar que o caminho de execução real não existe hoje"
+      serverSrc.includes("liveExecutionPath"),
+      "o endpoint precisa continuar declarando o estado do caminho de execução real"
+    );
+    assert.ok(
+      /liveExecutionPath:[\s\S]{0,900}HFT_REAL_ENTRY_ENABLED/.test(serverSrc),
+      "o estado declarado precisa vir da política real (HFT_REAL_ENTRY_ENABLED), não de frase fixa"
+    );
+    assert.ok(
+      /realEntry: \(\(\) => \{[\s\S]{0,700}wouldEnterNow/.test(serverSrc),
+      "o painel de veracidade precisa dizer se uma entrada real passaria AGORA (wouldEnterNow)"
     );
   });
 
@@ -3689,6 +3708,342 @@ async function main(): Promise<void> {
     assert.equal(/ShredStream co-localizado|Canal Elite ativo/.test(ui), false, "canal inventado não pode voltar");
     assert.ok(/\/api\/rpc-nodes/.test(ui) && /\/api\/health/.test(ui) && /blockhash/.test(ui), "as checagens precisam ser reais");
     assert.ok(/declaração não é medição|NÃO mede a posição física/.test(ui), "declaração e medição precisam estar separadas na tela");
+  });
+
+  // ── Helpers do grupo [24]: dublês de rede/cofre. O orquestrador testado é o MESMO do
+  //    servidor; só as capacidades externas são substituídas. ────────────────────────────
+  const MINT_FAKE = "So11111111111111111111111111111111111111112";
+  const OWNER_FAKE = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+  const policyFake = {
+    enabled: true, autonomous: true, canaryMaxSol: 0.01, canaryOneEntry: true,
+    slippageBps: 300, maxPriceImpactBps: 1500, requirePreflight: true, maxTipBps: 50,
+    maxTotalExposureSol: 0,
+  } as any;
+  const allowedGate = (re: any) =>
+    re.assessEntryGate({ policy: policyFake, mode: "LIVE", liveAuthorized: true, mint: MINT_FAKE, sizeSol: 0.01 });
+  const entryRequest = (over: any = {}) => ({
+    mint: MINT_FAKE,
+    sizeSol: 0.01,
+    userPublicKey: OWNER_FAKE,
+    policy: policyFake,
+    gate: over.gate,
+    confirmTimeoutMs: 100,
+  } as any);
+  const fakeEntryDeps = (over: any = {}): any => ({
+    assertCanSign: over.assertCanSign ?? (() => {}),
+    getQuote: async () => {
+      over.onQuote?.();
+      return over.quote ?? { outAmount: "1000000000", priceImpactPct: "0.0123", routeLabels: ["pump.fun"] };
+    },
+    buildSwapTransaction: async () => {
+      over.onBuild?.();
+      return { fakeTx: true };
+    },
+    simulateTransaction: over.simulate ?? (async () => ({ ok: true, err: null, unitsConsumed: 120_000, logsTail: ["Program log: ok"] })),
+    getFreshBlockhash: async () => over.blockhash ?? { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 999_999 },
+    signAndSubmit: async () => {
+      over.onSign?.();
+      return over.submit ?? { ok: true, signature: "5" + "x".repeat(63), bundleId: "bundle_fake", tipSol: 0.0005 };
+    },
+    confirm: over.confirm ?? (async () => ({ outcome: "confirmed", slot: 123_456_789 })),
+    observeFill: over.observeFill ?? (async () => ({ measured: true, tokensReceived: "1000000000", feeLamports: 5000, slot: 123_456_789 })),
+    now: () => 0,
+  });
+
+  // [24] S6 — ENTRADA REAL: gates, orquestração e leitura de fill
+  console.log("\n[24] Entrada real (S6): travas, pré-flight e fill medido");
+
+  await test("política de entrada real é fail-closed por padrão (nenhuma das três declarações)", async () => {
+    const re = await import("../src/realEntry.js");
+    const policy = re.resolveRealEntryPolicy({} as any);
+    assert.equal(policy.enabled, false, "HFT_REAL_ENTRY_ENABLED ausente NÃO pode habilitar entrada real");
+    assert.equal(policy.autonomous, false, "entrada automática precisa de declaração própria");
+    assert.equal(policy.canaryMaxSol, 0.01, "teto canário default é 0,01 SOL");
+    assert.equal(policy.canaryOneEntry, true, "uma entrada canário por vez por padrão");
+    assert.equal(policy.requirePreflight, true, "pré-flight é obrigatório por padrão");
+    assert.equal(policy.maxTipBps, 50, "teto de tip em bps do capital");
+    assert.equal(policy.slippageBps, 300);
+    assert.equal(policy.maxPriceImpactBps, 1500);
+  });
+
+  await test("política de entrada real respeita o ambiente declarado", async () => {
+    const re = await import("../src/realEntry.js");
+    const policy = re.resolveRealEntryPolicy({
+      HFT_REAL_ENTRY_ENABLED: "1",
+      HFT_AUTONOMOUS_ENTRY: "true",
+      HFT_CANARY_MAX_SOL: "0.05",
+      HFT_CANARY_ONE_ENTRY: "0",
+      HFT_ENTRY_SLIPPAGE_BPS: "450",
+      HFT_ENTRY_MAX_PRICE_IMPACT_BPS: "900",
+      HFT_ENTRY_REQUIRE_PREFLIGHT: "0",
+      MAX_TIP_BPS: "80",
+      MAX_TOTAL_EXPOSURE_SOL: "0.2",
+    } as any);
+    assert.equal(policy.enabled, true);
+    assert.equal(policy.autonomous, true);
+    assert.equal(policy.canaryMaxSol, 0.05);
+    assert.equal(policy.canaryOneEntry, false);
+    assert.equal(policy.slippageBps, 450);
+    assert.equal(policy.maxPriceImpactBps, 900);
+    assert.equal(policy.requirePreflight, false);
+    assert.equal(policy.maxTipBps, 80);
+    assert.equal(policy.maxTotalExposureSol, 0.2);
+  });
+
+  await test("gate de entrada bloqueia cada motivo com código próprio (nunca um 'não' genérico)", async () => {
+    const re = await import("../src/realEntry.js");
+    const mint = "So11111111111111111111111111111111111111112";
+    const base = {
+      policy: { ...re.REAL_ENTRY_DEFAULTS, enabled: true, autonomous: true, canaryOneEntry: true, maxTotalExposureSol: 0, maxTipBps: 50 },
+      mode: "LIVE",
+      liveAuthorized: true,
+      mint,
+      sizeSol: 0.01,
+    } as any;
+
+    const codesOf = (input: any) => re.assessEntryGate(input).issues.map((i: any) => i.code);
+
+    assert.deepEqual(codesOf({ ...base, policy: { ...base.policy, enabled: false } }), ["ENTRY_PATH_DISABLED"]);
+    assert.deepEqual(codesOf({ ...base, autonomousCall: true, policy: { ...base.policy, autonomous: false } }), ["AUTONOMOUS_ENTRY_DISABLED"]);
+    assert.ok(codesOf({ ...base, mode: "PAPER", liveAuthorized: false }).includes("MODE_NOT_LIVE"));
+    assert.ok(codesOf({ ...base, killSwitchActive: true }).includes("KILL_SWITCH"));
+    assert.ok(codesOf({ ...base, readOnlyMode: true }).includes("READ_ONLY"));
+    assert.ok(codesOf({ ...base, mint: "não-é-base58!!" }).includes("MINT_INVALID"));
+    assert.ok(codesOf({ ...base, sizeSol: 0 }).includes("SIZE_INVALID"));
+    assert.ok(codesOf({ ...base, sizeSol: 0.011 }).includes("CANARY_CAP_EXCEEDED"), "teto canário é teto DURO");
+    assert.ok(codesOf({ ...base, realEntriesDone: 1 }).includes("CANARY_ALREADY_USED"));
+    assert.ok(codesOf({ ...base, policy: { ...base.policy, maxTotalExposureSol: 0.005 } }).includes("EXPOSURE_LIMIT"));
+    assert.ok(codesOf({ ...base, hasOpenPositionForMint: true }).includes("DUPLICATE_OPEN_POSITION"));
+    assert.ok(codesOf({ ...base, maxPositionSol: 0.001 }).includes("MAX_POSITION_SOL_EXCEEDED"));
+  });
+
+  await test("gate de entrada APROVA o caso canário coerente", async () => {
+    const re = await import("../src/realEntry.js");
+    const gate = re.assessEntryGate({
+      policy: { ...re.REAL_ENTRY_DEFAULTS, enabled: true, autonomous: true, canaryOneEntry: true, maxTotalExposureSol: 0, maxTipBps: 50 },
+      mode: "LIVE",
+      liveAuthorized: true,
+      mint: "So11111111111111111111111111111111111111112",
+      sizeSol: 0.01,
+      realEntriesDone: 0,
+      openExposureSol: 0,
+    } as any);
+    assert.equal(gate.allowed, true, `esperava aprovação, veio: ${JSON.stringify(gate.issues)}`);
+    assert.equal(gate.issues.filter((i: any) => i.severity === "block").length, 0);
+  });
+
+  await test("orquestrador: pré-flight reprovado NÃO assina (a simulação descobre de graça)", async () => {
+    const re = await import("../src/realEntry.js");
+    let signed = 0;
+    let built = 0;
+    const deps = fakeEntryDeps({
+      simulate: async () => ({ ok: false, err: { message: "custom program error: 0x1771" }, logsTail: ["Program log: 6001"] }),
+      onSign: () => signed++,
+      onBuild: () => built++,
+    });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "simulation_failed");
+    assert.equal(signed, 0, "nenhuma assinatura pode existir quando a simulação reprova");
+    assert.equal(built, 1, "a transação foi construída (necessário para simular)");
+    assert.match(result.reason ?? "", /simulação REJEITOU/);
+  });
+
+  await test("orquestrador: caminho feliz confirma com SLOT e mede o fill da cadeia", async () => {
+    const re = await import("../src/realEntry.js");
+    const deps = fakeEntryDeps({});
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "confirmed");
+    assert.equal(result.confirmedOnChain, true, "confirmado exige slot observado");
+    assert.equal(result.slot, 123456789);
+    assert.equal(result.signature, "5" + "x".repeat(63));
+    assert.equal(result.tokensReceived, "1000000000", "quantidade vem do delta de postTokenBalances");
+    assert.equal(result.fillMeasured, true);
+    assert.equal(result.bundleAccepted, true, "'aceito pelo block engine' é um fato separado da execução");
+    assert.ok(result.timingsMs.total >= 0);
+    assert.equal(result.gateIssues.filter((i: any) => i.severity === "block").length, 0);
+  });
+
+  await test("orquestrador: sem slot observado o estado é submitted_unconfirmed — NUNCA confirmed", async () => {
+    const re = await import("../src/realEntry.js");
+    const deps = fakeEntryDeps({ confirm: async () => ({ outcome: "unknown" as const, error: "não observado na janela" }) });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "submitted_unconfirmed");
+    assert.equal(result.confirmedOnChain, false, "aceito ≠ executado: a regra que impediu PnL fabricado");
+    assert.ok(result.signature, "a assinatura existe e precisa ser reconciliada");
+  });
+
+  await test("orquestrador: barreira de assinatura roda ANTES de gastar cota", async () => {
+    const re = await import("../src/realEntry.js");
+    let quoted = 0;
+    const deps = fakeEntryDeps({
+      onQuote: () => quoted++,
+      assertCanSign: () => {
+        throw new Error("[Signer Guard] Modo LIVE não autoriza operação de capital.");
+      },
+    });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "signing_blocked");
+    assert.equal(quoted, 0, "se o modo não autoriza, nem a cotação deve ser pedida");
+  });
+
+  await test("orquestrador: impacto de preço acima do teto recusa ANTES de construir", async () => {
+    const re = await import("../src/realEntry.js");
+    let built = 0;
+    const deps = fakeEntryDeps({
+      quote: { outAmount: "1000", priceImpactPct: "0.30", routeLabels: ["pump"] },
+      onBuild: () => built++,
+    });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "refused");
+    assert.equal(built, 0, "comprar o próprio impacto não pode nem chegar a montar a transação");
+    assert.match(result.reason ?? "", /impacto de preço/);
+  });
+
+  await test("orquestrador: blockhash sem prova de expiração não assina", async () => {
+    const re = await import("../src/realEntry.js");
+    let signed = 0;
+    const deps = fakeEntryDeps({
+      blockhash: { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 0 },
+      onSign: () => signed++,
+    });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "submit_failed");
+    assert.equal(signed, 0, "sem lastValidBlockHeight não existe prova de expiração para decidir retry");
+  });
+
+  await test("orquestrador: gate bloqueado nem monta deps de rede", async () => {
+    const re = await import("../src/realEntry.js");
+    const gate = re.assessEntryGate({
+      policy: { ...re.REAL_ENTRY_DEFAULTS, enabled: true, autonomous: true, canaryOneEntry: true, maxTotalExposureSol: 0, maxTipBps: 50 },
+      mode: "PAPER",
+      liveAuthorized: false,
+      mint: "So11111111111111111111111111111111111111112",
+      sizeSol: 0.01,
+    } as any);
+    let quoted = 0;
+    const deps = fakeEntryDeps({ onQuote: () => quoted++ });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate }));
+    assert.equal(result.status, "refused");
+    assert.equal(quoted, 0);
+    assert.match(result.reason ?? "", /MODE_NOT_LIVE/);
+  });
+
+  await test("canário: falha ANTES de assinar não consome a tentativa (rede caindo ≠ bloqueio permanente)", async () => {
+    const re = await import("../src/realEntry.js");
+    const count = re.countLandedEntryAttempts;
+    assert.equal(count([]), 0);
+    assert.equal(count([{ mode: "paper", signature: null, status: "paper" }]), 0, "paper nunca conta");
+    assert.equal(count([{ mode: "shadow", signature: null, status: "shadow" }]), 0, "shadow nunca conta");
+    assert.equal(
+      count([{ mode: "live", signature: null, status: "rejected" }]),
+      0,
+      "falha em cotação/construção/simulação/blockhash não tocou a cadeia"
+    );
+    assert.equal(count([{ mode: "live", signature: "5abc", status: "quote_failed" }]), 1, "assinatura existe: a transação pode ter entrado");
+    assert.equal(count([{ mode: "live", signature: null, status: "confirmed" }]), 1, "confirmação registrada conta mesmo sem campo de assinatura");
+    assert.equal(
+      count([
+        { mode: "live", signature: "5a", status: "submitted_unconfirmed" },
+        { mode: "live", signature: "5b", status: "confirmed" },
+        { mode: "paper", signature: null, status: "paper" },
+      ]),
+      2
+    );
+  });
+
+  await test("leitura de fill: delta de postTokenBalances é a quantidade recebida", async () => {
+    const re = await import("../src/realEntry.js");
+    const fill = re.parseEntryFill({
+      owner: "Owner111111111111111111111111111111111111",
+      mint: "Mint11111111111111111111111111111111111111",
+      slot: 999,
+      meta: {
+        err: null,
+        fee: 5000,
+        preTokenBalances: [],
+        postTokenBalances: [
+          { owner: "Owner111111111111111111111111111111111111", mint: "Mint11111111111111111111111111111111111111", uiTokenAmount: { amount: "2500000000" } },
+        ],
+      },
+    });
+    assert.equal(fill.measured, true);
+    assert.equal(fill.tokensReceived, "2500000000");
+    assert.equal(fill.feeLamports, 5000);
+    assert.equal(fill.slot, 999);
+  });
+
+  await test("leitura de fill: transação que falhou é MEDIÇÃO (0 recebido), não ausência de dado", async () => {
+    const re = await import("../src/realEntry.js");
+    const fill = re.parseEntryFill({
+      owner: "Owner111111111111111111111111111111111111",
+      mint: "Mint11111111111111111111111111111111111111",
+      meta: { err: { InstructionError: [0, { Custom: 6001 }] }, fee: 5000, postTokenBalances: [], preTokenBalances: [] },
+    });
+    assert.equal(fill.measured, true);
+    assert.equal(fill.tokensReceived, "0");
+    assert.match(fill.error ?? "", /falhou on-chain/);
+  });
+
+  await test("leitura de fill: saldo DIMINUIU na entrada é inconsistência declarada, não silêncio", async () => {
+    const re = await import("../src/realEntry.js");
+    const owner = "Owner111111111111111111111111111111111111";
+    const mint = "Mint11111111111111111111111111111111111111";
+    const fill = re.parseEntryFill({
+      owner,
+      mint,
+      meta: {
+        fee: 5000,
+        preTokenBalances: [{ owner, mint, uiTokenAmount: { amount: "100" } }],
+        postTokenBalances: [{ owner, mint, uiTokenAmount: { amount: "10" } }],
+      },
+    });
+    assert.equal(fill.tokensReceived, "0", "nunca reportar quantidade negativa como compra");
+    assert.match(fill.error ?? "", /DIMINUIU/);
+  });
+
+  await test("leitura de fill: sem meta o resultado é 'não medido' com motivo", async () => {
+    const re = await import("../src/realEntry.js");
+    const fill = re.parseEntryFill({ owner: "a", mint: "b", meta: null });
+    assert.equal(fill.measured, false);
+    assert.equal(fill.tokensReceived, null);
+    assert.ok(fill.error && fill.error.length > 0);
+  });
+
+  await test("fiação: pipeline LIVE executa a entrada real e o gate é consultado antes", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/if \(liveTrading\) \{[\s\S]{0,900}runRealEntry\(/.test(src), "o ramo LIVE precisa chamar runRealEntry");
+    assert.equal(/entrada on-chain não está implementada/.test(src), false, "a recusa antiga não pode voltar");
+    assert.ok(/app\.post\("\/api\/real-entry"/.test(src), "a entrada real manual precisa de rota própria");
+    assert.ok(/buildEntryGateInput\(/.test(src) && /assessEntryGate\(/.test(src), "o gate puro precisa ser consultado pela fiação");
+    assert.ok(/HFT_REAL_ENTRY_ENABLED/.test(src), "a terceira declaração precisa existir no código");
+    assert.ok(/realEntry: \(\(\) => \{/.test(src), "system-truth precisa declarar o estado da entrada real");
+  });
+
+  await test("fiação: entrada cota SOL→mint (a inversão cotaria uma VENDA)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(
+      /JupiterIntegration\.getQuote\(SOL_MINT, mint,/.test(src),
+      "a cotação de ENTRADA é SOL → mint; o inverso (mint → SOL) é saída"
+    );
+  });
+
+  await test("isolamento: realEntry não tem acesso a chave nem a envio direto", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/realEntry.ts"), "utf8"));
+    for (const proibido of ["Keypair", "OPERATIONAL_PRIVATE_KEY", "executeWithDecryptedKeypair", "sendTransaction", "sendRawTransaction", "@solana/web3.js"]) {
+      assert.equal(src.includes(proibido), false, `realEntry.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(/signAndSubmit/.test(src), "assinar+enviar é capacidade INJETADA (uma só, isolada)");
+  });
+
+  await test("isolamento: as três declarações e o teto canário estão documentados no .env.example", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const env = fs.readFileSync(path.join(repoRoot, ".env.example"), "utf8");
+    for (const v of ["HFT_REAL_ENTRY_ENABLED", "HFT_AUTONOMOUS_ENTRY", "HFT_CANARY_MAX_SOL", "HFT_CANARY_ONE_ENTRY"]) {
+      assert.ok(env.includes(v), `.env.example precisa declarar ${v}`);
+    }
   });
 
   console.log("\n=========================================");

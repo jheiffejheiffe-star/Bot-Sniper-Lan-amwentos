@@ -16,6 +16,7 @@ import {
   GeyserStreamClient, 
   JupiterIntegration, 
   JitoBundleSender,
+  ConfirmationMonitor,
   isValidBase58Blockhash,
   RPC_ENDPOINT, 
   RPC_WEBSOCKET, 
@@ -34,12 +35,24 @@ import {
   type PriceQuote
 } from "./src/accounting.js";
 import {
+  assertCanSign,
   describeRuntimeMode,
   getRuntimeModeResolution,
   validateRuntimeConfiguration,
 } from "./src/runtimeMode.js";
 import { LatencyTrace, monotonicNow, telemetry, wallClockNow } from "./src/telemetry.js";
 import { simulateEntry, type ShadowEntryResult } from "./src/shadowEntry.js";
+import {
+  assessEntryGate,
+  countLandedEntryAttempts,
+  executeRealEntry,
+  parseEntryFill,
+  refusedRealEntry,
+  resolveRealEntryPolicy,
+  type EntryGateInput,
+  type RealEntryDeps,
+  type RealEntryResult,
+} from "./src/realEntry.js";
 import {
   JitoTipOracle,
   TIP_FLOOR_URL,
@@ -272,6 +285,25 @@ app.get("/api/health", (_req, res) => {
      * `skipped > 0` no dexscreener, por exemplo, significa "faltou dado por cota".
      */
     budgets: budgets.resumo(),
+    /**
+     * ENTRADA REAL (S6): o operador precisa ver, sem ler código, se o caminho real está
+     * ligado e com que teto. `readiness` é o gate completo rodando AGORA — o mesmo que
+     * recusaria uma entrada neste instante, com o motivo exato.
+     */
+    realEntry: (() => {
+      const policy = resolveRealEntryPolicy();
+      const { gateInput } = buildEntryGateInput({ mint: SOL_MINT, sizeSol: policy.canaryMaxSol, autonomousCall: true });
+      const gate = assessEntryGate(gateInput);
+      return {
+        policy,
+        autonomousGate: gate,
+        lastResults: realEntryHistory.slice(0, 5),
+        note:
+          "Entrada real exige RUNTIME_MODE=LIVE + LIVE_TRADING_ENABLED=true + HFT_REAL_ENTRY_ENABLED=1; " +
+          "o pipeline automático exige ainda HFT_AUTONOMOUS_ENTRY=1. O teto por entrada é HFT_CANARY_MAX_SOL. " +
+          "Posição só é registrada com slot on-chain observado (GET /api/real-entry).",
+      };
+    })(),
     /**
      * O perfil de cota só vale o que o endpoint conectado suporta. Este bloco diz o que foi
      * inferido do HOST (nunca da chave) e onde a declaração não bate com o conectado.
@@ -1408,9 +1440,31 @@ app.get("/api/system-truth", (_req, res) => {
     generatedAt: new Date().toISOString(),
     headline:
       "Este painel mistura MEDIÇÃO REAL com painéis SIMULADOS (RNG no servidor). " +
-      "Nada de execução on-chain existe enquanto o caminho de entrada real não estiver implementado.",
+      "O caminho de ENTRADA REAL existe desde S6, mas só sai do papel com três declarações " +
+      "(RUNTIME_MODE=LIVE + LIVE_TRADING_ENABLED=true + HFT_REAL_ENTRY_ENABLED=1) e teto canário; " +
+      "sem elas, nenhuma compra real é possível. O bloco `realEntry` abaixo diz o estado AGORA.",
     realSources,
     simulatedEndpoints,
+    /**
+     * Estado da entrada real — a pergunta "este bot pode gastar agora?" precisa de resposta
+     * direta aqui, no painel de veracidade, e não só em /api/real-entry.
+     */
+    realEntry: (() => {
+      const policy = resolveRealEntryPolicy();
+      const { gateInput } = buildEntryGateInput({ mint: SOL_MINT, sizeSol: policy.canaryMaxSol, autonomousCall: true });
+      const gate = assessEntryGate(gateInput);
+      return {
+        enabled: policy.enabled,
+        autonomous: policy.autonomous,
+        canaryMaxSol: policy.canaryMaxSol,
+        wouldEnterNow: gate.allowed,
+        blockingCodes: gate.issues.filter((i) => i.severity === "block").map((i) => i.code),
+        note:
+          "`wouldEnterNow=false` significa que uma entrada real seria recusada neste instante. " +
+          "O caminho assina com pré-flight obrigatório, intenção persistida antes de assinar e " +
+          "posição só registrada com slot on-chain observado.",
+      };
+    })(),
     budgets: {
       perfilRpc: HFT_RPC_PROFILE_EFETIVO,
       desligado: process.env.HFT_BUDGET_DISABLED === "1",
@@ -1446,7 +1500,15 @@ app.get("/api/system-truth", (_req, res) => {
     summary: {
       realSources: realSources.filter((s) => s.status === "real").length,
       simulatedEndpoints: simulatedEndpoints.length,
-      liveExecutionPath: "não implementado (LaunchSwapper desabilitado) — nenhuma compra real é possível hoje",
+      liveExecutionPath: (() => {
+        const policy = resolveRealEntryPolicy();
+        const res = getRuntimeModeResolution();
+        return policy.enabled && res.liveAuthorized
+          ? `implementado e HABILITADO (canary ≤ ${policy.canaryMaxSol} SOL por entrada; rota Jupiter→Jito; ` +
+            `o builder nativo por IDL é otimização de latência ainda não implementada)`
+          : `implementado mas DESLIGADO (modo ${res.mode}, HFT_REAL_ENTRY_ENABLED=${policy.enabled ? "1" : "0"}) ` +
+            `— nenhuma compra real acontece neste estado`;
+      })(),
     },
   });
 });
@@ -4159,17 +4221,38 @@ Respond in a short, scannable JSON object with these keys:
   const liveTrading = isLiveTradingEnabled();
 
   if (liveTrading) {
-    dbStore.saveLog({
-      timestamp: new Date().toISOString(),
-      level: "CRITICAL",
-      component: "JITO_BUNDLE",
-      message:
-        `[Daemon] LIVE_TRADING_ENABLED=true, mas a execução de ENTRADA on-chain não está implementada ` +
-        `e verificada neste código (sem testes de fill real, sem política de tip/CU validada em mainnet). ` +
-        `O sistema RECUSA simular um fill para não gerar PnL fictício. Rota pretendida: ${routeHint}. ` +
-        `Implemente e teste o caminho de compra antes de habilitar capital real.`,
+    /**
+     * S6 (autorizado em 2026-10-03): aqui ficava a RECUSA — "entrada on-chain não está
+     * implementada; não vou simular um fill". A recusa foi substituída pelo caminho real,
+     * que continua sendo incapaz de "simular um fill": `runRealEntry` só registra posição
+     * quando OBSERVA slot on-chain. O que mudou é que agora, com as três declarações
+     * (LIVE + flag + HFT_REAL_ENTRY_ENABLED), existe tentativa real — com teto canário,
+     * pré-flight obrigatório e intenção persistida antes de assinar.
+     */
+    const realResult = await runRealEntry({
+      mint: tokenMint,
+      tokenName,
+      sizeSol: tradingSolAmount,
+      autonomousCall: true,
       correlationId,
     });
+
+    if (realResult.status !== "confirmed") {
+      reportSignalRejected(`entrada real: ${realResult.status}`);
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "WARN",
+        component: "REAL_ENTRY",
+        message:
+          `[Daemon S6] ${tokenName.toUpperCase()} — entrada real não confirmada (${realResult.status}). ` +
+          `${realResult.reason ?? ""} Rota pretendida: ${routeHint}.`,
+        correlationId,
+      });
+      hotPathInFlight.release(tokenMint);
+      return;
+    }
+
+    reportSignalAccepted();
     hotPathInFlight.release(tokenMint);
     return;
   }
@@ -4554,6 +4637,429 @@ async function runShadowEntry(mint: string, sizeSol: number, tokenName: string):
     correlationId: `corr_shadow_${mint.slice(0, 8)}_${Date.now()}`,
   });
 }
+
+// ============================================================================
+// S6 — ENTRADA REAL (autorizada em 2026-10-03) — CANARY DE 0,01 SOL
+// ============================================================================
+//
+// O que mudou em relação ao bloco anterior: em vez de RECUSAR quando LIVE está ligado,
+// este código executa a entrada com travas explícitas. As travas, em ordem de efeito:
+//
+//   1. TERCEIRA DECLARAÇÃO: `HFT_REAL_ENTRY_ENABLED=1`. RUNTIME_MODE=LIVE +
+//      LIVE_TRADING_ENABLED=true continuam sendo as duas primeiras — nenhuma delas liga
+//      entrada real sozinha, e esta terceira é específica de ENTRADA (saída não depende dela).
+//   2. TETO CANÁRIO: `HFT_CANARY_MAX_SOL` (default 0,01 SOL) é teto DURO por entrada.
+//   3. UMA ENTRADA: `HFT_CANARY_ONE_ENTRY=1` (default) — o canário roda e PARA.
+//   4. AUTONOMIA SEPARADA: o pipeline automático só entra com `HFT_AUTONOMOUS_ENTRY=1`.
+//      Sem ela, entrada real só por POST /api/real-entry (operador no comando).
+//   5. PRÉ-FLIGHT OBRIGATÓRIO: simulação antes de assinar (o gasto de descobrir um erro
+//      de instrução é a própria taxa; a simulação descobre de graça).
+//   6. INTENÇÃO PERSISTIDA ANTES DE ASSINAR: sobrevive a crash e impede segunda compra.
+//
+// O que este bloco NÃO faz: não monta instrução nativa do pump.fun "de cabeça". A rota é o
+// agregador (Jupiter), cuja instrução é construída e mantida por quem opera o programa. O
+// builder nativo por IDL é otimização de latência (S6b) e exige o IDL fixado + dry-run em
+// devnet; sem isso, seria trocar latência por risco de queimar taxa com layout vencido.
+
+const realEntryHistory: RealEntryResult[] = [];
+const MAX_REAL_ENTRY_HISTORY = 20;
+
+/** Estado que o gate precisa conhecer, lido do banco — nunca de contadores de tela. */
+function collectRealEntryState(mint: string) {
+  const positions = dbStore.getPositions();
+  const openReal = positions.filter(
+    (p: any) => p.mode !== "paper" && (p.status === "open" || p.status === "exit_pending" || !p.status)
+  );
+  /**
+   * Tentativas que PODERIAM ter executado (assinatura existiu). Falha antes de assinar não
+   * consome o canário — ver `countLandedEntryAttempts` em src/realEntry.ts.
+   */
+  const realTrades = dbStore
+    .getTrades()
+    .filter((t: any) => t.mode !== "paper" && t.mode !== "shadow");
+  return {
+    openReal,
+    openExposureSol: openReal.reduce((acc: number, p: any) => acc + (Number(p.sizeSol) || 0), 0),
+    realEntriesDone: countLandedEntryAttempts(realTrades as any[]),
+    hasOpenPositionForMint: openReal.some((p: any) => p.mint === mint),
+  };
+}
+
+function buildEntryGateInput(params: {
+  mint: string;
+  sizeSol: number;
+  autonomousCall: boolean;
+}): { gateInput: EntryGateInput; policy: ReturnType<typeof resolveRealEntryPolicy> } {
+  const policy = resolveRealEntryPolicy();
+  const res = getRuntimeModeResolution();
+  const sec = getOperationalSecurityState();
+  const state = collectRealEntryState(params.mint);
+  const maxPositionSol = Number(process.env.MAX_POSITION_SOL ?? 0);
+
+  return {
+    policy,
+    gateInput: {
+      policy,
+      mode: res.mode,
+      liveAuthorized: res.liveAuthorized,
+      killSwitchActive: sec.killSwitchActive,
+      readOnlyMode: sec.readOnlyMode,
+      autonomousCall: params.autonomousCall,
+      mint: params.mint,
+      sizeSol: params.sizeSol,
+      maxPositionSol: Number.isFinite(maxPositionSol) ? maxPositionSol : undefined,
+      openExposureSol: state.openExposureSol,
+      realPositionsOpen: state.openReal.length,
+      realEntriesDone: state.realEntriesDone,
+      hasOpenPositionForMint: state.hasOpenPositionForMint,
+    },
+  };
+}
+
+/**
+ * Executa UMA entrada real, ponta a ponta. Devolve o resultado tipado — nunca lança por
+ * falha de execução (o chamador decide o que fazer com o status).
+ */
+async function runRealEntry(params: {
+  mint: string;
+  tokenName: string;
+  sizeSol: number;
+  autonomousCall: boolean;
+  correlationId: string;
+}): Promise<RealEntryResult> {
+  const { gateInput, policy } = buildEntryGateInput(params);
+  const gate = assessEntryGate(gateInput);
+
+  if (!gate.allowed) {
+    const refused = refusedRealEntry(params.mint, params.sizeSol, gate);
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "WARN",
+      component: "REAL_ENTRY",
+      message: `[S6] Entrada real RECUSADA pelo gate: ${refused.reason}`,
+      correlationId: params.correlationId,
+    });
+    realEntryHistory.unshift(refused);
+    if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
+    return refused;
+  }
+
+  const sizeSol = params.sizeSol;
+
+  let userPublicKey: string;
+  try {
+    userPublicKey = getActiveWalletPublicKey().toBase58();
+  } catch (err: any) {
+    const refused = refusedRealEntry(params.mint, sizeSol, gate, `carteira indisponível: ${err?.message ?? err}`);
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "CRITICAL",
+      component: "REAL_ENTRY",
+      message: `[S6] Entrada real abortada: ${refused.reason}`,
+      correlationId: params.correlationId,
+    });
+    return refused;
+  }
+
+  // ── Intenção persistida ANTES de qualquer assinatura ───────────────────────
+  const positionId = `pos_live_${Date.now()}`;
+  let entryIntent = persistIntent(
+    createExecutionIntent({ positionId, mint: params.mint, token: params.tokenName.toUpperCase(), side: "entry" })
+  );
+
+  /** Tip medido (tip floor real). Sem dado, o submitBundle usa o mínimo do Jito e DECLARA. */
+  let measuredTipSol: number | null = null;
+  try {
+    const floor = await jitoTipOracle.getTipFloor();
+    const rec = await jitoTipOracle.recommendTip({
+      capitalSol: sizeSol,
+      maxTipBps: policy.maxTipBps,
+      policy: (process.env.JITO_TIP_POLICY as any) || "p75",
+    }, floor);
+    const raw = rec?.tipSol ?? null;
+    measuredTipSol = typeof raw === "number" && raw > 0 ? raw : null;
+    if (measuredTipSol === null) {
+      console.warn(`[S6] Tip floor sem valor utilizável (${rec?.basis ?? "sem base"}). O envio usará o mínimo do Jito.`);
+    }
+  } catch (err: any) {
+    console.warn(`[S6] Tip floor indisponível (${err?.message ?? err}). O envio usará o mínimo do Jito e registrará o motivo.`);
+  }
+
+  const deps: RealEntryDeps = {
+    assertCanSign: () => assertCanSign("entry"),
+    getQuote: async (mint, sizeLamports, slippageBps, timeoutMs) => {
+      const call = await withBudget(
+        budgets.jupiter,
+        // ENTRADA = gastar SOL para receber o mint. Inverter os lados aqui cotaria uma
+        // VENDA do mint com valor lido em lamports — erro que o pré-flight não pegaria
+        // (a simulação de uma venda seria bem-sucedida se houvesse saldo).
+        () => JupiterIntegration.getQuote(SOL_MINT, mint, sizeLamports, slippageBps, timeoutMs ?? 6000),
+        { priority: "normal" }
+      );
+      if (!call.ok) throw new Error(call.skippedReason ?? "cotação bloqueada por orçamento de cota");
+      return call.value as any;
+    },
+    buildSwapTransaction: (quote, userPk, timeoutMs) =>
+      JupiterIntegration.buildSwapTransaction(quote, userPk, timeoutMs ?? 6000),
+    simulateTransaction: async (tx) => {
+      const conn = globalConnection;
+      if (!conn) throw new Error("RPC indisponível (globalConnection nulo)");
+      const sim = await conn.simulateTransaction(tx as VersionedTransaction, {
+        commitment: "processed",
+        sigVerify: false,
+        // O blockhash do agregador é substituído por um monitorado na assinatura; simular
+        // contra ele mediria expiração, não programa/compute.
+        replaceRecentBlockhash: true,
+      });
+      return {
+        ok: sim.value.err === null || sim.value.err === undefined,
+        err: sim.value.err,
+        unitsConsumed: sim.value.unitsConsumed ?? null,
+        logsTail: (sim.value.logs ?? []).slice(-5).map((l) => String(l).slice(0, 200)),
+      };
+    },
+    getFreshBlockhash: async () => {
+      const cache = blockhashCacheRef;
+      if (!cache) throw new Error("cache de blockhash não inicializado neste processo");
+      return cache.getFresh();
+    },
+    signAndSubmit: async ({ transaction, blockhash, sizeSol: cap, maxTipBps }) =>
+      executeWithDecryptedKeypair(async (keypair) => {
+        const tx = transaction as VersionedTransaction;
+        /**
+         * `VersionedTransaction` não tem `recentBlockhash`/`feePayer` no objeto raiz: o
+         * blockhash vive em `message.recentBlockhash` e o fee payer já está na mensagem
+         * (o agregador monta a transação com `userPublicKey` como pagador). Trocar o
+         * blockhash aqui é seguro porque a transação do agregador NÃO vem assinada —
+         * se um dia vier (co-assinatura), o campo `signatures[0]` estaria preenchido e
+         * este ponto precisa ser revisto: alterar a mensagem invalidaria a assinatura
+         * anterior.
+         */
+        if (tx.signatures.length > 0 && tx.signatures.some((sig) => sig.some((b) => b !== 0))) {
+          throw new Error(
+            "transação do agregador já vem assinada: substituir o blockhash invalidaria a assinatura existente"
+          );
+        }
+        tx.message.recentBlockhash = blockhash;
+        tx.sign([keypair]);
+        const signature = bs58.encode(tx.signatures[0]);
+
+        // PERSISTIR ANTES DE TRANSMITIR: se o processo morrer entre assinar e enviar, a
+        // assinatura fica registrada e o próximo boot CONSULTA o status (nunca reconstrói às cegas).
+        entryIntent = advanceIntentOrKeep(
+          entryIntent,
+          "signed",
+          {
+            signature,
+            blockhash,
+            // O orquestrador já recusou antes de chegar aqui se `lastValidBlockHeight <= 0`;
+            // `?? 0` existe só para satisfazer o tipo, e 0 é interpretado como "desconhecido"
+            // pela política de retry (nunca autoriza reconstruir sem prova de expiração).
+            lastValidBlockHeight: depsBlockhashHeight ?? 0,
+          },
+          "entrada real: transação assinada (ainda não transmitida)"
+        );
+
+        const jitoSender = new JitoBundleSender(globalConnection as Connection);
+        const sent = await jitoSender.submitBundle([tx], keypair, measuredTipSol ?? 0.000_001, blockhash, {
+          capitalCommittedSol: cap,
+          maxTipBps,
+          region: (process.env.JITO_REGION as any) || undefined,
+          purpose: "entry",
+        });
+        /**
+         * `success` do sender significa "aceito pelo block engine" — NÃO "executado". O
+         * nome é traduzido para `ok` sem prometer execução; quem decide se há posição é a
+         * confirmação com slot observado.
+         */
+        return { ok: sent.success, signature, bundleId: sent.bundleId, tipSol: sent.tipSol, error: sent.error };
+      }, "entry"),
+    confirm: async (signature, lastValidBlockHeight, timeoutMs) => {
+      const conn = globalConnection;
+      if (!conn) return { outcome: "unknown" as const, error: "RPC indisponível para confirmar" };
+      const monitor = new ConfirmationMonitor(conn);
+      const res = await monitor.confirmWithRetry(signature, lastValidBlockHeight, timeoutMs, 800);
+      return { outcome: res.outcome, slot: res.slot, error: res.error };
+    },
+    observeFill: async (signature) => {
+      const conn = globalConnection;
+      if (!conn) return { measured: false, tokensReceived: null, feeLamports: null, slot: null, error: "sem conexão RPC" };
+      const tx = await conn.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+      if (!tx) return { measured: false, tokensReceived: null, feeLamports: null, slot: null, error: "transação não disponível (RPC não a retornou)" };
+      return parseEntryFill({
+        owner: userPublicKey,
+        mint: params.mint,
+        meta: tx.meta as any,
+        slot: tx.slot ?? null,
+      });
+    },
+    now: monotonicNow,
+  };
+
+  /**
+   * `depsBlockhashHeight` é lido DENTRO do signAndSubmit — o closure precisa do valor que
+   * veio do `getFreshBlockhash` do orquestrador. Como `RealEntryDeps.signAndSubmit` recebe
+   * `blockhash` mas não `lastValidBlockHeight`, guardamos o par aqui para a intenção.
+   */
+  let depsBlockhashHeight: number | null = null;
+  const originalGetFresh = deps.getFreshBlockhash;
+  deps.getFreshBlockhash = async () => {
+    const bh = await originalGetFresh();
+    depsBlockhashHeight = bh.lastValidBlockHeight;
+    return bh;
+  };
+
+  const result = await executeRealEntry(deps, {
+    mint: params.mint,
+    sizeSol,
+    userPublicKey,
+    policy,
+    gate,
+    confirmTimeoutMs: Number(process.env.HFT_ENTRY_CONFIRM_TIMEOUT_MS ?? 30_000),
+  });
+
+  // ── Intenção: estado final coerente com o desfecho ─────────────────────────
+  const intentPatch = { signature: result.signature, blockhash: result.blockhash, lastValidBlockHeight: result.lastValidBlockHeight };
+  if (result.status === "confirmed") {
+    entryIntent = advanceIntentOrKeep(entryIntent, "confirmed", { ...intentPatch, confirmationLevel: "confirmed" }, "entrada real confirmada com slot observado");
+  } else if (result.status === "failed_on_chain" || result.status === "expired" || result.status === "submit_failed" || result.status === "simulation_failed") {
+    entryIntent = advanceIntentOrKeep(entryIntent, "failed", { ...intentPatch, lastError: result.reason }, `entrada real não executou: ${result.status}`);
+  } else if (result.signature) {
+    // unconfirmed/refused-após-assinar: NÃO terminal. A reconciliação por status decide.
+    entryIntent = advanceIntentOrKeep(entryIntent, "submitted", { ...intentPatch, lastError: result.reason }, `entrada real enviada, aguardando reconciliação (${result.status})`);
+  } else {
+    entryIntent = advanceIntentOrKeep(entryIntent, "failed", { lastError: result.reason }, "entrada real não chegou a assinar");
+  }
+
+  // ── Registro do resultado (trade sempre; posição SÓ com execução observada) ─
+  const tradeStatus = result.confirmedOnChain ? "confirmed" : result.signature ? result.status : "rejected";
+  dbStore.saveTrade({
+    id: result.signature ? `live_${result.signature.slice(0, 16)}` : `live_refused_${Date.now()}`,
+    token: params.tokenName.toUpperCase(),
+    mint: params.mint,
+    amount: `${sizeSol} SOL (REAL)`,
+    outAmount: result.tokensReceived ? `${result.tokensReceived} unidades do mint (medido on-chain)` : "não medido",
+    time: new Date().toTimeString().split(" ")[0] + "." + String(Date.now() % 1000).padStart(3, "0"),
+    latencyMs: Math.round(result.timingsMs.total),
+    status: tradeStatus,
+    block: result.slot ?? 0,
+    tipSol: result.tipSol ?? 0,
+    route: `Jupiter → Jito bundle [${result.routeLabels.join(">") || "rota?"}]${result.confirmedOnChain ? "" : " (SEM confirmação on-chain)"}`,
+    mode: "live" as const,
+    signature: result.signature,
+  } as any);
+
+  if (result.confirmedOnChain && result.slot !== null) {
+    const observedTokens = result.tokensReceived;
+    const entryPrice = observedTokens && Number(observedTokens) > 0 ? sizeSol / (Number(observedTokens) / 1e9) : 0;
+    dbStore.savePosition({
+      id: positionId,
+      token: params.tokenName.toUpperCase(),
+      mint: params.mint,
+      sizeSol,
+      entryPrice,
+      currentPrice: entryPrice,
+      pnlPercent: 0,
+      status: "open",
+      stopLossPercent: -5.0,
+      takeProfitPercent: 15.0,
+      trailingStopActive: true,
+      trailingStopOffsetPercent: 2.5,
+      highestPrice: entryPrice,
+      timeOpened: new Date().toLocaleTimeString(),
+      mode: "live",
+      priceSource: "fill on-chain (pre/postTokenBalances)",
+      signature: result.signature,
+      slot: result.slot,
+      // Honestidade registrada: quando o fill não pôde ser lido, o preço de entrada é 0 e
+      // está declarado — nunca um número plausível inventado.
+      entryPriceMeasured: result.fillMeasured && !!observedTokens,
+      entryPriceNote: result.fillMeasured
+        ? null
+        : `fill não medido (${result.reason ?? "motivo não informado"}) — entryPrice 0 até reconciliar`,
+    } as any);
+
+    recorder.recordPositionLifecycle({
+      positionId,
+      mint: params.mint,
+      token: params.tokenName.toUpperCase(),
+      event: "opened",
+      mode: "live",
+      sizeSol,
+      entryPriceSol: entryPrice,
+      exitPriceSol: null,
+      pnlPercent: null,
+      reason: `entrada real confirmada (slot ${result.slot})`,
+      pnlMeasuredOnChain: result.fillMeasured,
+    });
+  }
+
+  dbStore.saveLog({
+    timestamp: new Date().toISOString(),
+    level: result.confirmedOnChain ? "CRITICAL" : result.signature ? "WARN" : "INFO",
+    component: "REAL_ENTRY",
+    message:
+      `[S6] Entrada real ${params.tokenName.toUpperCase()} → status=${result.status}` +
+      (result.signature ? `, assinatura ${result.signature.slice(0, 16)}...` : "") +
+      (result.slot !== null ? `, slot ${result.slot}` : "") +
+      (result.tipSol !== null ? `, tip ${result.tipSol} SOL` : "") +
+      (result.tokensReceived !== null ? `, recebido ${result.tokensReceived}` : "") +
+      `, latência total ${result.timingsMs.total}ms ` +
+      `(quote ${result.timingsMs.quote}/build ${result.timingsMs.build}/sim ${result.timingsMs.simulate}/submit ${result.timingsMs.submit}/confirm ${result.timingsMs.confirm}ms)` +
+      (result.reason ? `. Motivo: ${result.reason}` : "") +
+      (result.status === "submitted_unconfirmed"
+        ? ". ATENÇÃO: aceito pelo block engine e NÃO observado na janela — reconciliar por status antes de assumir posição."
+        : ""),
+    correlationId: params.correlationId,
+  });
+
+  realEntryHistory.unshift(result);
+  if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
+  return result;
+}
+
+/**
+ * POST /api/real-entry — entrada real MANUAL (canário).
+ *
+ * Existe separado do pipeline por uma razão de operação: a primeira entrada real deve ser
+ * disparada por uma pessoa que sabe qual mint escolheu, e não por um sinal automático.
+ */
+app.post("/api/real-entry", async (req, res) => {
+  const mint = String(req.body?.mint ?? "").trim();
+  const sizeSol = Number(req.body?.sizeSol ?? process.env.HFT_CANARY_MAX_SOL ?? 0.01);
+  const tokenName = String(req.body?.token ?? mint.slice(0, 6));
+  const { gateInput } = buildEntryGateInput({ mint, sizeSol, autonomousCall: false });
+  const gate = assessEntryGate(gateInput);
+
+  if (!gate.allowed) {
+    return res.status(409).json({ refused: true, gate, reason: refusedRealEntry(mint, sizeSol, gate).reason });
+  }
+
+  const correlationId = `corr_realentry_${mint.slice(0, 8)}_${Date.now()}`;
+  const result = await runRealEntry({ mint, tokenName, sizeSol, autonomousCall: false, correlationId });
+  const httpStatus =
+    result.status === "confirmed" ? 200 : result.status === "submitted_unconfirmed" ? 202 : 424;
+  return res.status(httpStatus).json({ result, gate });
+});
+
+/** GET /api/real-entry — política vigente + último resultado. Somente leitura. */
+app.get("/api/real-entry", (_req, res) => {
+  const policy = resolveRealEntryPolicy();
+  const { gateInput } = buildEntryGateInput({ mint: "So11111111111111111111111111111111111111112", sizeSol: policy.canaryMaxSol, autonomousCall: false });
+  res.json({
+    policy,
+    policyNote:
+      "Entrada real exige TRÊS declarações: RUNTIME_MODE=LIVE, LIVE_TRADING_ENABLED=true e " +
+      "HFT_REAL_ENTRY_ENABLED=1. Entrada automática exige ainda HFT_AUTONOMOUS_ENTRY=1.",
+    readiness: assessEntryGate(gateInput),
+    lastResults: realEntryHistory,
+    howToMeasure: {
+      tip: "POST /api/jito-tips (tip floor real; os campos percentilesSol são medidos)",
+      costs: "o fill real é lido de pre/postTokenBalances da transação confirmada (parseEntryFill)",
+      landing: "getBundleStatuses/getInflightBundleStatuses reconciliam 'aceito' × 'executado'",
+    },
+  });
+});
 
 // ============================================================================
 // S4 — INTENÇÕES DE EXECUÇÃO (idempotência) E RECONCILIAÇÃO POSIÇÃO × CADEIA

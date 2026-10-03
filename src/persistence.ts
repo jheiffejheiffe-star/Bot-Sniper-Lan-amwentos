@@ -153,6 +153,8 @@ export interface DBLog {
     | "MEMPOOL_SCANNER"
     /** Entradas em shadow: cotação + transação simulada (nunca assinada/enviada). */
     | "SHADOW_ENTRY"
+    /** Entrada REAL (S6): assinatura, envio e confirmação. Não confundir com shadow/paper. */
+    | "REAL_ENTRY"
     | "SYSTEM";
   message: string;
   correlationId?: string;
