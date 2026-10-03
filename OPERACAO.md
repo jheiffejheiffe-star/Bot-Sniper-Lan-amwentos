@@ -43,7 +43,7 @@ $EDITOR .env
 
 # 3. validação estática + testes (não toca rede nem banco operacional)
 npm run lint
-npm run test                 # 86 testes de segurança/regressão
+npm run test                 # suíte de segurança/regressão (contagem impressa no fim)
 
 # 4. PROVA DE FUNCIONAMENTO no SEU ambiente (read-only: nada é assinado/enviado)
 > **Plano gratuito:** para rodar tudo com camadas gratuitas (RPC/mercado/execução),
@@ -108,7 +108,7 @@ Como LER cada resposta (fato → interpretação):
 
 ## 4. Primeira hora, na ordem (checklist)
 
-1. `npm install && npm run test` → 86/86.
+1. `npm install && npm run test` → todos verdes (o runner imprime `🏆 N TESTES PASSARAM`).
 2. `npm run smoke` → todos os estágios ✅ (no seu ambiente com egress).
 3. `npm run verify:endpoints` → exit 0. **Se falhar, não ligue nada de LIVE.**
 4. `npm run quarantine` (dry-run) → revise as posições classificadas.
@@ -117,8 +117,12 @@ Como LER cada resposta (fato → interpretação):
 6. Deixe rodando em PAPER e observe por tempo suficiente para ver `eventCount` subir e
    aparecerem `shadow-entries`. Se `eventCount` ficar em 0 com `socketOpen=true`, o problema
    é a *filtragem* de logs (programas/hints), não a conexão.
-7. Só depois de dias de dado medido — e nunca antes de `npm run replay` mostrar expectativa
-   positiva líquida de custos — considere LIVE, que hoje **não tem caminho de compra**.
+7. **Se for usar a rota NATIVA de compra** (instrução montada do IDL, sem agregador), valide o
+   layout contra a rede antes de tudo:
+   `npm run pump:dryrun -- <mint> --payer <sua_chave_PUBLICA>` → verdict `err: null`.
+   O script **não assina e não envia nada** (simulação com `sigVerify: false`).
+8. Só depois de dias de dado medido — e nunca antes de `npm run replay` mostrar expectativa
+   positiva líquida de custos — considere LIVE, que exige as três declarações do item abaixo.
 
 ---
 
@@ -131,6 +135,23 @@ Como LER cada resposta (fato → interpretação):
 | `LIVE` | sim (exige duas declarações + chave + `ADMIN_TOKEN` + RPC https) | sim, **quando o caminho existir** | trades `mode: live` com assinatura real |
 
 `LIVE` sem todas as condições **não sobe** (exit 1) — é configuração fatal, não aviso.
+
+### 5.1 Caminho de compra (S6) e a rota de entrada
+
+| Rota (`HFT_ENTRY_ROUTE`) | Como executa | Pré-requisito |
+|---|---|---|
+| `aggregator` (**default**) | cotação + transação do Jupiter | rota existente para o mint |
+| `native` | instrução `buy_exact_sol_in` montada do IDL pinado (`assets/pump-idl-excerpt.json`), sem round-trip de agregador | `npm run pump:dryrun` com `err: null` **e** anti-drift do IDL `ok: true` no boot |
+
+Ligar a entrada real exige **três** declarações: `RUNTIME_MODE=LIVE` + `LIVE_TRADING_ENABLED=true`
++ `HFT_REAL_ENTRY_ENABLED=1`. Entrada automática exige ainda `HFT_AUTONOMOUS_ENTRY=1`.
+Estado vigente em `GET /api/real-entry` (`entryRoute`, `idlDrift`, `readiness.allowed`).
+
+**Anti-drift do IDL:** no boot, o bot lê a conta `global` e a `fee_config` e confere owner +
+discriminador + tamanho contra o IDL pinado. Resultados possíveis: `confere` (ok), `IDL_DRIFT`
+(não confere — **fatal** na rota native) e `IDL_NAO_VERIFICADO` (RPC inalcançável: **não** é
+sucesso nem drift, e a rota native fica bloqueada). Na rota `aggregator` o drift é aviso alto,
+não derruba o boot — a rota não usa o layout.
 
 ---
 
@@ -162,8 +183,12 @@ Como LER cada resposta (fato → interpretação):
 
 ## 8. O que NÃO está implementado (e não é segredo)
 
-1. **Entrada real on-chain** — não assina nem envia compra. Sem isso não existe execução real;
-   todo PnL é simulado.
+1. **Entrada real on-chain (S6)** — IMPLEMENTADA e **desligada por default**
+   (`HFT_REAL_ENTRY_ENABLED=0`): `POST /api/real-entry` monta, pré-simula, assina e envia a compra
+   quando as três declarações estão presentes, com teto de canário. Enquanto a variável não for
+   ligada, todo PnL continua simulado. A **saída** continua dependendo das condições de venda já
+   implementadas — leia `GET /api/system-truth` antes de tratar qualquer número como dinheiro.
+   Limites conhecidos: sem bundle Jito (S8), sem gRPC (S7), sem idempotência entre processos.
 2. **gRPC Yellowstone** — o canal de baixa latência está declarado como não implementado; o
    runtime cai para WSS (mais lento) e diz isso no log.
 3. **Idempotência entre processos** — a trava de voo único vale por processo; duas instâncias

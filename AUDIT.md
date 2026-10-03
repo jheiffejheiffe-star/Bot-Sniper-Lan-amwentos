@@ -1760,3 +1760,93 @@ Boot e rota, verificados de verdade:
 - **`3 declarações` não é burocracia**: cada uma responde a uma pergunta diferente (posso operar?
   estou em modo real? deve ENTRAR agora?). Um único booleano respondendo às três é como se produz
   um modo paper que assina.
+
+---
+
+## Adendo 16 — S6b: builder nativo por IDL, com anti-drift e dry-run que não assina (2026-10-03)
+
+### 1. Contexto
+
+O S6 fez a entrada real existir — mas **pela rota do agregador** (Jupiter). Isso paga dois custos
+evitáveis num sniper: um round-trip HTTP no caminho crítico e a dependência de o agregador **já ter
+rota** para um mint criado há segundos (quando ele não tem, a entrada simplesmente não acontece).
+O S6b remove os dois montando a instrução localmente a partir do IDL público — e o preço dessa
+decisão é que a responsabilidade pelo layout passa a ser NOSSA. Este adendo é sobre como essa
+responsabilidade foi endereçada: uma cópia verbatim do IDL como referência, um builder verificado
+CONTRA esse IDL, um dry-run contra a mainnet que não assina, e um anti-drift no boot.
+
+### 2. A pergunta que organiza tudo: "por que confiar no layout?"
+
+Sem agregador, um byte errado em `data` ou uma conta a menos na ordem vira rejeição — e
+o pior caso não é rejeição: é um `min_tokens_out` calculado de campos lidos no lugar errado,
+que faz o bot **aceitar** um preço ruim. Três defesas, em camadas independentes:
+
+1. **Referência pinada.** `assets/pump-idl-excerpt.json` é transcrição verbatim (sem reescrita) das
+   instruções `buy` / `buy_exact_sol_in`, dos discriminadores e dos structs `BondingCurve`/`Global`/
+   `Fees`/`FeeTier`/`OptionBool`, com um bloco `_provenance` declarando fonte e transformações.
+   **Limite declarado:** o hash do arquivo COMPLETO do IDL não foi capturado (o sandbox não tem
+   egress; `curl` falha e o conteúdo veio de leitura por página). Confira `sha256sum` no VPS.
+2. **Teste [25] — 25 verificações contra a referência.** Discriminadores byte a byte; ordem,
+   `writable` e `signer` das 16 contas comparados UM A UM com o IDL; layouts do parser comparados
+   campo a campo com os structs; dados sintéticos montados **a partir do IDL** (não de vetor
+   escrito à mão, para que um erro de ordem apareça); cotação reproduzida à mão; recusas.
+3. **Anti-drift no boot.** Lê `global` e `fee_config` da rede e confere owner + discriminador +
+   tamanho. Três resultados possíveis — e aqui está o ponto: **são três, não dois**.
+
+| Resultado | Significado | Efeito |
+|---|---|---|
+| `confere` | layout pinado = layout da rede, medido agora | rota native liberada |
+| `IDL_DRIFT` | não confere | **exit 1** na rota native; WARN alto na aggregator |
+| `IDL_NAO_VERIFICADO` | RPC inalcançável | **nenhum veredito**; native bloqueada |
+
+O terceiro estado existe porque transformar "não consegui perguntar" em "está tudo bem" é
+exatamente a telemetria fabricada que o Adendo 14 removeu. `ok: null` é um valor, não um vazio.
+
+### 3. Uma armadilha real, encontrada ao derivar os endereços
+
+O `event_authority` publicado em snippets da comunidade
+(`Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7Hx6SgqR`) **não é** o derivado das seeds do IDL
+(`Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1`): mesmo prefixo de 36 caracteres, sufixo diferente,
+**e os dois são base58 válido de 32 bytes**. Validação por formato — inclusive a que nós mesmos
+temos em `isUsableAddress` — não distingue os dois. Só a derivação distingue. O módulo expõe
+`EVENT_AUTHORITY_TRAP_ADDRESSES` e o teste [25] mede o prefixo comum em vez de supor um número.
+O PDA `global` derivado, por outro lado, confere com a constante pública — o que mostra que a
+derivação está certa e que a armadilha é específica daquele endereço copiado.
+
+### 4. O que o módulo faz e o que ele deliberadamente NÃO faz
+
+`src/pumpInstruction.ts` é PURO: nenhuma conexão, nenhuma chave, nenhum `fetch`, nenhuma assinatura
+(há teste que varre o arquivo procurando esses símbolos). Ele monta: dados de instrução, contas na
+ordem do IDL, PDAs por seeds, cotação pela fórmula oficial (4 passos, com `null` quando não dá para
+calcular — nunca um número inventado) e `min_tokens_out` conservador (piso, clamp em 9.999 bps,
+porque 10.000 bps significaria aceitar qualquer preço, inclusive o de um rug).
+
+Decisão de instrução: `buy_exact_sol_in` (gasta o SOL exato e impõe `min_tokens_out`) em vez de
+`buy` (`max_sol_cost`), porque o limite que protege o sniper é o de **token recebido**. `*_v2`
+(quote mint não-SOL) não foi implementada: `assertSolQuotedCurve` recusa curva não cotada em SOL.
+
+### 5. Evidências (medidas, não declaradas)
+
+`npm run lint` → 0 erros · `npm run test` → **221/221** (eram 195; grupo [25] com 26 testes) ·
+`npm run build` → ok.
+
+| Cenário | Resultado observado |
+|---|---|
+| Boot PAPER, rota aggregator, RPC inalcançável | `[Boot][IDL] … Isto NÃO é IDL_DRIFT — é indeterminado`; `GET /api/real-entry` → `entryRoute:"aggregator"`, `idlDrift:{checked:true,ok:null,code:"IDL_NAO_VERIFICADO"}` |
+| Boot PAPER com `HFT_ENTRY_ROUTE=native`, RPC inalcançável | `[Boot][IDL][FATAL] Rota native exige layout verificado…` → **exit 1** |
+| `npm run pump:dryrun` sem rede | falha com diagnóstico de REDE (`confirme egress/firewall`), **sem emitir veredito de layout** — dizer "layout ok" sem ter perguntado seria o pior desfecho possível |
+| Teste de mecanismo (sem rede, chave efêmera em memória) | trocar `tx.message.recentBlockhash` depois de montar sobrevive à assinatura e à serialização — é disso que a rota nativa depende |
+| Guarda de entrada | `entryRoute === "native" && pumpIdlDrift.ok !== true` → recusa ANTES de montar (defesa em profundidade: o boot é um instante, a variável de ambiente pode mudar) |
+
+### 6. O que continua aberto
+
+- **A validação de layout contra a mainnet depende do VPS do operador.** Este sandbox não tem
+  egress: o dry-run terminou em diagnóstico de rede, não em `err: null`. **Nada aqui autoriza ligar
+  `HFT_ENTRY_ROUTE=native`:** o primeiro passo fora do sandbox é
+  `npm run pump:dryrun -- <mint> --payer <chave-pública>` e `verdict: err: null`.
+- **Hash do IDL completo não capturado** (ver §2.1). O excerto é fiel à leitura, mas a conferência
+  independente (`sha256sum` do `pump.json` oficial) tem de ser feita onde há rede.
+- **Rota native não foi exercitada on-chain**: nem devnet (o pump é mainnet) nem mainnet. Ela está
+  implementada, testada estaticamente e *desligada*.
+- **S8 (envio paralelo/bundle) segue não implementado** — a rota nativa melhora a montagem, não o
+  envio. Sem bundle, o landing continua sujeito ao que o RPC entregar.

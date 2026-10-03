@@ -10,7 +10,14 @@ const currentDirname = typeof __dirname !== "undefined"
   ? __dirname
   : path.dirname(currentFilename);
 import { GoogleGenAI } from "@google/genai";
-import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import {
+  ComputeBudgetProgram,
+  Connection,
+  PublicKey,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+} from "@solana/web3.js";
 import { 
   RecentBlockhashCache, 
   GeyserStreamClient, 
@@ -53,6 +60,22 @@ import {
   type RealEntryDeps,
   type RealEntryResult,
 } from "./src/realEntry.js";
+import {
+  PUMP_ACCOUNT_DISCRIMINATORS,
+  PUMP_FEE_PROGRAM_ID,
+  PUMP_PROGRAM_ID,
+  SYSTEM_PROGRAM_ID,
+  assertSolQuotedCurve,
+  buildPumpBuyExactSolInInstruction,
+  deriveBondingCurvePda,
+  deriveFeeConfigPda,
+  deriveGlobalPda,
+  minTokensOutFromSlippage,
+  parseBondingCurveAccount,
+  parseGlobalAccount,
+  quoteTokensOutExactSolIn,
+  type BoundingCurveState,
+} from "./src/pumpInstruction.js";
 import {
   JitoTipOracle,
   TIP_FLOOR_URL,
@@ -941,6 +964,154 @@ const rpcCoherence: RpcCoherence = assessRpcCoherence({
       `[Boot][RPC] modo ${mode}: seguindo com a incoerência REGISTRADA (visível em ` +
         `GET /api/health → rpcCoherence). Em LIVE isto impediria o boot.`
     );
+  }
+}
+
+/**
+ * ANTI-DRIFT DO IDL DO PUMP (S6b) — "o layout pinado ainda é o layout da rede?".
+ *
+ * ## O que faz
+ *
+ * Antes de qualquer coisa assinar, confere contra a cadeia as duas âncoras das quais a rota
+ * nativa depende: (1) o PDA `global` pertence ao programa do pump e o primeiro byte de 8 tem o
+ * discriminador `Global` do IDL pinado; (2) o PDA `fee_config` pertence ao programa de taxas e
+ * tem o discriminador `FeeConfig`. Também exige que a conta `global` tenha tamanho suficiente
+ * para o layout completo — se o programa adicionou um campo, o parser nativo leria lixo.
+ *
+ * ## Por que existe
+ *
+ * Um IDL mudou, um `data.length` mudou, um endereço fixo mudou: nos três casos a instrução
+ * montada seria REJEITADA pela rede no meio do lançamento — ou, pior, `min_tokens_out` sairia
+ * de números errados. É o equivalente, para o layout, do que a guarda de coerência de RPC faz
+ * para a cota: falha no boot, não no momento crítico.
+ *
+ * ## Política (não é simétrica, e isso é deliberado)
+ *
+ * - `HFT_ENTRY_ROUTE=native` → divergência é FATAL: a rota não tem como operar sem o layout.
+ * - `HFT_ENTRY_ROUTE=aggregator` (default) → divergência é WARN ALTO e fica registrada em
+ *   `GET /api/real-entry → idlDrift`; a entrada por agregador não usa o layout, então derrubar o
+ *   boot seria indisponibilidade sem relação com o risco. RPC inalcançável NÃO é drift: é
+ *   `indeterminado` (testar com RPC caído é legítimo e já é contado em outro lugar).
+ *
+ * Nada aqui envia transação, assina ou move fundos: são duas leituras de conta.
+ */
+let pumpIdlDrift: { checked: boolean; ok: boolean | null; code: string | null; detail: string | null } = {
+  checked: false,
+  ok: null,
+  code: null,
+  detail: null,
+};
+
+async function verifyPumpIdlAgainstChain(connection: Connection, entryRoute: string): Promise<void> {
+  const fatal = entryRoute === "native";
+  const registrar = (code: string, detail: string) => {
+    pumpIdlDrift = { checked: true, ok: false, code, detail };
+    const linha = `[Boot][IDL] ${code}: ${detail}`;
+    if (fatal) {
+      console.error(
+        `${linha}. Rota de entrada = native: o layout pinado é a ÚNICA coisa que monta a ` +
+          `instrução, e ele não confere com a rede. O boot NÃO prossegue (não se assina com ` +
+          `layout não verificado). Ação: atualize assets/pump-idl-excerpt.json a partir do IDL ` +
+          `oficial e rode o grupo [25] dos testes antes de subir de novo.`
+      );
+      process.exit(1);
+    }
+    console.warn(
+      `${linha}. Rota de entrada = aggregator: a instrução nativa NÃO é usada nesta rota, então o ` +
+        `boot prossegue — mas HFT_ENTRY_ROUTE=native está BLOQUEADA até isto ser corrigido. ` +
+        `Visível em GET /api/real-entry → idlDrift.`
+    );
+  };
+
+  try {
+    const globalPk = new PublicKey(deriveGlobalPda());
+    const feeConfigPk = new PublicKey(deriveFeeConfigPda());
+    const infos = await connection.getMultipleAccountsInfo([globalPk, feeConfigPk]);
+    const [globalInfo, feeConfigInfo] = infos;
+
+    if (!globalInfo) {
+      registrar(
+        "IDL_DRIFT",
+        `a conta global (${globalPk.toBase58()}) não existe neste RPC. O programa do pump pode não ` +
+          `estar implantado nesta rede — em devnet o layout NÃO pode ser validado`
+      );
+      return;
+    }
+    if (globalInfo.owner.toBase58() !== PUMP_PROGRAM_ID) {
+      registrar(
+        "IDL_DRIFT",
+        `owner da conta global = ${globalInfo.owner.toBase58()}, esperado ${PUMP_PROGRAM_ID}. ` +
+          `Os PDAs derivados não apontam para o programa do IDL pinado`
+      );
+      return;
+    }
+    const discriminatorGlobal = Buffer.from(globalInfo.data.subarray(0, 8)).toString("hex");
+    const esperadoGlobal = Buffer.from(PUMP_ACCOUNT_DISCRIMINATORS.Global).toString("hex");
+    if (discriminatorGlobal !== esperadoGlobal) {
+      registrar(
+        "IDL_DRIFT",
+        `discriminador da conta global = ${discriminatorGlobal}, esperado ${esperadoGlobal}. ` +
+          `A estrutura Global mudou (ou o PDA aponta para outra conta)`
+      );
+      return;
+    }
+    const parsed = parseGlobalAccount(globalInfo.data);
+    if (!parsed.value) {
+      registrar(
+        "IDL_DRIFT",
+        `a conta global tem ${globalInfo.data.length} bytes e não satisfaz o layout pinado: ` +
+          parsed.problems.map((p) => p.message).join(" | ")
+      );
+      return;
+    }
+
+    if (!feeConfigInfo) {
+      registrar("IDL_DRIFT", `a conta fee_config (${feeConfigPk.toBase58()}) não existe neste RPC`);
+      return;
+    }
+    if (feeConfigInfo.owner.toBase58() !== PUMP_FEE_PROGRAM_ID) {
+      registrar(
+        "IDL_DRIFT",
+        `owner da conta fee_config = ${feeConfigInfo.owner.toBase58()}, esperado ${PUMP_FEE_PROGRAM_ID}`
+      );
+      return;
+    }
+    const discriminatorFee = Buffer.from(feeConfigInfo.data.subarray(0, 8)).toString("hex");
+    const esperadoFee = Buffer.from(PUMP_ACCOUNT_DISCRIMINATORS.FeeConfig).toString("hex");
+    if (discriminatorFee !== esperadoFee) {
+      registrar(
+        "IDL_DRIFT",
+        `discriminador da conta fee_config = ${discriminatorFee}, esperado ${esperadoFee}`
+      );
+      return;
+    }
+
+    pumpIdlDrift = { checked: true, ok: true, code: null, detail: null };
+    console.log(
+      `[Boot][IDL] Layout pinado CONFERE com a rede: global ${globalPk.toBase58()} ` +
+        `(${globalInfo.data.length} bytes, fee_recipient ${parsed.value.feeRecipient}, ` +
+        `fee_basis_points ${parsed.value.feeBasisPoints}) e fee_config sob ${PUMP_FEE_PROGRAM_ID}.`
+    );
+  } catch (err: any) {
+    // RPC inalcançável NÃO é drift: é indeterminado, e dizer "ok" aqui seria telemetria falsa.
+    pumpIdlDrift = {
+      checked: true,
+      ok: null,
+      code: "IDL_NAO_VERIFICADO",
+      detail: `leitura indisponível: ${err?.message ?? err}`,
+    };
+    console.warn(
+      `[Boot][IDL] Não foi possível verificar o layout contra a rede (${err?.message ?? err}). ` +
+        `Isto NÃO é IDL_DRIFT — é indeterminado. HFT_ENTRY_ROUTE=native permanece bloqueada até ` +
+        `uma verificação bem-sucedida (npm run pump:dryrun -- <mint> --payer <chave-publica>).`
+    );
+    if (fatal) {
+      console.error(
+        "[Boot][IDL][FATAL] Rota native exige layout verificado contra a rede e o RPC não respondeu. " +
+          "Subir assim significaria assinar sem verificação — o boot NÃO prossegue."
+      );
+      process.exit(1);
+    }
   }
 }
 
@@ -4785,9 +4956,116 @@ async function runRealEntry(params: {
     console.warn(`[S6] Tip floor indisponível (${err?.message ?? err}). O envio usará o mínimo do Jito e registrará o motivo.`);
   }
 
+  /**
+   * ROTA DE ENTRADA (S6): `aggregator` (default, validado por Jupiter) ou `native`
+   * (instrução montada do IDL pinado, `src/pumpInstruction.ts`).
+   *
+   * Por que a nativa é opt-in e não default: ela elimina um round-trip HTTP e o risco de o
+   * agregador não ter rota para um mint recém-criado — mas o layout tem de ser validado contra
+   * a rede ANTES (`npm run pump:dryrun`). O default continua sendo o caminho já exercitado.
+   */
+  const entryRoute = (process.env.HFT_ENTRY_ROUTE ?? "aggregator").trim().toLowerCase();
+
+  /**
+   * DEFESA EM PROFUNDIDADE (S6b). O boot já verifica o layout contra a rede e é FATAL na rota
+   * native — mas o boot é um instante e a ordem dos eventos do processo não é uma garantia de
+   * segurança: entre subir o listener e concluir a verificação existe uma janela, e uma variável
+   * de ambiente pode mudar sem reinício. Aqui, a condição é checada NO MOMENTO da entrada:
+   * rota native exige verificação `ok === true` (conferido), não `null` (indeterminado) nem
+   * `false` (drift). Sem verificação confirmada, a instrução não é montada nem assinada.
+   */
+  if (entryRoute === "native" && pumpIdlDrift.ok !== true) {
+    const motivo =
+      pumpIdlDrift.ok === false
+        ? `IDL_DRIFT (${pumpIdlDrift.code}): ${pumpIdlDrift.detail}. A instrução nativa NÃO é ` +
+          `montada com layout que não confere com a rede — o resultado seria rejeição ou ` +
+          `min_tokens_out errado.`
+        : `layout do IDL NÃO VERIFICADO (${pumpIdlDrift.code ?? "sem leitura"}): ` +
+          `${pumpIdlDrift.detail ?? "nenhuma verificação registrada"}. A rota native exige ` +
+          `verificação prévia: npm run pump:dryrun -- <mint> --payer <chave-publica>.`;
+    const refused = refusedRealEntry(params.mint, sizeSol, gate, motivo);
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "CRITICAL",
+      component: "REAL_ENTRY",
+      message: `[S6] Rota native recusada antes de montar: ${refused.reason}`,
+      correlationId: params.correlationId,
+    });
+    return refused;
+  }
+
+  if (entryRoute !== "aggregator" && entryRoute !== "native") {
+    const refused = refusedRealEntry(
+      params.mint,
+      sizeSol,
+      gate,
+      `HFT_ENTRY_ROUTE="${entryRoute}" não é uma rota conhecida (use "aggregator" ou "native")`
+    );
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "CRITICAL",
+      component: "REAL_ENTRY",
+      message: `[S6] Rota de entrada inválida: ${refused.reason}. Nada foi montado — fail-closed.`,
+      correlationId: params.correlationId,
+    });
+    return refused;
+  }
+
+  /** Preenchido quando a rota é nativa: estado da curva/global lido no instante da montagem. */
+  let nativeContext: { curve: BoundingCurveState; feeRecipient: string; minTokensOut: bigint; spendableSolIn: bigint } | null = null;
+
   const deps: RealEntryDeps = {
     assertCanSign: () => assertCanSign("entry"),
     getQuote: async (mint, sizeLamports, slippageBps, timeoutMs) => {
+      if (entryRoute === "native") {
+        const conn = globalConnection;
+        if (!conn) throw new Error("RPC indisponível (globalConnection nulo): rota nativa exige leitura de conta");
+        const infos = await conn.getMultipleAccountsInfo([
+          new PublicKey(deriveGlobalPda()),
+          new PublicKey(deriveBondingCurvePda(mint)),
+        ]);
+        const [globalInfo, curveInfo] = infos;
+        if (!globalInfo) throw new Error("conta Global do pump não encontrada no RPC configurado");
+        if (!curveInfo) throw new Error("bonding curve não encontrada: mint sem curva ativa (migrado ou inexistente)");
+
+        const global = parseGlobalAccount(globalInfo.data);
+        const curve = parseBondingCurveAccount(curveInfo.data);
+        if (!global.value) throw new Error(`Global ilegível: ${global.problems.map((p) => p.message).join(" | ")}`);
+        if (!curve.value) throw new Error(`BondingCurve ilegível: ${curve.problems.map((p) => p.message).join(" | ")}`);
+        if (curve.value.complete) throw new Error("curva COMPLETA (token migrado): não se compra na curva neste estado");
+        const solGuard = assertSolQuotedCurve(curve.value.quoteMint);
+        if (!solGuard.ok) throw new Error(solGuard.reason);
+
+        const spendableSolIn = BigInt(sizeLamports);
+        const q = quoteTokensOutExactSolIn({
+          spendableSolIn,
+          virtualTokenReserves: curve.value.virtualTokenReserves,
+          virtualQuoteReserves: curve.value.virtualQuoteReserves,
+          protocolFeeBps: global.value.feeBasisPoints,
+          creatorFeeBps: curve.value.creatorFeeBps,
+        });
+        if (!q) throw new Error("cotação nativa não calculável (reservas/taxas): dado insuficiente para entrar");
+        const minTokensOut = minTokensOutFromSlippage(q.tokensOut, slippageBps);
+        if (minTokensOut <= 0n) throw new Error("min_tokens_out calculado é zero: slippage/taxa anulam a compra");
+
+        nativeContext = { curve: curve.value, feeRecipient: global.value.feeRecipient, minTokensOut, spendableSolIn };
+
+        /**
+         * Impacto MEDIDO da própria curva: preço de execução (net_sol/tokens) contra o preço
+         * spot (reservas virtuais). Não é estimativa de terceiro — é aritmética das reservas
+         * lidas um instante antes. O gate de impacto do realEntry consome este número.
+         */
+        const spot = Number(curve.value.virtualQuoteReserves) / Number(curve.value.virtualTokenReserves);
+        const exec = Number(q.netSol) / Number(q.tokensOut);
+        const impactFraction = spot > 0 ? exec / spot - 1 : 0;
+
+        return {
+          outAmount: q.tokensOut.toString(),
+          priceImpactPct: String(impactFraction),
+          routeLabels: [`pump.fun curva (nativa, ${q.totalFeeBps}bps)`],
+        };
+      }
+
       const call = await withBudget(
         budgets.jupiter,
         // ENTRADA = gastar SOL para receber o mint. Inverter os lados aqui cotaria uma
@@ -4799,8 +5077,48 @@ async function runRealEntry(params: {
       if (!call.ok) throw new Error(call.skippedReason ?? "cotação bloqueada por orçamento de cota");
       return call.value as any;
     },
-    buildSwapTransaction: (quote, userPk, timeoutMs) =>
-      JupiterIntegration.buildSwapTransaction(quote, userPk, timeoutMs ?? 6000),
+    buildSwapTransaction: async (quote, userPk, timeoutMs) => {
+      if (entryRoute === "native") {
+        const ctx = nativeContext;
+        if (!ctx) throw new Error("estado da curva ausente: a cotação nativa precisa rodar antes da montagem");
+        const built = buildPumpBuyExactSolInInstruction({
+          mint: params.mint,
+          user: userPk,
+          feeRecipient: ctx.feeRecipient,
+          creator: ctx.curve.creator,
+          spendableSolIn: ctx.spendableSolIn,
+          minTokensOut: ctx.minTokensOut,
+        });
+        const cuLimit = Number(process.env.HFT_ENTRY_CU_LIMIT ?? 200_000);
+        const cuPrice = Number(process.env.HFT_ENTRY_CU_PRICE_MICROLAMPORTS ?? 0);
+        const ixs = [
+          ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }),
+          ...(cuPrice > 0 ? [ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Math.floor(cuPrice) })] : []),
+          new TransactionInstruction({
+            programId: new PublicKey(built.programId),
+            // `name` é metadado nosso para auditoria; NÃO vai como AccountMeta.
+            keys: built.keys.map((k) => ({
+              pubkey: new PublicKey(k.pubkey),
+              isSigner: k.isSigner,
+              isWritable: k.isWritable,
+            })),
+            data: built.data,
+          }),
+        ];
+        /**
+         * O blockhash de espaço reservado é substituído por um MONITORADO em `signAndSubmit`
+         * (que também assina). Nada é assinado com o valor de espaço reservado: a ordem é
+         * montar → simular (substitui na simulação) → trocar por blockhash fresco → assinar.
+         */
+        const message = new TransactionMessage({
+          payerKey: new PublicKey(userPk),
+          recentBlockhash: SYSTEM_PROGRAM_ID,
+          instructions: ixs,
+        }).compileToV0Message();
+        return new VersionedTransaction(message);
+      }
+      return JupiterIntegration.buildSwapTransaction(quote, userPk, timeoutMs ?? 6000);
+    },
     simulateTransaction: async (tx) => {
       const conn = globalConnection;
       if (!conn) throw new Error("RPC indisponível (globalConnection nulo)");
@@ -5046,8 +5364,16 @@ app.post("/api/real-entry", async (req, res) => {
 app.get("/api/real-entry", (_req, res) => {
   const policy = resolveRealEntryPolicy();
   const { gateInput } = buildEntryGateInput({ mint: "So11111111111111111111111111111111111111112", sizeSol: policy.canaryMaxSol, autonomousCall: false });
+  const entryRoute = (process.env.HFT_ENTRY_ROUTE ?? "aggregator").trim().toLowerCase();
   res.json({
     policy,
+    entryRoute,
+    idlDrift: pumpIdlDrift,
+    entryRouteNote:
+      entryRoute === "native"
+        ? "ROTA NATIVA: instrução montada do IDL pinado (assets/pump-idl-excerpt.json). Exige que " +
+          "`npm run pump:dryrun` tenha retornado err=null contra a mainnet antes de operar."
+        : "ROTA AGREGADOR (Jupiter): caminho exercitado; exige rota existente para o mint.",
     policyNote:
       "Entrada real exige TRÊS declarações: RUNTIME_MODE=LIVE, LIVE_TRADING_ENABLED=true e " +
       "HFT_REAL_ENTRY_ENABLED=1. Entrada automática exige ainda HFT_AUTONOMOUS_ENTRY=1.",
@@ -6801,6 +7127,10 @@ async function startServer() {
         disableRetryOnRateLimit: true
       });
       globalConnection = connection;
+
+      // ANTI-DRIFT DO IDL: valida o layout pinado contra a rede ANTES de qualquer caminho que
+      // possa assinar. Fatal na rota native, aviso registrado na rota aggregator.
+      await verifyPumpIdlAgainstChain(connection, (process.env.HFT_ENTRY_ROUTE ?? "aggregator").trim().toLowerCase());
 
       // Instância ÚNICA e real do cache de blockhash (antes havia um gerador de hash falso).
       blockhashCacheRef = new RecentBlockhashCache(connection);

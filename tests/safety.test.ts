@@ -21,6 +21,7 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { PublicKey } from "@solana/web3.js";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -4044,6 +4045,451 @@ async function main(): Promise<void> {
     for (const v of ["HFT_REAL_ENTRY_ENABLED", "HFT_AUTONOMOUS_ENTRY", "HFT_CANARY_MAX_SOL", "HFT_CANARY_ONE_ENTRY"]) {
       assert.ok(env.includes(v), `.env.example precisa declarar ${v}`);
     }
+  });
+
+  // [25] S6 — INSTRUÇÃO NATIVA POR IDL: layout conferido contra o IDL oficial pinado
+  console.log("\n[25] Entrada nativa por IDL (S6): layout, PDAs, cotação e guardas");
+
+  await test("IDL pinado: o excerto existe, veio do repositório oficial e traz o programa certo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const idl = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/pump-idl-excerpt.json"), "utf8"));
+    assert.equal(idl.address, "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+    assert.ok(/pump-public-docs/.test(idl._provenance.source), "a proveniência precisa apontar o repo oficial");
+    assert.ok(/pump.json/.test(idl._provenance.source));
+    assert.ok(Array.isArray(idl._provenance.transformations) && idl._provenance.transformations.length > 0,
+      "as transformações aplicadas ao excerto precisam estar declaradas");
+    const names = idl.instructions.map((i: any) => i.name);
+    assert.deepEqual(names, ["buy", "buy_exact_sol_in"]);
+  });
+
+  await test("discriminadores do builder batem byte a byte com o IDL pinado", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const idl = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/pump-idl-excerpt.json"), "utf8"));
+    const byName: Record<string, number[]> = {
+      buy: [...pi.PUMP_INSTRUCTION_DISCRIMINATORS.buy],
+      buyExactSolIn: [...pi.PUMP_INSTRUCTION_DISCRIMINATORS.buyExactSolIn],
+    };
+    for (const ix of idl.instructions) {
+      const ours = byName[ix.name === "buy_exact_sol_in" ? "buyExactSolIn" : "buy"];
+      assert.deepEqual(ours, ix.discriminator, `discriminador de ${ix.name} divergiu do IDL`);
+    }
+    for (const [name, bytes] of Object.entries(pi.PUMP_ACCOUNT_DISCRIMINATORS)) {
+      const idlAcc = idl.accounts.find((a: any) => a.name === name);
+      assert.ok(idlAcc, `${name} precisa existir nos discriminadores de conta do IDL`);
+      assert.deepEqual([...bytes], idlAcc.discriminator, `discriminador de conta ${name} divergiu`);
+    }
+  });
+
+  await test("dados da instrução: bytes exatos e tamanho derivado do IDL (uma ambiguidade resolvida por evidência)", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const buy = pi.buildBuyData({ amount: 1n, maxSolCost: 1n, trackVolume: true });
+    assert.equal(buy.length, 8 + 8 + 8 + 1);
+    assert.equal(buy.subarray(0, 8).toString("hex"), "66063d1201daebea");
+    assert.equal(buy.readBigUInt64LE(8), 1n);
+    assert.equal(buy.readBigUInt64LE(16), 1n);
+    assert.equal(buy[24], 1, "track_volume (OptionBool) = 1 byte: o IDL o define como struct de um bool");
+    assert.equal(pi.buildBuyData({ amount: 1n, maxSolCost: 1n, trackVolume: false })[24], 0);
+
+    const exact = pi.buildBuyExactSolInData({ spendableSolIn: 10_000_000n, minTokensOut: 2n });
+    assert.equal(exact.length, 8 + 8 + 8);
+    assert.equal(exact.subarray(0, 8).toString("hex"), "38fc74089edfcd5f");
+    assert.equal(exact.readBigUInt64LE(8), 10_000_000n);
+    assert.equal(exact.readBigUInt64LE(16), 2n);
+  });
+
+  await test("ordem e semântica das contas: comparadas UMA A UMA com o IDL pinado", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const idl = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/pump-idl-excerpt.json"), "utf8"));
+    const buy = idl.instructions.find((i: any) => i.name === "buy_exact_sol_in");
+
+    const mint = "So11111111111111111111111111111111111111112";
+    // Endereços de teste: o fee_recipient do protocolo MUDA, então entra por parâmetro.
+    const feeRecipient = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ";
+    const creator = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+    const user = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1";
+    const keys = pi.buildBuyAccountKeys({ mint, user, feeRecipient, creator });
+
+    assert.deepEqual(keys.map((k: any) => k.name), buy.accounts.map((a: any) => a.name),
+      "a ordem e os nomes das contas têm de ser exatamente os do IDL");
+    assert.equal(keys.length, buy.accounts.length, "nem uma conta a mais, nem a menos");
+
+    // writable/signer de cada posição: uma conta writable a menos = instrução rejeitada.
+    for (let i = 0; i < keys.length; i++) {
+      const spec = buy.accounts[i];
+      assert.equal(keys[i].isWritable, Boolean(spec.writable), `conta ${spec.name}: writable divergiu`);
+      assert.equal(keys[i].isSigner, Boolean(spec.signer), `conta ${spec.name}: signer divergiu`);
+    }
+
+    // Contas com endereço fixo no IDL precisam sair exatamente iguais.
+    for (const spec of buy.accounts) {
+      if (!spec.address) continue;
+      const key = keys.find((k: any) => k.name === spec.name);
+      assert.ok(key, `conta ${spec.name} do IDL não foi produzida pelo builder`);
+      assert.equal(key!.pubkey, spec.address, `conta ${spec.name}: endereço fixo divergiu do IDL`);
+    }
+  });
+
+  await test("PDAs: derivação confere com ground truth público (global e bonding curve)", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    // Ground truth 1: o Global PDA do pump é constante pública amplamente publicada em SDKs e
+    // exemplos (duas fontes independentes concordam) — e a derivação aqui reproduz exatamente.
+    assert.equal(pi.deriveGlobalPda(), "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+    // Derivado do IDL: bonding curve de um mint conhecido é determinística.
+    const bc = pi.deriveBondingCurvePda("So11111111111111111111111111111111111111112");
+    assert.ok(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(bc));
+    assert.notEqual(bc, pi.deriveGlobalPda());
+    // Determinismo: mesma entrada, mesmo PDA (sem estado escondido).
+    assert.equal(bc, pi.deriveBondingCurvePda("So11111111111111111111111111111111111111112"));
+  });
+
+  await test("TRAP documentada: o event_authority publicado na web NÃO é aceito — é endereço sósia", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const derivado = pi.deriveEventAuthorityPda();
+    const publicado = pi.EVENT_AUTHORITY_TRAP_ADDRESSES[0];
+    assert.notEqual(derivado, publicado,
+      "o endereço do snippet web compartilha 40 caracteres de prefixo com o derivado e tem sufixo diferente: " +
+      "é o padrão de endereço sósia que esta base já removeu uma vez (achado C4)");
+    // O sósia é base58 válido — é justamente por isso que ele passa por revisão de olho.
+    const { PublicKey } = await import("@solana/web3.js");
+    assert.equal(new PublicKey(publicado).toBytes().length, 32, "o sósia é estruturalmente válido: validação por formato não o pega");
+    /**
+     * O comprimento do prefixo comum é MEDIDO, não suposto: com 36 caracteres iguais e 8
+     * diferentes, a olho nu os dois endereços são o "mesmo" endereço — e é exatamente por isso
+     * que colar endereço de exemplo em código é um erro de segurança, não de estilo.
+     */
+    let comum = 0;
+    while (comum < publicado.length && publicado[comum] === derivado[comum]) comum++;
+    assert.ok(comum >= 30, `prefixo comum medido: ${comum} caracteres (esperado ≥ 30 para caracterizar o sósia)`);
+    assert.ok(comum < derivado.length, "os endereços NÃO são idênticos");
+  });
+
+  await test("cotação: os 4 passos das docs oficiais, com aritmética inteira conferida à mão", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    // Caso redondo, calculável à mão: gasto 1 SOL, fee total 100 bps (1%), sem creator.
+    const r = pi.quoteTokensOutExactSolIn({
+      spendableSolIn: 1_000_000_000n,
+      virtualTokenReserves: 1_000_000_000_000_000n,
+      virtualQuoteReserves: 30_000_000_000n,
+      protocolFeeBps: 100,
+      creatorFeeBps: 0,
+    });
+    assert.ok(r, "a cotação precisa ser calculável neste caso");
+    const esperadoNetSol = (1_000_000_000n * 10_000n) / 10_100n;
+    assert.equal(r!.netSol, esperadoNetSol, "passo 1: net_sol = floor(spendable * 10_000 / (10_000 + fee))");
+    const esperadoTokens = ((esperadoNetSol - 1n) * 1_000_000_000_000_000n) / (30_000_000_000n + esperadoNetSol - 1n);
+    assert.equal(r!.tokensOut, esperadoTokens, "passo 4: tokens_out da fórmula do IDL");
+    assert.equal(r!.totalFeeBps, 100);
+    assert.ok(r!.steps.length >= 3, "a cotação precisa ser auditável passo a passo");
+  });
+
+  await test("cotação: monotonicidade e recusas explícitas (nunca número inventado)", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const base = { virtualTokenReserves: 1_000_000_000_000_000n, virtualQuoteReserves: 30_000_000_000n, protocolFeeBps: 100, creatorFeeBps: 50 };
+    const um = pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 1_000_000_000n });
+    const dois = pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 2_000_000_000n });
+    assert.ok(um && dois && dois.tokensOut > um.tokensOut, "gastar mais SOL tem de comprar mais tokens");
+
+    assert.equal(pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 0n }), null, "gasto zero não tem cotação");
+    assert.equal(pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 1n }), null, "gasto menor que a taxa não tem cotação");
+    assert.equal(pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 1_000_000_000n, virtualTokenReserves: 0n }), null, "reserva zero é dado inválido");
+    assert.equal(pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 1_000_000_000n, protocolFeeBps: 9_999, creatorFeeBps: 1_000 }), null, "taxa total ≥ 100% é absurdo declarado");
+  });
+
+  await test("min_tokens_out: piso conservador (arredonda para baixo) e slippage limitado", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    assert.equal(pi.minTokensOutFromSlippage(10_000n, 0), 10_000n, "slippage zero mantém o valor exato");
+    assert.equal(pi.minTokensOutFromSlippage(10_000n, 100), 9_900n, "1% de slippage tira 1%");
+    assert.equal(pi.minTokensOutFromSlippage(10_001n, 1), (10_001n * 9_999n) / 10_000n, "arredonda para baixo (piso)");
+    // Piso, nunca teto: com 1 token de resto, o piso é MENOR ou igual ao exato.
+    assert.ok(pi.minTokensOutFromSlippage(10_001n, 1) <= 10_001n, "nunca exigir mais do que o esperado");
+    // 10.000 bps significaria aceitar QUALQUER preço — inclusive um rug. É limitado.
+    assert.equal(pi.minTokensOutFromSlippage(10_000n, 10_000), 1n, "slippage de 100% é limitado a 9.999 bps");
+    assert.equal(pi.minTokensOutFromSlippage(10_000n, -5), 10_000n, "slippage negativo é tratado como zero");
+  });
+
+  await test("parsers: BondingCurve e Global leem os campos certos na ordem do IDL", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const idl = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "assets/pump-idl-excerpt.json"), "utf8"));
+    assert.deepEqual(pi.BONDING_CURVE_LAYOUT.map((f: any) => f.name), idl.types.BondingCurve.map((f: any) => f.name),
+      "o layout do parser de BondingCurve precisa ser o do IDL, campo por campo");
+    assert.deepEqual(pi.GLOBAL_LAYOUT.map((f: any) => f.name), idl.types.Global.map((f: any) => f.name),
+      "o layout do parser de Global precisa ser o do IDL, campo por campo");
+
+    // Monta a conta sintética A PARTIR do layout do IDL (não de um vetor escrito à mão):
+    // assim, errar a ordem no builder ou no IDL quebra o teste.
+    const buildFromIdl = (fields: any[], values: Record<string, any>) => {
+      const parts: Buffer[] = [];
+      for (const f of fields) {
+        const t = f.type;
+        if (t === "pubkey") parts.push(Buffer.from(new PublicKey(values[f.name]).toBytes()));
+        else if (t === "bool") parts.push(Buffer.from([values[f.name] ? 1 : 0]));
+        else if (Array.isArray(t)) {
+          for (let i = 0; i < t[1]; i++) parts.push(Buffer.from(new PublicKey(values[f.name][i]).toBytes()));
+        } else {
+          const buf = Buffer.alloc(t === "u128" ? 16 : 8);
+          if (t === "u128") buf.writeBigUInt64LE(BigInt(values[f.name]), 0);
+          else buf.writeBigUInt64LE(BigInt(values[f.name]), 0);
+          parts.push(buf);
+        }
+      }
+      return Buffer.concat(parts);
+    };
+
+    const zero = "11111111111111111111111111111111";
+    const creator = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+    const wsol = "So11111111111111111111111111111111111111112";
+    const bcValues: Record<string, any> = {};
+    for (const f of idl.types.BondingCurve) {
+      bcValues[f.name] = f.type === "pubkey" ? (f.name === "creator" ? creator : wsol)
+        : f.type === "bool" ? false
+        : f.name === "creator_fee_bps" ? 50 : 777;
+    }
+    const bcData = Buffer.concat([Buffer.from(pi.PUMP_ACCOUNT_DISCRIMINATORS.BondingCurve), buildFromIdl(idl.types.BondingCurve, bcValues)]);
+    const bc = pi.parseBondingCurveAccount(bcData);
+    assert.ok(bc.value, `BondingCurve deveria parsear: ${JSON.stringify(bc.problems)}`);
+    assert.equal(bc.value!.creator, creator);
+    assert.equal(bc.value!.creatorFeeBps, 50);
+    assert.equal(bc.value!.quoteMint, wsol);
+    assert.equal(bc.value!.complete, false);
+
+    const glValues: Record<string, any> = {};
+    for (const f of idl.types.Global) {
+      const t = f.type;
+      glValues[f.name] = t === "pubkey" ? (f.name === "fee_recipient" ? creator : zero)
+        : t === "bool" ? false
+        : Array.isArray(t) ? Array.from({ length: t[1] }, () => zero)
+        : f.name === "fee_basis_points" ? 100
+        : 0;
+    }
+    const glData = Buffer.concat([Buffer.from(pi.PUMP_ACCOUNT_DISCRIMINATORS.Global), buildFromIdl(idl.types.Global, glValues)]);
+    const gl = pi.parseGlobalAccount(glData);
+    assert.ok(gl.value, `Global deveria parsear: ${JSON.stringify(gl.problems)}`);
+    assert.equal(gl.value!.feeRecipient, creator);
+    assert.equal(gl.value!.feeBasisPoints, 100);
+  });
+
+  await test("parsers: recusam discriminador errado e conta truncada (ler assim daria número plausível e errado)", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const certos = Buffer.from(pi.PUMP_ACCOUNT_DISCRIMINATORS.BondingCurve);
+    const outros = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    const truncada = Buffer.concat([certos, Buffer.alloc(pi.BONDING_CURVE_ACCOUNT_SIZE - 8 - 1, 0)]);
+    const r1 = pi.parseBondingCurveAccount(truncada);
+    assert.equal(r1.value, null);
+    assert.equal(r1.problems[0].code, "bytes-insuficientes");
+
+    const tipoErrado = Buffer.concat([outros, Buffer.alloc(pi.BONDING_CURVE_ACCOUNT_SIZE - 8, 0)]);
+    const r2 = pi.parseBondingCurveAccount(tipoErrado);
+    assert.equal(r2.value, null);
+    assert.equal(r2.problems[0].code, "discriminador-errado");
+
+    assert.equal(pi.parseGlobalAccount(null).value, null, "sem dado não há valor");
+    assert.equal(pi.parseGlobalAccount(Buffer.alloc(4)).problems[0].code, "curta-demais");
+  });
+
+  await test("guarda de curva: instrução SOL-only recusa curva cotada em outro ativo", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    assert.equal(pi.assertSolQuotedCurve(pi.WSOL_MINT).ok, true);
+    assert.equal(pi.assertSolQuotedCurve(pi.SYSTEM_PROGRAM_ID).ok, true, "conta de SOL também aparece como endereço zero");
+    const usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const r = pi.assertSolQuotedCurve(usdc);
+    assert.equal(r.ok, false);
+    assert.match(r.reason ?? "", /_v2/, "o motivo precisa dizer o que usar no lugar");
+  });
+
+  await test("endereço: validação estrutural recusa lixo e o endereço zero como destinatário", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    assert.equal(pi.isUsableAddress("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"), true);
+    assert.equal(pi.isUsableAddress(pi.SYSTEM_PROGRAM_ID), false);
+    assert.equal(pi.isUsableAddress("nao-e-base58-0OIl"), false);
+    assert.equal(pi.isUsableAddress(""), false);
+  });
+
+  await test("instrução montada: programa, contas e dados coerentes entre si", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const ix = pi.buildPumpBuyExactSolInInstruction({
+      mint: pi.WSOL_MINT,
+      user: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+      feeRecipient: "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ",
+      creator: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+      spendableSolIn: 10_000_000n,
+      minTokensOut: 1_234n,
+    });
+    assert.equal(ix.programId, pi.PUMP_PROGRAM_ID);
+    assert.equal(ix.keys.length, 16, "buy_exact_sol_in tem 16 contas no IDL pinado");
+    assert.equal(ix.accountNames.join(","), ix.keys.map((k: any) => k.name).join(","));
+    assert.equal(ix.data.readBigUInt64LE(0 + 8), 10_000_000n);
+    assert.equal(ix.data.readBigUInt64LE(16), 1_234n);
+    const signers = ix.keys.filter((k: any) => k.isSigner).map((k: any) => k.name);
+    assert.deepEqual(signers, ["user"], "só o usuário assina — um signer a mais quebraria o envio");
+    assert.equal(ix.keys.find((k: any) => k.name === "fee_program")!.pubkey, pi.PUMP_FEE_PROGRAM_ID);
+    assert.equal(ix.keys.find((k: any) => k.name === "program")!.pubkey, pi.PUMP_PROGRAM_ID);
+  });
+
+  await test("isolamento: o módulo de instrução não assina, não envia e não lê segredo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/pumpInstruction.ts"), "utf8"));
+    for (const proibido of ["Keypair", "OPERATIONAL_PRIVATE_KEY", "process.env", "sendTransaction", "sendRawTransaction", "fetch("]) {
+      assert.equal(src.includes(proibido), false, `pumpInstruction.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(/findProgramAddressSync/.test(src), "PDA é DERIVADO, nunca copiado");
+    assert.ok(!/web3\.js.*Connection/.test(src), "não abre conexão");
+  });
+
+  await test("custo mínimo honesto: rent documentado no IDL é cobrado do pagador", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const idl = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/pump-idl-excerpt.json"), "utf8"));
+    const docs: string[] = idl.instructions.find((i: any) => i.name === "buy_exact_sol_in").docs;
+    const texto = docs.join(" ");
+    assert.match(texto, /creator_vault: rent\.minimum_balance/);
+    assert.match(texto, /user_volume_accumulator: rent\.minimum_balance/);
+    assert.match(texto, /Quote formulas/, "a fórmula de cotação implementada vem das docs do IDL pinado");
+  });
+
+  await test("rota nativa: trocar o blockhash após montar sobrevive à assinatura e à serialização", async () => {
+    /**
+     * MECANISMO DO QUAL A ROTA NATIVA DEPENDE. A transação é montada sem blockhash real (o da
+     * curva não existe antes de a montagem terminar) e o blockhash monitorado entra depois, no
+     * choke point de assinatura. Se o web3.js ignorasse a mutação, o sistema assinaria com o
+     * blockhash de espaço reservado — e a transação seria rejeitada SEMPRE, gastando a
+     * tentativa e o tip. Este teste prova o mecanismo sem rede e sem chave real (Keypair
+     * efêmero, só em memória, nada transmitido).
+     */
+    const { Keypair, MessageV0, TransactionMessage, VersionedTransaction, ComputeBudgetProgram } = await import("@solana/web3.js");
+    const pi = await import("../src/pumpInstruction.js");
+    const payer = Keypair.generate();
+    const msg = new TransactionMessage({
+      payerKey: payer.publicKey,
+      recentBlockhash: "11111111111111111111111111111111",
+      instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 })],
+    }).compileToV0Message();
+    const tx = new VersionedTransaction(msg);
+    const blockhashMonitorado = pi.deriveGlobalPda();
+    tx.message.recentBlockhash = blockhashMonitorado;
+    tx.sign([payer]);
+    const voltou = VersionedTransaction.deserialize(tx.serialize());
+    assert.equal(
+      MessageV0.deserialize(voltou.message.serialize()).recentBlockhash,
+      blockhashMonitorado,
+      "o blockhash substituído tem de estar nos bytes assinados"
+    );
+  });
+
+  await test("fiação: rota nativa é opt-in, validada fail-closed e reportada em /api/real-entry", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/HFT_ENTRY_ROUTE/.test(src), "a rota precisa ser selecionável por variável");
+    assert.ok(
+      /entryRoute !== "aggregator" && entryRoute !== "native"[\s\S]{0,400}refusedRealEntry/.test(src),
+      "rota desconhecida precisa ser RECUSADA (fail-closed), não cair em um default silencioso"
+    );
+    assert.ok(/buildPumpBuyExactSolInInstruction\(/.test(src), "a rota nativa precisa usar o builder do IDL");
+    assert.ok(/ComputeBudgetProgram\.setComputeUnitLimit/.test(src), "compute budget explícito no caminho nativo");
+    assert.ok(
+      /tx\.message\.recentBlockhash = blockhash/.test(src),
+      "o blockhash de espaço reservado da montagem precisa ser substituído antes de assinar"
+    );
+    assert.ok(/entryRoute,/.test(src) && /entryRouteNote/.test(src), "/api/real-entry precisa declarar a rota ativa");
+  });
+
+  await test("dry-run: o script de validação não assina, não envia e não aceita chave privada", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "scripts/pump-dryrun.ts"), "utf8");
+    const src = codigoSemComentarios(raw);
+    for (const proibido of ["sendTransaction", "sendRawTransaction", "Keypair", "fromSecretKey", ".sign(", "partialSign"]) {
+      assert.equal(src.includes(proibido), false, `pump-dryrun.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(/sigVerify: false/.test(src), "a simulação precisa dispensar assinatura (nenhuma chave envolvida)");
+    assert.ok(/replaceRecentBlockhash: true/.test(src), "blockhash não pode ser o objeto do teste");
+    assert.ok(/getMultipleAccountsInfo/.test(src), "o dry-run lê as contas reais");
+    assert.ok(/NENHUMA assinatura/.test(raw), "o script precisa dizer em texto que não assina");
+  });
+
+  await test("dry-run: recusa antes de simular quando não há o que medir", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "scripts/pump-dryrun.ts"), "utf8"));
+    assert.ok(/curve\.value\.complete[\s\S]{0,200}fail\(/.test(src), "curva completa precisa abortar com motivo");
+    assert.ok(/assertSolQuotedCurve/.test(src), "curva não-SOL precisa abortar");
+    assert.ok(/owner\.toBase58\(\) !== PUMP_PROGRAM_ID/.test(src), "conta de outro programa precisa abortar (PDA errado)");
+    assert.ok(/parseGlobalAccount\(globalInfo\.data\)/.test(src) && /parseBondingCurveAccount\(curveInfo\.data\)/.test(src),
+      "os parsers precisam ser exercitados contra dados REAIS: é o ponto do dry-run");
+  });
+
+  await test(".env.example declara a rota e o orçamento de compute do caminho nativo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const env = fs.readFileSync(path.join(repoRoot, ".env.example"), "utf8");
+    for (const v of ["HFT_ENTRY_ROUTE", "HFT_ENTRY_CU_LIMIT", "HFT_ENTRY_CU_PRICE_MICROLAMPORTS"]) {
+      assert.ok(env.includes(v), `.env.example precisa declarar ${v}`);
+    }
+    assert.ok(/pump:dryrun/.test(env), "o .env.example precisa apontar o comando de validação");
+  });
+
+  await test("anti-drift do IDL: divergência é fatal na rota nativa e avisada na rota agregador", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/verifyPumpIdlAgainstChain/.test(src), "o boot precisa verificar o layout contra a rede");
+    assert.ok(/IDL_DRIFT/.test(src), "a divergência precisa ter código próprio, não 'erro genérico'");
+    // Fatal SÓ na rota native: na rota agregador a divergência de layout não é o risco da operação.
+    assert.ok(
+      /const fatal = entryRoute === "native"/.test(src),
+      "a política de fatalidade precisa ser derivada da rota, não fixa"
+    );
+    assert.ok(
+      /PUMP_ACCOUNT_DISCRIMINATORS\.Global/.test(src) && /PUMP_ACCOUNT_DISCRIMINATORS\.FeeConfig/.test(src),
+      "os discriminadores verificados têm de vir do IDL pinado, não de literais hex escritos à mão"
+    );
+    assert.ok(/PUMP_FEE_PROGRAM_ID/.test(src) && /deriveFeeConfigPda/.test(src), "a âncora de taxas precisa ser verificada");
+    assert.ok(
+      /IDL_NAO_VERIFICADO/.test(src),
+      "RPC inalcançável NÃO pode ser registrado como 'ok': é indeterminado, e chamar de ok seria telemetria falsa"
+    );
+  });
+
+  await test("anti-drift: distingue 'conferiu' de 'não conferiu' de 'não foi verificado' (três estados, não dois)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    // `checked: true, ok: null` é o estado "indeterminado" — nem sucesso nem drift.
+    assert.ok(
+      /pumpIdlDrift: \{ checked: boolean; ok: boolean \| null; code: string \| null; detail: string \| null \}/.test(src),
+      "o estado precisa ter um valor para 'não verificado' (ok: null)"
+    );
+    assert.ok(/idlDrift: pumpIdlDrift/.test(src), "o estado precisa estar exposto no endpoint de diagnóstico");
+  });
+
+  await test("painel de HFT: a tela lê o estado real da entrada — sem afirmação estática de autorização", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const arquivo = fs.readFileSync(path.join(repoRoot, "src/components/HftProfiler.tsx"), "utf8");
+    assert.equal(
+      /S6 NÃO AUTORIZADO/.test(arquivo),
+      false,
+      "o S6 foi publicado: manter esse texto seria uma afirmação falsa sobre o próprio sistema"
+    );
+    assert.ok(/fetch\("\/api\/real-entry"\)/.test(arquivo), "o estado da entrada precisa vir do backend");
+    assert.ok(/readiness\?\.allowed/.test(arquivo), "o portão é `allowed`, não `enabled`");
+    assert.ok(/"não medido"/.test(arquivo), "sem resposta do backend a tela diz 'não medido'");
+  });
+
+  await test("painel de MEV: o simulador de bundle não se confunde com a entrada real", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const arquivo = fs.readFileSync(path.join(repoRoot, "src/components/MevExecutionEngine.tsx"), "utf8");
+    assert.equal(/depende do S6 \(não autorizado\)/.test(arquivo), false, "texto desatualizado sobre o S6");
+    assert.ok(/POST \/api\/real-entry/.test(arquivo), "a tela precisa apontar o caminho REAL da compra");
+    assert.ok(/SIMULADO/.test(arquivo), "e deixar explícito que ela mesma é simulação");
+  });
+
+  await test("rota native: entrada recusa quando o layout NÃO está confirmado (defesa em profundidade)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(
+      /entryRoute === "native" && pumpIdlDrift\.ok !== true/.test(src),
+      "a checagem tem de ser `ok !== true`: `ok === false` sozinho deixaria passar o caso INDETERMINADO"
+    );
+    // A ordem importa: a guarda de IDL precisa vir ANTES de qualquer montagem de instrução.
+    const posGuarda = src.indexOf('entryRoute === "native" && pumpIdlDrift.ok !== true');
+    const posBuilder = src.indexOf("buildPumpBuyExactSolInInstruction({");
+    assert.ok(posGuarda > 0 && posBuilder > 0 && posGuarda < posBuilder, "verificação antes da montagem");
   });
 
   console.log("\n=========================================");

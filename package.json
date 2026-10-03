@@ -12,6 +12,7 @@
     "test": "tsx tests/safety.test.ts",
     "test:all": "npm run lint && npm run test",
     "verify:endpoints": "tsx scripts/verify-endpoints.ts",
+    "pump:dryrun": "tsx scripts/pump-dryrun.ts",
     "test:destructive": "tsx test-production.ts",
     "replay": "tsx scripts/replay.ts",
     "quarantine": "tsx scripts/quarantine-db.ts",

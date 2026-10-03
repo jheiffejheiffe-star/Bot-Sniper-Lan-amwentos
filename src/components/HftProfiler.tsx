@@ -99,6 +99,24 @@ export function HftProfiler() {
     ]);
   };
 
+  const [entryState, setEntryState] = useState<{
+    route: string;
+    enabled: boolean;
+    autonomous: boolean;
+    blocker: string | null;
+    idl: string;
+    idlDetail: string | null;
+  } | null>(null);
+
+  /**
+   * MEDIÇÃO REAL (4/4): estado da ENTRADA REAL — lido de `/api/real-entry`.
+   *
+   * O que este painel NÃO faz: repetir a palavra "autorizado/não autorizado" escrita à mão em
+   * JSX. Esse texto era uma AFIRMAÇÃO ESTÁTICA sobre um sistema que muda de estado por variável
+   * de ambiente — e já estava desatualizada (S6 foi publicado). Aqui, o que aparece na tela é o
+   * que o backend responde: rota ativa, se a entrada está ligada, e se o layout do IDL confere
+   * com a rede (`idlDrift`). Sem resposta → "não medido".
+   */
   // Scroll to logs top
   useEffect(() => {
     if (logsEndRef.current) {
@@ -170,9 +188,29 @@ export function HftProfiler() {
         } else {
           setActiveExposure(null);
         }
+        const entryRes = await fetch("/api/real-entry");
+        if (entryRes.ok) {
+          const entry = await entryRes.json();
+          setEntryState({
+            route: String(entry?.entryRoute ?? "aggregator"),
+            // `readiness` é o resultado de `assessEntryGate`: { allowed, issues }. `allowed` diz se
+            // TODO o portão passaria agora (modo, declarações, freios, orçamento). Ler `.enabled`
+            // aqui daria `undefined` e a tela mostraria "desligada" para sempre — telemetria falsa.
+            enabled: Boolean(entry?.readiness?.allowed),
+            autonomous: Boolean(entry?.policy?.autonomous),
+            blocker: Array.isArray(entry?.readiness?.issues)
+              ? (entry.readiness.issues.find((i: any) => i?.severity === "block")?.code ?? null)
+              : null,
+            idl: entry?.idlDrift?.ok === true ? "confere" : entry?.idlDrift?.ok === false ? String(entry?.idlDrift?.code) : "não verificado",
+            idlDetail: entry?.idlDrift?.detail ?? null,
+          });
+        } else {
+          setEntryState(null);
+        }
       } catch {
         setEventsPerSec(null);
         setActiveExposure(null);
+        setEntryState(null);
       }
     };
     void fetchTruth();
@@ -517,9 +555,18 @@ export function HftProfiler() {
                   </div>
                 </div>
               </div>
-              <div className="mt-2.5 pt-2 border-t border-slate-900 flex justify-between items-center text-[9px] font-mono">
-                <span className="text-slate-500">ENVIO REAL DE BUNDLE:</span>
-                <span className="text-slate-400 font-bold">S6 NÃO AUTORIZADO</span>
+              <div
+                className="mt-2.5 pt-2 border-t border-slate-900 flex justify-between items-center text-[9px] font-mono"
+                title={entryState?.idlDetail ?? "Sem divergência de IDL registrada pelo boot."}
+              >
+                <span className="text-slate-500">ENTRADA REAL (S6):</span>
+                <span className="text-slate-300 font-bold">
+                  {entryState === null
+                    ? "não medido"
+                    : `rota ${entryState.route} · ${entryState.enabled ? "portão aberto" : `bloqueada${
+                        entryState.blocker ? ` (${entryState.blocker})` : ""
+                      }`}${entryState.autonomous ? " · automática" : ""} · IDL ${entryState.idl}`}
+                </span>
               </div>
             </div>
 

@@ -160,7 +160,11 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
          * com `outAmount` e `block` ALEATÓRIOS e a empurrava para a lista de operações do App —
          * o painel exibia um trade que nunca existiu, com números inventados.
          * Agora: o resultado aparece marcado como SIMULADO e nenhuma operação é registrada.
-         * `onBundleSuccess` segue existindo para quando houver submissão REAL (S6 autorizado).
+         * `onBundleSuccess` segue reservado para quando houver submissão REAL de bundle — que é a
+         * capacidade S8 (envio paralelo), ainda não implementada. Este componente NÃO é o caminho
+         * da entrada real do S6: a compra real sai por `POST /api/real-entry` (rota aggregator ou
+         * native), com pré-flight simulado e canário. Não confundir os dois: aqui é demonstração
+         * da mecânica de bundle; lá é a ordem de compra.
          */
         void onBundleSuccess;
       }
@@ -418,7 +422,9 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
           {bundleResult.simulated === true && (
             <div className="mb-2 p-1.5 bg-amber-500/10 border border-amber-500/30 rounded text-[10px] font-mono text-amber-300 font-bold">
               SIMULADO — nenhum bundle foi enviado on-chain. Sem fill, sem preço de execução, sem
-              slot. Esta tela demonstra a mecânica; o envio real depende do S6 (não autorizado).
+              slot. Esta tela demonstra a mecânica de bundle (S8, não implementada). A compra real
+              é outro caminho: <code className="text-amber-200">POST /api/real-entry</code>, com
+              rota declarada em <code className="text-amber-200">/api/real-entry → entryRoute</code>.
             </div>
           )}
           <p className="text-[10px] font-mono leading-relaxed text-slate-300 mb-2">
