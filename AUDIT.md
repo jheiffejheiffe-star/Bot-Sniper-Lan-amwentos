@@ -1154,3 +1154,88 @@ O bloco `hotPath` (contadores do caminho quente) existia só em `/api/system-tru
 expostos lá também — instrumentação que só aparece no segundo endpoint continua invisível para
 quem olha o básico. `npm run test` 98/98 (a verificação nova entrou como asserção adicional no
 teste de regressão do caminho quente).
+
+---
+
+## Adendo 9 (2026-10-03) — Máquina GRATUITA: orçamento de cota, medição e playbook
+
+Pedido do usuário: *"de início vou usar tudo de graça para testar, então monte a melhor máquina
+nessas condições"* — com o reforço de que o produto final deve **identificar lançamentos, comprar
+e vender automaticamente** e ser de nível mundial. Nada aqui assina ou envia transação: o escopo é
+a camada gratuita de infraestrutura + medição.
+
+### 1. O diagnóstico que orienta a solução
+
+Em plano gratuito o bot **não falha por latência: falha por `429`**. E o padrão de falha é
+perverso — o polling de fundo (medir RTT de nós a cada 5 s, consultar preço de posições, oráculo
+de tip) consome a mesma cota que a decisão de um lançamento; o erro aparece exatamente na hora em
+que a decisão depende daquele dado. Sem orçamento, o limite do provedor vira uma falha aleatória.
+
+### 2. O que foi implementado
+
+**`src/rateBudget.ts` (novo, funções puras, relógio injetável)**
+- `RateBudget` — janela deslizante real (guarda os instantes das aquisições aceitas), com
+  `tryAcquire()` **sem `await`** (serve ao caminho quente), `waitMsUntilNextSlot()` e `snapshot()`.
+- Presets com o limite **publicado** e o campo `source` dizendo de onde veio cada número:
+  `public` 8 req/s (conservador para o endpoint compartilhado), `helius` 10 req/s (1M créditos/mês,
+  `sendTransaction` 1/s), `alchemy` 25 req/s (30M CU/mês; `getTransaction` custa 4x), `quicknode`
+  ~15 req/s, `syndica` 100 req/s (10M req/mês). Mercado: DexScreener 300 req/min; Jupiter
+  60 req/min **por organização**; Jito 1 req/s por IP por região.
+- `withBudget()` com três prioridades, e a ordem é uma **decisão de risco, não de estilo**:
+  - `exit` — nunca bloqueada (fechar posição/reduzir risco não depende de cota); o excesso é
+    contado em `bypassed`;
+  - `normal` — espera até `maxWaitMs` (250–300 ms nos call sites) e, se ainda não houver vaga,
+    **pula e conta** (`skipped`);
+  - `background` — não espera nada (medição de infraestrutura cede a cota ao caminho quente).
+- Perfil desconhecido cai em `public` (fail-safe: nunca fica sem teto). `HFT_BUDGET_DISABLED=1`
+  desliga o teto **mantendo a contagem** — desligar não pode virar ponto cego.
+
+**Fiação (`server.ts`)**
+- DexScreener do filtro profundo e do preço de referência: `normal`, 250 ms de espera.
+- Preço de posição (DexScreener e fallback Jupiter) e as cotações de saída
+  (`fetchJupiterQuoteWithRetry` e o close manual): `exit`.
+- Telemetria de RTT dos nós: cede na hora e o adiamento é contado em `rpcMeasureSkippedByBudget`.
+- `GET /api/system-truth → budgets` (teto, `source`, `skipped`, `bypassed`, perfil, se está
+  desligado) e `GET /api/health → budgets` (resumo).
+
+**`scripts/free-check.ts` + `npm run free:check`** — mede a pilha gratuita no ambiente do operador
+em 8 estágios (config → RPC p50/p95 → WebSocket contando notificações do Pump.fun → DexScreener →
+Jupiter → tip floor e block engine do Jito → tabela de orçamentos → recomendação de `.env`).
+Regras do script: chave de API **nunca** é impressa (só o host); "0 notificações" é reportado como
+**não conclusivo**, não como falha de detecção; sem medição de RPC não há recomendação de endpoint.
+
+**`GRATIS.md`** — playbook: o que o gratuito compra e o que não compra, tabela de limites
+publicados por serviço, as cinco decisões da máquina gratuita (um processo por chave; orçamento;
+VPS gratuito na mesma região do RPC em vez de máquina doméstica; WSS e a opção PumpPortal; PAPER/
+SHADOW e nunca LIVE), `.env` de exemplo, aritmética de cota, ordem de medição e a ordem de upgrade
+por dólar (gRPC → envio staked → co-location → Postgres).
+
+### 3. Verdade desconfortável registrada junto (para não se perder no otimismo)
+
+- **Compra e venda reais não são gratuitas.** O ciclo completo (detectar → decidir → entrar →
+  gerir → sair) roda **automaticamente hoje, de graça, em PAPER**, com preço real de mercado. A
+  entrada on-chain (S6) não está implementada e exige hot wallet com SOL para taxas e tip.
+- **"Nível mundial" em velocidade não é alcançável em plano gratuito.** Endpoint compartilhado,
+  envio sem prioridade e `sendTransaction` limitado a 1/s (Helius Free) tornam inclusão uma
+  questão de sorte. O que se constrói sem dinheiro é o motor correto e a medição que diz
+  exatamente onde dói — e é isso que este adendo entrega.
+- Os tetos são **publicados**, não medidos por nós: provedor muda limite sem avisar. Se aparecer
+  `429` com os contadores dentro do teto, o preset é que está desatualizado.
+
+### 4. Estado verificado
+
+```
+npm run lint              → exit 0
+npm run test              → 107/107 (grupo [17]: 9 testes de orçamento/cota)
+npm run build             → ok
+npm start (produção)      → PAPER, /api/health.budgets e /api/system-truth.budgets respondendo
+npm run free:check -- --quick → 10 estágios; 5 falhas de REDE do sandbox (sem egress), declaradas
+```
+
+### 5. O que continua aberto (com autorização, não por decisão minha)
+
+- **Feed gratuito PumpPortal (`subscribeNewToken`)**: entrega o mint direto na criação do token e
+  elimina o `getTransaction` do caminho do lançamento — é o maior ganho gratuito de latência e
+  custo. Não foi implementado: é uma fonte de dados nova e precisa da sua autorização.
+- **S6 — entrada real com canary de 0,01 SOL**: exige capital, carteira dedicada e autorização
+  explícita. É o que transforma "compra e vende automaticamente em PAPER" em execução real.
