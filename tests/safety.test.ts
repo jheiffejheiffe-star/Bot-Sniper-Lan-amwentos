@@ -2273,7 +2273,7 @@ async function main(): Promise<void> {
     const reg = buildBudgetRegistry({ rpcProfile: "helius" });
     assert.equal(reg.rpc.spec.limit, RPC_PROFILES.helius.limit);
     const snap = reg.snapshot();
-    assert.equal(snap.length, 5, "rpc + 4 provedores de mercado");
+    assert.equal(snap.length, 6, "rpc + 5 provedores externos (DexScreener, Jupiter, RugCheck, Jito x2)");
   });
 
   await test("perfil desconhecido cai em `public` (fail-safe, nunca sem teto)", async () => {
@@ -2289,6 +2289,380 @@ async function main(): Promise<void> {
     for (let i = 0; i < 50; i++) reg.rpc.tryAcquire();
     assert.equal(reg.rpc.snapshot().accepted, 50);
     assert.ok(/DESLIGADO/.test(reg.rpc.spec.source), "a origem precisa dizer que o teto está desligado");
+  });
+
+  // ---------------------------------------------------------------------------
+  // [18] FEED GRATUITO DA PUMPPORTAL — mint direto, sem getTransaction
+  // ---------------------------------------------------------------------------
+  console.log("\n[18] Feed PumpPortal (detecção gratuita com mint direto)");
+
+  class FakeSocket {
+    public sent: string[] = [];
+    public closed = false;
+    private handlers: Record<string, Array<(ev: any) => void>> = {};
+    addEventListener(type: string, fn: (ev: any) => void) {
+      (this.handlers[type] ??= []).push(fn);
+    }
+    send(data: string) { this.sent.push(data); }
+    close() { this.closed = true; this.emit("close", {}); }
+    /** Simula o servidor: dispara um evento para os handlers registrados. */
+    emit(type: string, ev: any) { for (const fn of this.handlers[type] ?? []) fn(ev); }
+    message(obj: any) { this.emit("message", { data: JSON.stringify(obj) }); }
+    rawMessage(text: string) { this.emit("message", { data: text }); }
+  }
+
+  await test("parsing defensivo: só `mint` é obrigatório; o resto vira null, nunca inventado", async () => {
+    const { parsePumpPortalMessage } = await import("../src/pumpPortalFeed.js");
+
+    // Mensagem real típica (campos que o provedor envia na criação).
+    const ok = parsePumpPortalMessage(
+      JSON.stringify({
+        signature: "5Kd3r8Qq4vYqk9m2VtXz1u8LsWzQb7nHfDc2",
+        mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+        txType: "create",
+        name: "Teste",
+        symbol: "TST",
+        marketCapSol: 28.5,
+        initialBuy: 0.5,
+      }),
+      1234
+    );
+    assert.equal(ok.ok, true);
+    if (ok.ok) {
+      assert.equal(ok.event.mint, "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU");
+      assert.equal(ok.event.txType, "create");
+      assert.equal(ok.event.name, "Teste");
+      assert.equal(ok.event.marketCapSol, 28.5);
+      assert.equal(ok.event.receivedAt, 1234);
+      assert.ok(ok.event.fields.includes("mint"));
+    }
+
+    // Sem campos opcionais: prossegue com null (não inventar nome nem market cap).
+    const minimal = parsePumpPortalMessage(JSON.stringify({ mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU" }), 1);
+    assert.equal(minimal.ok, true);
+    if (minimal.ok) {
+      assert.equal(minimal.event.name, null);
+      assert.equal(minimal.event.marketCapSol, null);
+      assert.equal(minimal.event.txType, "unknown", "tipo não declarado NÃO pode ser chutado como create");
+    }
+
+    // Mensagem de migração: tipo reconhecido.
+    const mig = parsePumpPortalMessage(JSON.stringify({ mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", txType: "migrate" }), 2);
+    assert.equal(mig.ok && mig.event.txType, "migrate");
+  });
+
+  await test("parsing defensivo: entradas inválidas são RECUSADAS com motivo", async () => {
+    const { parsePumpPortalMessage } = await import("../src/pumpPortalFeed.js");
+    for (const [raw, motivo] of [
+      ["não é json", /JSON inválido/],
+      [JSON.stringify(["array"]), /não é objeto/],
+      [JSON.stringify({}), /sem campo `mint`/],
+      [JSON.stringify({ mint: "0OIl" }), /estruturalmente inválido/],
+      [JSON.stringify({ mint: "" }), /sem campo `mint`/],
+    ] as Array<[string, RegExp]>) {
+      const r = parsePumpPortalMessage(raw, 0);
+      assert.equal(r.ok, false, `deveria recusar: ${raw}`);
+      if (!r.ok) assert.ok(motivo.test(r.reason), `motivo inesperado: ${r.reason}`);
+    }
+  });
+
+  await test("feed: uma única conexão e as duas assinaturas gratuitas", async () => {
+    const { PumpPortalFeed } = await import("../src/pumpPortalFeed.js");
+    const sockets: FakeSocket[] = [];
+    const feed = new PumpPortalFeed({
+      onEvent: () => {},
+      wsFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s as any;
+      },
+      setTimer: () => 0 as any,
+      clearTimer: () => {},
+    });
+
+    feed.connect();
+    feed.connect(); // no-op deliberado: múltiplas conexões podem causar banimento
+    feed.connect();
+    assert.equal(sockets.length, 1, "connect() repetido NÃO pode abrir outra conexão");
+
+    sockets[0].emit("open", {});
+    const methods = sockets[0].sent.map((m) => JSON.parse(m).method);
+    assert.deepEqual(methods, ["subscribeNewToken", "subscribeMigration"], "assinaturas gratuitas");
+
+    const h = feed.getHealth();
+    assert.equal(h.socketOpen, true);
+    assert.equal(h.subscriptionsSent.length, 2);
+  });
+
+  await test("feed: evento válido é emitido; duplicata e mensagem inválida são contadas", async () => {
+    const { PumpPortalFeed } = await import("../src/pumpPortalFeed.js");
+    const sockets: FakeSocket[] = [];
+    const recebidos: any[] = [];
+    const feed = new PumpPortalFeed({
+      onEvent: (e) => recebidos.push(e),
+      wsFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s as any;
+      },
+      setTimer: () => 0 as any,
+      clearTimer: () => {},
+    });
+    feed.connect();
+    const sock = sockets[0];
+    sock.emit("open", {});
+
+    const msg = { signature: "sigA", mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", txType: "create", name: "A" };
+    sock.message(msg);
+    sock.message(msg); // reentrega (reconexão do provedor)
+    sock.rawMessage("isso não é json");
+    sock.message({ txType: "create" }); // sem mint
+    sock.message({ ...msg, signature: "sigB" }); // mesmo mint, evento novo
+
+    assert.equal(recebidos.length, 2, "só eventos válidos e não duplicados");
+    assert.equal(recebidos[0].name, "A");
+
+    const h = feed.getHealth();
+    assert.equal(h.messagesReceived, 5);
+    assert.equal(h.eventsEmitted, 2);
+    assert.equal(h.duplicatesDropped, 1);
+    assert.equal(h.invalidMessages, 2);
+  });
+
+  await test("feed: queda agenda reconexão com backoff e `stop` cancela tudo", async () => {
+    const { PumpPortalFeed, pumpPortalBackoffMs } = await import("../src/pumpPortalFeed.js");
+    const sockets: FakeSocket[] = [];
+    const timers: Array<{ fn: () => void; ms: number; canceled: boolean }> = [];
+    const feed = new PumpPortalFeed({
+      onEvent: () => {},
+      wsFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s as any;
+      },
+      setTimer: (fn, ms) => {
+        const t = { fn, ms, canceled: false };
+        timers.push(t);
+        return t as any;
+      },
+      clearTimer: (h: any) => {
+        if (h) h.canceled = true;
+      },
+    });
+
+    // Backoff cresce e satura no teto — reconectar em rajada é o que causa banimento.
+    assert.ok(pumpPortalBackoffMs(1, 1000, 60_000) >= 250);
+    assert.ok(pumpPortalBackoffMs(2, 1000, 60_000) > pumpPortalBackoffMs(1, 1000, 60_000));
+    assert.ok(pumpPortalBackoffMs(30, 1000, 60_000) <= 60_000 * 1.2, "teto respeitado (jitter incluso)");
+
+    feed.connect();
+    sockets[0].emit("open", {});
+    sockets[0].emit("close", {}); // queda
+    assert.equal(timers.length, 1, "queda agenda UMA reconexão");
+    assert.ok(timers[0].ms >= 250);
+    assert.equal(feed.getHealth().socketOpen, false);
+    assert.ok(feed.getHealth().consecutiveFailures >= 1);
+
+    // O timer de reconexão abre nova conexão quando dispara.
+    timers[0].fn();
+    assert.equal(sockets.length, 2, "reconectou ao disparar o backoff");
+
+    // stop(): cancela reconexão pendente e fecha o socket (sem ban por conexão abandonada).
+    sockets[1].emit("open", {});
+    feed.stop();
+    assert.equal(sockets[1].closed, true);
+    const h = feed.getHealth();
+    assert.equal(h.socketOpen, false);
+    // Depois de stop, uma nova queda NÃO pode agendar reconexão.
+    sockets[1].emit("close", {});
+    assert.equal(timers.length, 1, "após stop não se agenda reconexão");
+  });
+
+  await test("feed: falha do consumidor não derruba o feed", async () => {
+    const { PumpPortalFeed } = await import("../src/pumpPortalFeed.js");
+    const sockets: FakeSocket[] = [];
+    const feed = new PumpPortalFeed({
+      onEvent: () => {
+        throw new Error("consumidor quebrado");
+      },
+      wsFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s as any;
+      },
+      setTimer: () => 0 as any,
+      clearTimer: () => {},
+    });
+    feed.connect();
+    sockets[0].emit("open", {});
+    sockets[0].message({ mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", signature: "s1" });
+    const h = feed.getHealth();
+    assert.equal(h.eventsEmitted, 1, "o evento foi contado mesmo com o consumidor falhando");
+    assert.ok(/onEvent lançou/.test(String(h.lastError)));
+  });
+
+  await test("regressão: o feed precisa estar LIGADO na detecção e medido", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("new PumpPortalFeed("), "o feed precisa ser instanciado no boot");
+    assert.ok(
+      /preEnriched: true/.test(serverSrc),
+      "o evento da PumpPortal precisa ser marcado como pré-enriquecido (sem getTransaction)"
+    );
+    assert.ok(
+      /preEnriched === true\) trace\?\.mark\("enriched"\)/.test(serverSrc),
+      "o pipeline precisa marcar `enriched` na hora para evento pré-enriquecido"
+    );
+    assert.ok(
+      /pumpPortal: pumpPortalRef\?\.getHealth\(\)/.test(serverSrc),
+      "o health precisa expor o feed (prova de vida por contador, não por log)"
+    );
+    assert.ok(serverSrc.includes('"pumpportal"') && serverSrc.includes("HFT_PUMPPORTAL"), "fonte e chave de desligamento");
+    assert.ok(
+      /h\.eventsEmitted > 0 \? \("real" as const\) : \("unavailable" as const\)/.test(serverSrc),
+      "o painel não pode declarar o feed como real sem prova de vida (eventsEmitted > 0)"
+    );
+    assert.ok(/process\.on\("SIGTERM"/.test(serverSrc), "precisa existir encerramento gracioso");
+    assert.ok(
+      /shutdown = \(signal[\s\S]{0,1200}pumpPortalRef\?\.stop\(\)/.test(serverSrc),
+      "o encerramento precisa fechar o feed da PumpPortal (conexão abandonada pode causar ban)"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [19] RUGCHECK — evidência externa gratuita que só pode ENDURECER a decisão
+  // ---------------------------------------------------------------------------
+  console.log("\n[19] RugCheck (evidência externa de risco)");
+
+  await test("parser: payload completo vira evidência estruturada", async () => {
+    const { parseRugCheckReport } = await import("../src/rugCheck.js");
+    const ev = parseRugCheckReport(
+      {
+        score: 812,
+        score_level: "danger",
+        mintAuthority: null,
+        freezeAuthority: "9xQeWvG816bUx9EPfEZvkVv7iLwLiZ2jWgpgFdkh9xQe",
+        totalHolders: 128,
+        risks: [
+          { name: "Freeze Authority still enabled", level: "danger", score: 1, description: "pode congelar" },
+          { name: "Low Liquidity", level: "warn", score: 100 },
+          { name: "ignorado sem nome", level: "info" },
+        ],
+        markets: [
+          { lp: { lpLockedPct: 12.5, lpLockedUSD: 4200 } },
+          { lp: { lpLockedPct: 88.0, lpLockedUSD: 61000 } },
+        ],
+      },
+      321
+    );
+    assert.equal(ev.available, true);
+    assert.equal(ev.score, 812);
+    assert.equal(ev.scoreLevel, "danger");
+    assert.equal(ev.latencyMs, 321);
+    assert.equal(ev.risks.length, 3);
+    assert.deepEqual(ev.dangerNames, ["Freeze Authority still enabled"]);
+    assert.equal(ev.lpLockedUsd, 61000, "pega o MAIOR pool, não o primeiro");
+    assert.equal(ev.lpLockedPct, 88.0);
+    assert.equal(ev.freezeAuthority?.slice(0, 4), "9xQe");
+  });
+
+  await test("parser: relatório vazio/estranho NUNCA vira aprovação", async () => {
+    const { parseRugCheckReport } = await import("../src/rugCheck.js");
+    for (const raw of [null, undefined, [], {}, { foo: "bar" }, "texto"]) {
+      const ev = parseRugCheckReport(raw as any, null);
+      assert.equal(ev.available, false, `deveria ser indisponível: ${JSON.stringify(raw)}`);
+      assert.ok(ev.reason !== null, "indisponibilidade precisa de motivo explícito");
+      assert.equal(ev.score, null, "score ausente é null, nunca 0 (0 pareceria nota boa)");
+    }
+    // Relatório com campos desconhecidos mas reconhecíveis é considerado disponível.
+    const parcial = parseRugCheckReport({ totalHolders: 10 }, null);
+    assert.equal(parcial.available, true);
+  });
+
+  await test("fetch: HTTP ruim, timeout e JSON inválido viram indisponibilidade com motivo", async () => {
+    const { fetchRugCheckEvidence } = await import("../src/rugCheck.js");
+    const casos: Array<[any, RegExp]> = [
+      [async () => ({ ok: false, status: 429 } as any), /HTTP 429/],
+      [async () => { throw new Error("timeout de rede"); }, /falha na consulta/],
+      [async () => ({ ok: true, json: async () => { throw new Error("sem json"); } } as any), /não é JSON/],
+    ];
+    for (const [fetchImpl, motivo] of casos) {
+      const ev = await fetchRugCheckEvidence("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", {
+        fetchImpl: fetchImpl as any,
+      });
+      assert.equal(ev.available, false);
+      assert.ok(motivo.test(String(ev.reason)), `motivo inesperado: ${ev.reason}`);
+    }
+  });
+
+  await test("fetch: NUNCA espera por cota (evidência adicional não atrasa lançamento)", async () => {
+    const { fetchRugCheckEvidence } = await import("../src/rugCheck.js");
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const budget = new RateBudget({ name: "rugcheck", limit: 1, windowMs: 60_000, source: "teste" }, () => now);
+    assert.equal(budget.tryAcquire(), true, "consome a única vaga");
+
+    let chamou = false;
+    const ev = await fetchRugCheckEvidence("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", {
+      budget,
+      fetchImpl: (async () => {
+        chamou = true;
+        return { ok: true, json: async () => ({ score: 10 }) } as any;
+      }) as any,
+    });
+    assert.equal(chamou, false, "sem cota, a chamada externa não é feita");
+    assert.equal(ev.available, false);
+    assert.ok(/cota de "rugcheck" esgotada/.test(String(ev.reason)));
+    assert.equal(budget.skipped, 1);
+  });
+
+  await test("regra de ouro: evidência externa só ENDURECE — nunca amolece", async () => {
+    const { parseRugCheckReport, rugCheckRiskReasons } = await import("../src/rugCheck.js");
+
+    // Indisponível: não gera risco NEM aprovação — o veredito local decide.
+    const indisponivel = parseRugCheckReport(null);
+    const r0 = rugCheckRiskReasons(indisponivel);
+    assert.equal(r0.usable, false);
+    assert.deepEqual(r0.reasons, []);
+
+    // Limpo: utilizável, mas sem motivos — jamais vira "aprovação" (não existe API para isso).
+    const limpo = parseRugCheckReport({ score: 5, risks: [], totalHolders: 50 });
+    const r1 = rugCheckRiskReasons(limpo);
+    assert.equal(r1.usable, true);
+    assert.deepEqual(r1.reasons, [], "aprovação externa NÃO adiciona crédito de score");
+
+    // Perigo: gera motivos, que o filtro usa para DESCONTAR.
+    const perigo = parseRugCheckReport({
+      score: 780,
+      risks: [
+        { name: "Freeze Authority still enabled", level: "danger" },
+        { name: "Top holder owns 45%", level: "warn" },
+      ],
+      freezeAuthority: "9xQeWvG816bUx9EPfEZvkVv7iLwLiZ2jWgpgFdkh9xQe",
+    });
+    const r2 = rugCheckRiskReasons(perigo);
+    assert.equal(r2.usable, true);
+    assert.ok(r2.reasons.some((x) => /PERIGO/.test(x)));
+    assert.ok(r2.reasons.some((x) => /score de risco/.test(x)));
+    assert.ok(r2.reasons.some((x) => /freeze authority ativa/i.test(x)));
+  });
+
+  await test("regressão: o filtro profundo usa a evidência externa e ela é OPCIONAL", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("fetchRugCheckEvidence("), "o filtro precisa consultar a evidência externa");
+    assert.ok(
+      serverSrc.includes("rugCheckRiskReasons(") && serverSrc.includes("score -= Math.min(45"),
+      "a evidência precisa DESCONTAR score (endurecer), nunca somar"
+    );
+    assert.ok(
+      /HFT_RUGCHECK !== "0"/.test(serverSrc),
+      "precisa existir chave de desligamento — dependência externa sempre pode ser removida"
+    );
+    assert.ok(
+      serverSrc.includes('missingChecks.push("rugcheck (evidência externa)")'),
+      "indisponível precisa ser registrado como verificação faltante, nunca como aprovação"
+    );
   });
 
   console.log("\n=========================================");

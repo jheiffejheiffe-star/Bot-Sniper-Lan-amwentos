@@ -1239,3 +1239,101 @@ npm run free:check -- --quick → 10 estágios; 5 falhas de REDE do sandbox (sem
   custo. Não foi implementado: é uma fonte de dados nova e precisa da sua autorização.
 - **S6 — entrada real com canary de 0,01 SOL**: exige capital, carteira dedicada e autorização
   explícita. É o que transforma "compra e vende automaticamente em PAPER" em execução real.
+
+---
+
+## Adendo 10 (2026-10-03) — Melhores ferramentas GRATUITAS integradas (PumpPortal + RugCheck)
+
+Pedido: *"Use as melhores ferramentas gratuitas disponíveis"*. Interpretação registrada: isto
+autoriza **integrar fontes gratuitas de dados/evidência** (leitura), não autoriza execução real —
+o S6 continua pendente de autorização explícita e de capital (taxa e tip não são grátis). Nada
+neste adendo assina, envia ou gasta.
+
+### 1. Escolha das ferramentas (e por que não outras)
+
+| Ferramenta | Custo | Por que entrou |
+|---|---|---|
+| **PumpPortal** `subscribeNewToken` / `subscribeMigration` | grátis, sem chave | Entrega o **mint na própria notificação** — elimina `getTransaction` e a espera por `confirmed` que o S5 mediu como gargalo estrutural |
+| **RugCheck** `/v1/tokens/{mint}/report` | grátis | Segundo par de olhos no filtro de rug/honeypot (score, riscos, freeze authority, LP) |
+
+Descartadas (com motivo): `pumpdev.io` (terceiro sem histórico verificável — não é "o melhor"),
+Birdeye/Solana Tracker (exigem chave e cobram acima do free), gRPC gratuito (não existe: Helius
+LaserStream começa no plano Business, US$ 499/mês), DexScreener/Jupiter/Jito (já integrados e
+orçados no adendo 9).
+
+### 2. `src/pumpPortalFeed.ts` — o feed que elimina o gargalo
+
+- **Uma conexão por processo.** A documentação do provedor é explícita: várias conexões simultâneas
+  podem causar banimento (que expira em 1 hora). `connect()` é idempotente por construção, e o
+  teste trava isso.
+- Backoff exponencial com jitter e teto de 60 s — reconectar em rajada é justamente o que causa ban.
+- Dedupe por assinatura reutilizando `SeenLaunchSignatures` do caminho quente.
+- **Parsing defensivo:** a página de documentação não lista os campos da mensagem. O parser exige
+  apenas `mint` estruturalmente válido (base58) e trata o resto como opcional; campo ausente vira
+  `null`, nunca valor inventado, e `fields` registra o que a mensagem realmente trouxe.
+- Zero dependências novas: usa o `WebSocket` global (Node ≥ 22) e aceita `wsFactory` injetada — é o
+  que permite testar o feed inteiro **sem abrir socket**.
+
+**Fiação:** o evento entra no MESMO pipeline, marcado `preEnriched: true`, e o pipeline marca
+`enriched` imediatamente após o portão rápido. Ou seja, `received → gate_ok → enriched` acontece em
+microssegundos em vez de esperar confirmação de bloco. O `logsSubscribe` continua ativo porque é
+ele que cobre **Raydium e Meteora** — e porque depender de um único terceiro seria fragilidade.
+Quando as duas fontes veem o mesmo lançamento, o portão por mint garante **uma** decisão (a
+duplicata aparece em `hotPath.inFlightDuplicatesDropped`).
+
+**Honestidade no painel:** o rótulo da fonte só é `real` com prova de vida (`eventsEmitted > 0`).
+Feed criado que nunca conectou é `unavailable` — declarar "real" pelo simples fato de o objeto
+existir seria repetir o defeito que este trabalho vem corrigindo. Pelo mesmo motivo,
+`enrichmentMs: 0` neste caminho é **zero medido** (o mint veio no evento), não "não medido".
+
+### 3. `src/rugCheck.ts` — evidência que só pode ENDURECER
+
+Três regras, todas com teste:
+
+1. **Indisponível ≠ aprovado.** Falha/timeout/HTTP ruim/cota esgotada viram `available: false` com
+   **motivo explícito**, registrado em `missingChecks` e em `evidence.rugcheck`.
+2. **Limpo ≠ crédito.** Relatório sem riscos é utilizável mas **não eleva** o score local
+   (ausência de risco externo não é atestado de segurança).
+3. **Perigo desconta.** Riscos `danger`, score ≥ 500/700 e freeze authority ativa reduzem o score
+   (teto de −45) e entram nos motivos de risco.
+
+Orçamento de ~5 req/min (teto prático relatado por terceiros; o provedor não publica limite) com
+**espera zero**: evidência adicional não pode atrasar a decisão de um lançamento. Desligável por
+`HFT_RUGCHECK=0`.
+
+### 4. Encerramento gracioso (o detalhe que evita ban)
+
+O processo não tinha tratador de sinal: matar o bot deixava o WebSocket do RPC tentando reconectar
+para sempre (`max_reconnects: Infinity`) e abandonava a conexão da PumpPortal — exatamente o
+comportamento que o provedor avisa que pode banir. Agora `SIGTERM`/`SIGINT` desconectam as duas
+fontes e fecham o HTTP, com rede de segurança de 5 s.
+
+### 5. Medição (`npm run free:check` agora tem 12 estágios)
+
+Dois estágios novos: **PumpPortal** (conecta, assina, conta eventos — com três desfechos distintos:
+socket não abriu = rede; abriu com 0 eventos = INCONCLUSIVO; abriu com N = feed vivo) e **RugCheck**
+(consulta real, mostra score/riscos ou o motivo da indisponibilidade). `.env.example` e `GRATIS.md`
+atualizados com as chaves `HFT_PUMPPORTAL`, `PUMPPORTAL_WS_URL` e `HFT_RUGCHECK`.
+
+### 6. Estado verificado
+
+```
+npm run lint              → exit 0
+npm run test              → 120/120 (grupos [18] feed PumpPortal: 7 testes; [19] RugCheck: 6 testes)
+npm run build             → ok
+npm start (produção)      → PAPER; /api/health.pumpPortal e /api/system-truth.budgets (6 provedores)
+                            respondendo; sem rede no sandbox o feed reporta socketOpen=false e
+                            agenda reconexão com backoff, sem fingir estar conectado
+```
+
+### 7. O que continua NÃO verificado
+
+- **Nenhuma das duas fontes foi exercitada com rede real neste sandbox** (sem egress). O contrato
+  da PumpPortal é o documentado pelo provedor e o do RugCheck é inferido de uso público — o parser
+  é defensivo justamente por isso. A primeira execução no SEU ambiente é a validação: se
+  `pumpPortal.invalidMessages` subir, o formato mudou; o log diz o motivo e o ajuste é guiado por
+  dado observado, não por chute.
+- **O feed não substitui o WSS**: se a PumpPortal cair, sobram Raydium/Meteora + pump.fun via logs.
+- **RugCheck não garante nada** e não substitui as checagens on-chain do próprio bot.
+- **Execução real (S6) continua não implementada** — e não é gratuita: taxa de rede e tip são
+  custo real, e o `sendTransaction` do plano gratuito da Helius é limitado a 1/s.

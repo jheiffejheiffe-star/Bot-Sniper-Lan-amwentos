@@ -72,6 +72,8 @@ import {
   type HotPathStats,
 } from "./src/hotPath.js";
 import { buildBudgetRegistry, withBudget } from "./src/rateBudget.js";
+import { PumpPortalFeed, type PumpPortalEvent } from "./src/pumpPortalFeed.js";
+import { fetchRugCheckEvidence, rugCheckRiskReasons } from "./src/rugCheck.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
 import { compareStrategies, DEFAULT_STRATEGIES } from "./src/replay.js";
 import bs58 from "bs58";
@@ -207,6 +209,13 @@ app.use((req, res, next) => {
  */
 let geyserClientRef: GeyserStreamClient | null = null;
 
+/**
+ * Feed gratuito da PumpPortal (terceiro) — entrega o mint NA CRIAÇÃO do token, então este
+ * caminho não paga `getTransaction` nem a espera até `confirmed` (limite estrutural do S5).
+ * Fonte ADICIONAL: o `logsSubscribe` do RPC continua ativo e cobre Raydium/Meteora.
+ */
+let pumpPortalRef: PumpPortalFeed | null = null;
+
 app.get("/api/health", (_req, res) => {
   const detection = geyserClientRef?.getHealth() ?? null;
   res.json({
@@ -239,6 +248,7 @@ app.get("/api/health", (_req, res) => {
      * `skipped > 0` no dexscreener, por exemplo, significa "faltou dado por cota".
      */
     budgets: budgets.resumo(),
+    pumpPortal: pumpPortalRef?.getHealth() ?? null,
     detectionNote:
       "connected=true apenas indica que as subscrições de logs foram ACEITAS pelo RPC. " +
       "A prova de que a detecção funciona é `eventCount` crescendo — não o log de boot.",
@@ -1073,6 +1083,38 @@ app.get("/api/system-truth", (_req, res) => {
         "subscriptionsRequested é registro LOCAL; a prova de detecção é eventCount > 0. " +
         "enrichmentFailures > 0 = notificação vista e mint NÃO obtido: perda real de oportunidade, " +
         "não ausência de lançamento.",
+    },
+    {
+      source: "feed de lançamentos (PumpPortal, terceiro)",
+      /**
+       * O rótulo segue a MESMA régua do resto do painel: "real" só com prova de uso. Feed que
+       * existe mas nunca conectou é `unavailable` — declarar "real" pelo simples fato de o
+       * objeto ter sido criado seria repetir o defeito que este trabalho vem corrigindo.
+       */
+      status: (() => {
+        if (process.env.HFT_PUMPPORTAL === "0") return "unavailable" as const;
+        const h = pumpPortalRef?.getHealth();
+        if (!h) return "unavailable" as const;
+        return h.eventsEmitted > 0 ? ("real" as const) : ("unavailable" as const);
+      })(),
+      detail: pumpPortalRef
+        ? (() => {
+            const h = pumpPortalRef!.getHealth();
+            return (
+              `socketOpen=${h.socketOpen}, assinaturas=${h.subscriptionsSent.length}, ` +
+              `eventos=${h.eventsEmitted}, mensagens inválidas=${h.invalidMessages}, ` +
+              `duplicatas=${h.duplicatesDropped}` +
+              (h.sinceLastMessageMs !== null ? `, última mensagem há ${h.sinceLastMessageMs}ms` : ", nenhuma mensagem ainda") +
+              (h.eventsEmitted === 0 && !h.socketOpen ? " — sem conexão com o provedor" : "")
+            );
+          })()
+        : process.env.HFT_PUMPPORTAL === "0"
+          ? "desligado por configuração (HFT_PUMPPORTAL=0)"
+          : "não inicializado",
+      caveat:
+        "Serviço de terceiro, grátis e sem chave para subscribeNewToken/subscribeMigration. " +
+        "Entrega o mint na criação (sem getTransaction), mas NÃO é confirmação de cadeia: o " +
+        "filtro profundo continua verificando no RPC. Prova de vida = eventos > 0.",
     },
     {
       source: "banco operacional",
@@ -3123,6 +3165,40 @@ async function fetchRealOnChainTokenData(tokenMint: string, tokenName?: string):
     }
   }
 
+  /**
+   * 3.5 EVIDÊNCIA EXTERNA (RugCheck) — segundo par de olhos, GRÁTIS, e SEMPRE na direção de
+   * endurecer. Regras:
+   *   - indisponível não é aprovação: vira `missingChecks` e `evidence.rugcheck` com o motivo;
+   *   - disponível e limpo NÃO eleva o score (ausência de risco externo não é atestado);
+   *   - disponível com perigo/score alto REDUZ o score e entra nos motivos de risco.
+   * A cota é respeitada sem espera (evidência adicional não atrasa decisão de lançamento).
+   */
+  if (process.env.HFT_RUGCHECK !== "0") {
+    const rugcheckEvidence = await fetchRugCheckEvidence(tokenMint, {
+      budget: budgets.rugcheck,
+      maxWaitMs: 0,
+      timeoutMs: 3_500,
+    });
+    evidence.rugcheck = rugcheckEvidence.available
+      ? `disponível em ${rugcheckEvidence.latencyMs ?? "?"}ms (score=${rugcheckEvidence.score ?? "?"}, riscos=${rugcheckEvidence.risks.length})`
+      : `INDISPONÍVEL: ${rugcheckEvidence.reason ?? "motivo não informado"}`;
+    if (!rugcheckEvidence.available) {
+      missingChecks.push("rugcheck (evidência externa)");
+    } else {
+      const external = rugCheckRiskReasons(rugcheckEvidence);
+      if (external.usable && external.reasons.length > 0) {
+        // Cada risco apontado desconta; o teto de 0 é aplicado no fim do scoring.
+        score -= Math.min(45, external.reasons.length * 15);
+        riskReasons.push(...external.reasons);
+      }
+      if (rugcheckEvidence.lpLockedPct !== null) {
+        evidence.lpLocked = `${rugcheckEvidence.lpLockedPct.toFixed(1)}% ($${Math.round(rugcheckEvidence.lpLockedUsd ?? 0).toLocaleString()})`;
+      }
+    }
+  } else {
+    evidence.rugcheck = "desligado por configuração (HFT_RUGCHECK=0)";
+  }
+
   // 4. SCORING — apenas sobre evidência positiva.
   if (mintAuthorityDisabled === false) {
     score -= 30;
@@ -3195,6 +3271,9 @@ async function fetchRealOnChainTokenData(tokenMint: string, tokenName?: string):
         `freeze ${freezeAuthorityDisabled ? "revogada" : "ATIVA"}.`
     );
     if (riskReasons.length > 0) parts.push(`Alertas: ${riskReasons.join("; ")}.`);
+    if (evidence.rugcheck && evidence.rugcheck.startsWith("disponível")) {
+      parts.push(`Evidência externa (RugCheck): ${evidence.rugcheck}.`);
+    }
     parts.push(
       `Liquidez: ${liquidityUsd > 0 ? "$" + Math.round(liquidityUsd).toLocaleString() : "não medida"} ` +
         `em ${poolSource}. Status de lock do LP NÃO VERIFICADO.`
@@ -3432,6 +3511,13 @@ async function executeAutonomousPipeline(event: any, trace?: LatencyTrace): Prom
 
   // Portão rápido vencido: tudo daqui para frente custa rede.
   trace?.mark("gate_ok");
+
+  /**
+   * EVENTO PRÉ-ENRIQUECIDO (PumpPortal): o mint veio NA notificação, então não existe espera de
+   * enriquecimento. Marcar aqui é medir a verdade — e é exatamente o ganho que motivou este
+   * feed: no caminho WSS, `enriched` só acontece depois do `getTransaction` em `confirmed`.
+   */
+  if (event.preEnriched === true) trace?.mark("enriched");
 
   const deepStartedAt = Date.now();
   let deepComplete = false;
@@ -5682,6 +5768,86 @@ async function startServer() {
           );
         }
       }
+      /**
+       * FEED GRATUITO DA PUMPPORTAL (segunda fonte de detecção).
+       *
+       * Entrega o MINT no próprio evento de criação. Por isso este caminho não chama
+       * `getTransaction` e não espera `confirmed` — que o S5 mediu como o gargalo estrutural do
+       * caminho WSS. Fonte ADICIONAL: Raydium e Meteora continuam exclusivamente no WSS.
+       */
+      if (process.env.HFT_PUMPPORTAL !== "0") {
+        const feed = new PumpPortalFeed({
+          url: process.env.PUMPPORTAL_WS_URL?.trim() || undefined,
+          onEvent: (ppEvent: PumpPortalEvent) => {
+            const receivedAt = wallClockNow();
+            const trace = new LatencyTrace(
+              `pp_${ppEvent.signature?.slice(0, 16) ?? ppEvent.mint}_${receivedAt}`,
+              receivedAt,
+              null, // PumpPortal não informa slot na mensagem: null, nunca inventado
+              null
+            );
+
+            const launchEvent = {
+              id: trace.id,
+              timestamp: receivedAt,
+              programId: "pumpportal",
+              programName: "Pump.fun (feed PumpPortal)",
+              type: ppEvent.txType === "migrate" ? "Migration" : "TokenCreated",
+              mint: ppEvent.mint,
+              mintName: ppEvent.name ?? ppEvent.symbol ?? "LAUNCHED_TOKEN",
+              signature: ppEvent.signature,
+              slot: null,
+              /**
+               * Custo de enriquecimento NESTE caminho é zero por construção: o mint veio na
+               * mensagem. Zero medido — diferente de null, que significaria "não medido".
+               */
+              enrichmentMs: 0,
+              slotLagMs: null,
+              source: "pumpportal",
+              isRealOnChain: true,
+              simulated: false,
+            };
+
+            telemetry.record(trace.toRecord("pending"));
+            recorder.recordLaunchEvent({
+              eventId: `${ppEvent.signature ?? ppEvent.mint}:0`,
+              source: "pumpportal",
+              programId: "pumpportal",
+              programName: "Pump.fun (feed PumpPortal)",
+              eventType: launchEvent.type,
+              mint: ppEvent.mint,
+              signature: ppEvent.signature ?? "",
+              slot: null,
+              enrichmentMs: 0,
+            });
+
+            realOnChainEvents.unshift(launchEvent);
+            if (realOnChainEvents.length > 50) realOnChainEvents.pop();
+
+            executeAutonomousPipeline(
+              {
+                mint: ppEvent.mint,
+                mintName: launchEvent.mintName,
+                signature: ppEvent.signature,
+                preEnriched: true,
+                source: "pumpportal",
+              },
+              trace
+            ).catch((err) => {
+              console.error("[Autonomous Daemon] Pipeline (PumpPortal) error:", err.message);
+            });
+          },
+        });
+        pumpPortalRef = feed;
+        feed.connect();
+        console.log(
+          "[PumpPortal] Feed assinado (subscribeNewToken + subscribeMigration), uma conexão " +
+            "única. Mint direto no evento: este caminho NÃO paga getTransaction."
+        );
+      } else {
+        console.log("[PumpPortal] Desligado por configuração (HFT_PUMPPORTAL=0).");
+      }
+
     } catch (err: any) {
       console.log("[HFT Engine] Real infrastructure setup skipped or offline. Running simulation fallback mode.", err.message);
     }
@@ -5742,9 +5908,42 @@ async function startServer() {
   const bindHost = (process.env.HFT_BIND_HOST || "").trim() || "127.0.0.1";
   console.log(`[Server] Bind em ${bindHost}:${PORT} (HFT_BIND_HOST para expor deliberadamente).`);
 
-  app.listen(PORT, bindHost, () => {
+  const httpServer = app.listen(PORT, bindHost, () => {
     console.log(`[Server] Primary HTTP service running on port ${PORT}`);
   });
+
+  /**
+   * ENCERRAMENTO GRACIOSO.
+   *
+   * Sem isto, matar o processo deixava o WebSocket do RPC tentando reconectar para sempre
+   * (`max_reconnects: Infinity`) e abandonava a conexão da PumpPortal — e a documentação do
+   * provedor avisa que conexões abandonadas/múltiplas podem causar banimento (expira em 1h).
+   * Encerrar corretamente é parte de operar bem um serviço de terceiro.
+   */
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Shutdown] ${signal} recebido: desconectando fontes de dados e encerrando HTTP.`);
+    try {
+      geyserClientRef?.disconnect();
+    } catch (err: any) {
+      console.warn("[Shutdown] Falha ao desconectar o cliente de detecção:", err?.message ?? err);
+    }
+    try {
+      pumpPortalRef?.stop();
+    } catch (err: any) {
+      console.warn("[Shutdown] Falha ao encerrar o feed da PumpPortal:", err?.message ?? err);
+    }
+    httpServer.close(() => {
+      console.log("[Shutdown] HTTP encerrado. Nada ficou pendente.");
+      process.exit(0);
+    });
+    // Rede de segurança: se algum socket pendurar o fechamento, não ficamos presos.
+    setTimeout(() => process.exit(0), 5_000).unref?.();
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 
   // In Cloud Run production deployments, Cloud Run routes traffic to process.env.PORT (typically 8080).
   // Listen on process.env.PORT as well so Cloud Run health checks and ingress routing succeed.

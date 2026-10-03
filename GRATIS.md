@@ -29,8 +29,9 @@ promete lucro e não vende facilidade: diz o que o dinheiro compra e o que o có
 | RPC HTTP + WS | **Syndica Free** | 10M req/mês; até **100 req/s** | Maior teto gratuito de **leitura** | sem camada de mercado; parsing é seu |
 | RPC HTTP + WS | **Alchemy Free** | 30M CU/mês; 25 req/s | Maior folga em CU | `getTransaction`/`getBlock` custam **4x** |
 | RPC HTTP + WS | **QuickNode Free** | 10M créditos/mês; ~15 req/s (fontes divergem — medir) | WS + add-ons | créditos pesam por método |
-| Detecção | **WSS `logsSubscribe`** (qualquer plano) | sem custo por notificação | É o que o bot usa hoje | depende do WS do provedor |
-| Detecção (opcional) | **PumpPortal `subscribeNewToken`** | grátis, sem chave | Entrega o **mint direto** na criação do token | requer implementar (autorização) |
+| Detecção | **WSS `logsSubscribe`** (qualquer plano) | sem custo por notificação | Cobre Pump.fun + Raydium + Meteora | depende do WS do provedor |
+| Detecção | **PumpPortal `subscribeNewToken` / `subscribeMigration`** ✅ *implementado* | grátis, sem chave | Entrega o **mint direto** na criação → **sem `getTransaction`** neste caminho | é serviço de terceiro; uma conexão só (a doc avisa que múltiplas podem banir) |
+| Filtro de risco | **RugCheck `/report`** ✅ *implementado* | grátis | Segundo par de olhos: score, riscos, freeze authority, LP | ~5 req/min relatado; é evidência ADICIONAL (nunca aprova) |
 | Preço/liquidez | **DexScreener API pública** | 300 req/min (tokens/pairs/search) | Preço, liquidez, pares | 429 em rajada se não houver orçamento |
 | Cotação de saída | **Jupiter Free** | **60 req/min por organização** (≈1/s) | Cotação de swap para preço/saída | criar mais chaves **não** aumenta |
 | Execução | **Jito block engine** | 1 req/s por IP por região; tip mínimo 1000 lamports | Bundles e status de landing | 429 ao consultar em loop |
@@ -52,9 +53,12 @@ Os números acima estão codificados em `src/rateBudget.ts` (campo `source` de c
    um RPC em us-east paga **~120–200 ms por chamada**; o mesmo código numa VPS gratuita da mesma
    região mede **uma ordem de grandeza menos**. É o maior ganho gratuito que existe, e o
    `free:check` mostra o seu número.
-4. **Detecção pelo WSS (grátis) e, se autorizado, PumpPortal para o mint direto.** O S5 mediu o
-   gargalo: `getTransaction` **não aceita `processed`**, então enriquecer o lançamento sempre
-   espera `confirmed`. Um feed que já entrega o mint elimina essa espera **e** o custo de crédito.
+4. **Detecção em PARALELO: WSS do RPC + PumpPortal (ambos grátis).** O S5 mediu o gargalo:
+   `getTransaction` **não aceita `processed`**, então enriquecer o lançamento sempre espera
+   `confirmed`. O feed da PumpPortal entrega o mint na notificação e elimina essa espera (está
+   implementado e medido em `pumpPortal` no `/api/health`). O WSS do RPC continua porque é ele
+   que cobre **Raydium e Meteora** — e porque depender de um único terceiro para detectar seria
+   fragilidade, não velocidade.
 5. **PAPER → SHADOW, nunca LIVE.** Em plano gratuito, `sendTransaction` é limitado a ~1/s e não há
    conexão *staked*: comprar caro e não conseguir vender é o cenário provável, não o extremo.
 
@@ -81,6 +85,10 @@ MAX_POSITION_SOL=0.05
 # Orçamento do filtro profundo por sinal (LIVE veta se estourar; PAPER prossegue marcado).
 HFT_DEEP_FILTER_BUDGET_MS=900
 
+# Ferramentas gratuitas de detecção e evidência (padrão: ligadas).
+HFT_PUMPPORTAL=1            # feed PumpPortal (mint direto, sem getTransaction). Requer Node >= 22.
+HFT_RUGCHECK=1              # evidência externa de risco no filtro profundo (nunca aprova sozinha).
+
 # NÃO preencha isto agora:
 # OPERATIONAL_PRIVATE_KEY=...
 # LIVE_TRADING_ENABLED=true
@@ -105,6 +113,18 @@ Exemplo com **Helius Free** (1M créditos/mês, 10 req/s):
   saída, que tem prioridade).
 - **Jito:** 1/s. O oráculo de tip tem cache de 10 s; status de bundle é conferido com throttle.
 
+### 5.1 O caminho novo de detecção (por que ele é mais rápido)
+
+```
+ANTES  : logsSubscribe → getTransaction(confirmed, espera!) → mint → decisão
+AGORA  : PumpPortal → mint + nome/símbolo/signature → decisão        (0 RTT de enriquecimento)
+         logsSubscribe → getTransaction → decisão                      (Raydium/Meteora e redundância)
+```
+
+Os dois alimentam o MESMO pipeline; o portão por mint (`InFlightMints`) garante que o mesmo
+lançamento visto pelas duas fontes vire **uma** decisão — a duplicata é contada em
+`hotPath.inFlightDuplicatesDropped`, e não é erro: é o desenho.
+
 ## 6. O que medir, em ordem, e o que cada número decide
 
 | Medição | Onde ver | O que decide |
@@ -113,6 +133,9 @@ Exemplo com **Helius Free** (1M créditos/mês, 10 req/s):
 | Notificações na janela do WSS | `free:check` (estágio 3) | se 0, **não prova** detecção quebrada: aumente a janela e repita em horários diferentes |
 | `budgets.*.skipped` | `/api/system-truth` | >0 = plano subdimensionado para o polling atual |
 | `hotPath.enrichmentFailures` | `/api/health` | notificação vista e mint **não** obtido: perda real de oportunidade |
+| `pumpPortal.eventsEmitted` | `/api/health` | prova de vida do feed gratuito (log de conexão **não** é prova) |
+| `pumpPortal.invalidMessages` | `/api/health` | contrato do provedor mudou: ajustar o parser com o dado observado, sem chutar |
+| `budgets.rugcheck.skipped` | `/api/system-truth` | evidência externa perdida por cota (o filtro local continua valendo) |
 | `replay` / PnL paper | `npm run replay` | expectativa da estratégia — **não** "ganhou em 3 trades" |
 
 ## 7. Quando pagar: a ordem que rende mais por real
@@ -141,5 +164,11 @@ Exemplo com **Helius Free** (1M créditos/mês, 10 req/s):
   desatualizado — o lugar de corrigir é `src/rateBudget.ts`.
 - `npm run free:check` mede, mas **uma execução não é uma amostra**: rode em horários diferentes,
   com a rede que você vai usar de verdade.
+- **Dependência de terceiro é risco operacional.** O feed da PumpPortal não é oficial da
+  pump.fun; se ele cair ou mudar o formato, o contador `invalidMessages` sobe e a detecção volta
+  a depender do WSS. Nada de capital deve repousar na premissa de que ele estará sempre lá.
+- **RugCheck não garante nada.** Ele é um segundo par de olhos: ausência de risco apontado **não**
+  é atestado de segurança, e um relatório "limpo" não eleva o score local. O que aprova ou reprova
+  continua sendo as checagens on-chain feitas pelo próprio bot.
 - Nada neste documento autoriza execução real. O caminho de entrada on-chain (S6) continua
   pendente e depende de autorização explícita + capital.

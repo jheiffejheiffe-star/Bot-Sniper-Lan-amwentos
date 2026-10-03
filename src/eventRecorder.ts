@@ -29,7 +29,7 @@ import { JsonlSink, readJsonl } from "./telemetry.js";
 /* TIPOS DE REGISTRO                                                           */
 /* -------------------------------------------------------------------------- */
 
-export type EventSource = "wss-logs" | "grpc-geyser" | "manual";
+export type EventSource = "wss-logs" | "grpc-geyser" | "pumpportal" | "manual";
 
 export interface RecordedLaunchEvent {
   kind: "launch-event";

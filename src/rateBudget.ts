@@ -232,6 +232,14 @@ export const MARKET_BUDGET_SPECS = {
     windowMs: 60_000,
     source: "Jupiter API Free: 60 req/min por ORGANIZAÇÃO (≈1 req/s) — criar mais chaves não aumenta o limite",
   } as BudgetSpec,
+  rugcheck: {
+    name: "rugcheck",
+    limit: 5,
+    windowMs: 60_000,
+    source:
+      "RugCheck API gratuita; teto prático relatado por terceiros ~5 req/min — evidência " +
+      "ADICIONAL: não pode virar gargalo do caminho quente",
+  } as BudgetSpec,
   jitoTipFloor: {
     name: "jito-tip-floor",
     limit: 1,
@@ -250,6 +258,7 @@ export interface BudgetRegistry {
   rpc: RateBudget;
   dexscreener: RateBudget;
   jupiter: RateBudget;
+  rugcheck: RateBudget;
   jitoTipFloor: RateBudget;
   jitoBlockEngine: RateBudget;
   snapshot(): BudgetSnapshot[];
@@ -284,6 +293,7 @@ export function buildBudgetRegistry(options: BuildBudgetOptions = {}): BudgetReg
   const rpc = new RateBudget(effective(profile), now);
   const dexscreener = new RateBudget(effective(MARKET_BUDGET_SPECS.dexscreener), now);
   const jupiter = new RateBudget(effective(MARKET_BUDGET_SPECS.jupiter), now);
+  const rugcheck = new RateBudget(effective(MARKET_BUDGET_SPECS.rugcheck), now);
   const jitoTipFloor = new RateBudget(effective(MARKET_BUDGET_SPECS.jitoTipFloor), now);
   const jitoBlockEngine = new RateBudget(effective(MARKET_BUDGET_SPECS.jitoBlockEngine), now);
 
@@ -291,12 +301,13 @@ export function buildBudgetRegistry(options: BuildBudgetOptions = {}): BudgetReg
     rpc,
     dexscreener,
     jupiter,
+    rugcheck,
     jitoTipFloor,
     jitoBlockEngine,
-    snapshot: () => [rpc, dexscreener, jupiter, jitoTipFloor, jitoBlockEngine].map((b) => b.snapshot()),
+    snapshot: () => [rpc, dexscreener, jupiter, rugcheck, jitoTipFloor, jitoBlockEngine].map((b) => b.snapshot()),
     resumo: () => {
       const out: Record<string, { used: number; limit: number; janelaMs: number; skipped: number; bypassed: number; perfil: string }> = {};
-      for (const b of [rpc, dexscreener, jupiter, jitoTipFloor, jitoBlockEngine]) {
+      for (const b of [rpc, dexscreener, jupiter, rugcheck, jitoTipFloor, jitoBlockEngine]) {
         out[b.spec.name] = {
           used: b.used(),
           limit: b.spec.limit,

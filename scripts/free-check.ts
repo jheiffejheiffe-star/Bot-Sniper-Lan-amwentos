@@ -38,6 +38,8 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { RPC_ENDPOINT, RPC_WEBSOCKET } from "../src/realExecution.js";
 import { RPC_PROFILES, buildBudgetRegistry, type RpcProfileName } from "../src/rateBudget.js";
+import { PumpPortalFeed } from "../src/pumpPortalFeed.js";
+import { fetchRugCheckEvidence } from "../src/rugCheck.js";
 import { getRuntimeModeResolution } from "../src/runtimeMode.js";
 
 const args = process.argv.slice(2);
@@ -225,6 +227,46 @@ async function main(): Promise<void> {
   }
 
   /* ------------------------------------------------------------------ */
+  console.log("\n[3b] Feed PumpPortal (mint direto, grátis, sem chave)");
+  if (QUICK) {
+    record("PumpPortal subscribeNewToken", true, "pulada (--quick)", true);
+  } else {
+    const ppWindowMs = 12_000;
+    let ppEvents = 0;
+    let ppError: string | null = null;
+    const ppFeed = new PumpPortalFeed({
+      onEvent: () => {
+        ppEvents++;
+      },
+    });
+    ppFeed.connect();
+    await new Promise((r) => setTimeout(r, ppWindowMs));
+    const h = ppFeed.getHealth();
+    ppFeed.stop();
+    ppError = h.lastError;
+    if (!h.socketOpen) {
+      record(
+        "PumpPortal subscribeNewToken",
+        false,
+        `socket NÃO abriu (${ppWindowMs / 1000}s) — ${ppError ?? "sem detalhe do erro"}`
+      );
+    } else if (ppEvents === 0) {
+      record(
+        "PumpPortal subscribeNewToken",
+        false,
+        `socket abriu e 0 evento(s) em ${ppWindowMs / 1000}s — INCONCLUSIVO (pump.fun lança em rajadas; repita)`
+      );
+    } else {
+      record(
+        "PumpPortal subscribeNewToken",
+        true,
+        `${ppEvents} evento(s) em ${ppWindowMs / 1000}s com mint direto ($${h.messagesReceived} mensagens, ` +
+          `${h.invalidMessages} inválidas, ${h.duplicatesDropped} duplicadas)`
+      );
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
   console.log("\n[4] DexScreener (mercado)");
   const dex = await timedFetch(`${DEXSCREENER_BASE_URL}/tokens/${USDC_MINT}`);
   record(
@@ -269,6 +311,24 @@ async function main(): Promise<void> {
     tipAccounts.ok
       ? `${tipAccounts.body?.result?.length ?? 0} tip accounts em ${tipAccounts.ms}ms (limite: 1 req/s/IP/região)`
       : `HTTP ${tipAccounts.status} em ${tipAccounts.ms}ms — ${String(tipAccounts.body ?? "").slice(0, 80)}`
+  );
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[6b] RugCheck (evidência externa de risco, grátis)");
+  const rugcheck = await fetchRugCheckEvidence(USDC_MINT, {
+    fetchImpl: (async (url: any, init: any) => {
+      const t0 = Date.now();
+      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(9000) });
+      return { ok: res.ok, status: res.status, json: async () => res.json(), _ms: Date.now() - t0 } as any;
+    }) as any,
+    timeoutMs: 9_000,
+  });
+  record(
+    "RugCheck /report",
+    rugcheck.available,
+    rugcheck.available
+      ? `disponível em ${rugcheck.latencyMs ?? "?"}ms (score=${rugcheck.score ?? "?"}, riscos=${rugcheck.risks.length}) — evidência ADICIONAL: não aprova nada, só desconta`
+      : `INDISPONÍVEL: ${rugcheck.reason ?? "motivo não informado"} (o bot registra como verificação faltante; NÃO aprova por ausência)`
   );
 
   /* ------------------------------------------------------------------ */
