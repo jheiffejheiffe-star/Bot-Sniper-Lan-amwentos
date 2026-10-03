@@ -1310,7 +1310,12 @@ app.get("/api/system-truth", (_req, res) => {
     { path: "/api/simulate-fork", why: "cenário e tempos são RNG" },
     { path: "/api/simulate-snipe", why: "roteiro de compra simulado (grava posição marcada como paper)" },
     { path: "/api/co-location", why: "RTT por região é RNG" },
-    { path: "/api/jito-leader-schedule", why: "escala de líderes é RNG" },
+    {
+      path: "/api/jito-leader-schedule",
+      why:
+        "não mede nada: nextLeaderSlot/currentLeader/regiões/reputação de block engine vêm `null` " +
+        "com o motivo em `notMeasured` (antes eram RNG). O único campo medido é `currentSlot`.",
+    },
   ];
 
   const realSources = [
