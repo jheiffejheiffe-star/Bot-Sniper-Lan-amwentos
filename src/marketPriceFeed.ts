@@ -8,7 +8,10 @@
  *
  *   1. **DexScreener** — `GET /latest/dex/tokens/{mints}` aceita **até 30 endereços** separados
  *      por vírgula na mesma requisição (mesmo teto de 300 req/min). É a fonte mais rica: dá
- *      `priceNative` (preço JÁ em SOL, sem conversão) e `liquidity.usd`.
+ *      `priceNative`, `priceUsd` e `liquidity.usd`. CUIDADO: `priceNative` é o preço do token na
+ *      moeda de COTAÇÃO do par — só é "preço em SOL" quando o par é cotado em wrapped SOL. Em
+ *      par cotado em USDC, o número está em USDC e vale ~200x o preço em SOL; por isso a
+ *      conversão usa o USD/SOL do PRÓPRIO payload (`priceSolFromDexPairs`).
  *   2. **Jupiter Price API v3** — `GET /price/v3?ids={mints}` aceita **até 50 ids**. Devolve
  *      preço em USD; a conversão para SOL usa o preço do SOL **pedido na mesma requisição**
  *      (o mint wrapped-SOL vai sempre no lote). No plano Free, as chamadas do Price API contam
@@ -50,6 +53,14 @@
  */
 
 import { BudgetOutcome, RateBudget, withBudget } from "./rateBudget.js";
+import {
+  assessDivergence,
+  compareSamples,
+  DEFAULT_DIVERGENCE_THRESHOLDS,
+  PriceSampleBook,
+  type DivergenceFinding,
+  type DivergenceThresholds,
+} from "./priceQuality.js";
 
 export const DEXSCREENER_BASE_URL_DEFAULT = "https://api.dexscreener.com/latest/dex";
 export const JUPITER_PRICE_BASE_URL_DEFAULT = "https://lite-api.jup.ag";
@@ -81,6 +92,24 @@ export interface BatchResult {
   problems: string[];
   /** Fontes que efetivamente forneceram algum preço, na ordem de tentativa. */
   sourcesUsed: string[];
+  /**
+   * Discordâncias entre fontes INDEPENDENTES para o mesmo token (`warn`/`critical`).
+   * Lista vazia significa "não houve discordância relevante" — para saber se houve
+   * comparação de verdade, olhe `verification.checked`.
+   */
+  divergences: DivergenceFinding[];
+  /** Resultado da amostra de verificação cruzada deste ciclo. */
+  verification: BatchVerification;
+}
+
+export interface BatchVerification {
+  /** A verificação cruzada foi tentada neste ciclo? */
+  attempted: boolean;
+  /** Fonte usada na verificação (a primeira que ainda não havia respondido). */
+  source: string | null;
+  /** Quantas comparações cruzadas foram efetivamente feitas. */
+  checked: number;
+  problems: string[];
 }
 
 export interface BatchOptions {
@@ -100,6 +129,28 @@ export interface BatchOptions {
   geckoterminalBudget?: RateBudget;
   /** SOL/USD de reserva quando a fonte não devolve o SOL no lote (nunca inventa). */
   solUsdFallback?: number | null;
+  /**
+   * Livro de amostras por token/fonte. Quando presente, cada preço obtido é COMPARADO com a
+   * amostra mais recente de outra fonte e depois registrado. Sem livro, não há verificação
+   * cruzada — o lote volta a ser só "o primeiro que responde".
+   */
+  sampleBook?: PriceSampleBook;
+  /** Limiares da comparação (ligados por padrão; ver `priceQuality.ts`). */
+  divergenceThresholds?: DivergenceThresholds;
+  /**
+   * Tokens que devem ganhar uma SEGUNDA OPINIÃO neste ciclo, mesmo já tendo preço. A verificação
+   * usa a primeira fonte ainda não tentada (Jupiter, depois GeckoTerminal) e custa no MÁXIMO
+   * uma requisição extra por chamada — é o que permite detectar divergência no caso comum, em
+   * que o DexScreener responde tudo.
+   */
+  verifyMints?: string[];
+  /**
+   * Prioridade da VERIFICAÇÃO. Padrão `background`: verificação é dado adicional, então ela
+   * desiste na primeira negativa de cota e NUNCA faz bypass. Sem isto, uma chamada de lote com
+   * prioridade `exit` (gestão de posição) faria a verificação furar a cota — roubando vaga de
+   * quem realmente precisa reduzir risco.
+   */
+  verificationPriority?: "normal" | "exit" | "background";
 }
 
 function finiteNumber(v: unknown): number | null {
@@ -128,38 +179,150 @@ export function chunk<T>(items: T[], size: number): T[][] {
 /* -------------------------------------------------------------------------- */
 
 /**
- * DexScreener: escolhe o par Solana de MAIOR LIQUIDEZ por token (não o primeiro da lista —
- * pool raso tem preço que não é preço de mercado) e devolve `priceNative` como preço em SOL.
+ * Ancoragem de SOL/USD a partir do próprio payload do DexScreener: o par de MAIOR liquidez cujo
+ * token-base é o wrapped SOL (`priceUsd` é dólar por SOL). Sem isso, não existe como converter
+ * preço em USD para SOL sem inventar cotação — e o `solUsdFallback` do chamador é a única
+ * alternativa explícita.
  */
-export function parseDexScreenerBatch(body: unknown, fetchedAt: number): Map<string, BatchQuote> {
+export function dexSolUsdFromPairs(pairs: unknown, solUsdFallback: number | null = null): number | null {
+  if (!Array.isArray(pairs)) return finiteNumber(solUsdFallback) ?? null;
+  let melhor: number | null = null;
+  let melhorLiquidez = -1;
+  for (const p of pairs) {
+    if (!p || typeof p !== "object") continue;
+    if ((p as any).chainId !== "solana") continue;
+    if ((p as any)?.baseToken?.address !== SOL_MINT) continue;
+    const usd = finiteNumber((p as any).priceUsd);
+    if (usd === null || usd <= 0) continue;
+    const liq = finiteNumber((p as any)?.liquidity?.usd) ?? 0;
+    if (liq > melhorLiquidez) {
+      melhorLiquidez = liq;
+      melhor = usd;
+    }
+  }
+  if (melhor !== null) return melhor;
+  const reserva = finiteNumber(solUsdFallback);
+  return reserva !== null && reserva > 0 ? reserva : null;
+}
+
+/**
+ * Preço em SOL a partir dos pares de UM token, escolhendo o par de MAIOR LIQUIDEZ.
+ *
+ * ## A regra que evita erro de 200x
+ *
+ * No DexScreener, `priceNative` é o preço do token-base na moeda de COTAÇÃO do par — não "em
+ * SOL" por definição. Para um par TOKEN/SOL isso coincide com SOL por token; para um par
+ * TOKEN/USDC, `priceNative` é USDC por token e vale ~200x mais que o preço em SOL (SOL ≈ 200
+ * USD). Usar esse número como preço em SOL infla o PnL e, com capital real, dispara take-profit
+ * imediatamente depois da compra.
+ *
+ * Então:
+ *   1. par cotado em WRAPPED SOL  → `priceNative` É preço em SOL (sem conversão);
+ *   2. par cotado em outro token  → `priceUsd / solUsd` (SOL/USD do mesmo payload);
+ *   3. sem SOL/USD disponível     → `null` (a razão fica em `reason`), nunca o número errado.
+ */
+export function priceSolFromDexPairs(
+  pairs: unknown,
+  mint: string,
+  solUsdFallback: number | null = null,
+  /**
+   * Âncora USD/SOL já extraída do payload COMPLETO. Obrigatória quando `pairs` é apenas a lista
+   * de pares DESTE token (caso do parser em lote): o par do SOL não estaria nessa lista e a
+   * conversão cairia indevidamente em "sem âncora".
+   */
+  solUsdPrecomputed: number | null = null
+): { priceSol: number | null; liquidityUsd: number | null; quoteToken: string | null; reason: string } {
+  const lista = Array.isArray(pairs)
+    ? (pairs as any[]).filter(
+        (p) => p && typeof p === "object" && p.chainId === "solana" && p?.baseToken?.address === mint
+      )
+    : [];
+  if (lista.length === 0) {
+    return { priceSol: null, liquidityUsd: null, quoteToken: null, reason: "nenhum par Solana com este token como base" };
+  }
+
+  // Par de MAIOR liquidez (pool raso não é preço de mercado).
+  const melhor = lista.reduce((a, b) =>
+    (finiteNumber(b?.liquidity?.usd) ?? -1) > (finiteNumber(a?.liquidity?.usd) ?? -1) ? b : a
+  );
+  const liquidityUsd = finiteNumber(melhor?.liquidity?.usd);
+  const quoteToken = typeof melhor?.quoteToken?.address === "string" ? melhor.quoteToken.address : null;
+
+  // O próprio wrapped SOL vale 1 SOL, por definição — independe da moeda de cotação do par.
+  if (mint === SOL_MINT) {
+    return { priceSol: 1, liquidityUsd, quoteToken, reason: "wrapped SOL (preço 1 por definição)" };
+  }
+
+  const priceNative = finiteNumber(melhor?.priceNative);
+  if (quoteToken === SOL_MINT) {
+    if (priceNative !== null && priceNative > 0) {
+      return { priceSol: priceNative, liquidityUsd, quoteToken, reason: "par cotado em SOL: priceNative já é SOL por token" };
+    }
+    return { priceSol: null, liquidityUsd, quoteToken, reason: "par cotado em SOL, mas priceNative ausente ou inválido" };
+  }
+
+  const priceUsd = finiteNumber(melhor?.priceUsd);
+  const solUsd = solUsdPrecomputed ?? dexSolUsdFromPairs(pairs, solUsdFallback);
+  if (priceUsd !== null && priceUsd > 0 && solUsd !== null && solUsd > 0) {
+    return {
+      priceSol: priceUsd / solUsd,
+      liquidityUsd,
+      quoteToken,
+      reason: quoteToken === null ? "par sem quoteToken: convertido por USD/SOL do lote" : "par cotado em outro token: convertido por USD/SOL do lote",
+    };
+  }
+
+  return {
+    priceSol: null,
+    liquidityUsd,
+    quoteToken,
+    reason:
+      "par cotado em outro token e sem SOL/USD no payload: converter seria fabricar preço " +
+      "(priceNative está na moeda de cotação, não em SOL)",
+  };
+}
+
+/**
+ * DexScreener, em lote: escolhe o par Solana de MAIOR LIQUIDEZ por token e calcula o preço em
+ * SOL pela regra acima (`priceSolFromDexPairs`). A fonte registrada em `source` diz QUAL
+ * caminho foi usado, para o operador saber se houve conversão.
+ */
+export function parseDexScreenerBatch(
+  body: unknown,
+  fetchedAt: number,
+  solUsdFallback: number | null = null
+): Map<string, BatchQuote> {
   const out = new Map<string, BatchQuote>();
   const pairs = (body as any)?.pairs;
   if (!Array.isArray(pairs)) return out;
 
+  const porMint = new Map<string, any[]>();
   for (const p of pairs) {
     if (!p || typeof p !== "object") continue;
     if ((p as any).chainId !== "solana") continue;
     const mint = (p as any)?.baseToken?.address;
     if (!isQueryableMint(mint)) continue;
+    const lista = porMint.get(mint) ?? [];
+    lista.push(p);
+    porMint.set(mint, lista);
+  }
 
-    const priceSol = finiteNumber((p as any).priceNative);
-    const liquidityUsd = finiteNumber((p as any)?.liquidity?.usd);
-    const existing = out.get(mint);
+  // Âncora USD/SOL do payload COMPLETO (o SOL pode não ser base de nenhum par da lista de um token).
+  const solUsdAncora = dexSolUsdFromPairs(pairs, solUsdFallback);
 
-    const better =
-      !existing ||
-      (liquidityUsd ?? -1) > (existing.liquidityUsd ?? -1) ||
-      ((liquidityUsd ?? null) === (existing.liquidityUsd ?? null) && existing.priceSol === null && priceSol !== null);
-
-    if (better) {
-      out.set(mint, {
-        mint,
-        priceSol,
-        liquidityUsd,
-        source: "dexscreener (lote)",
-        fetchedAt,
-      });
-    }
+  for (const [mint, lista] of porMint) {
+    const r = priceSolFromDexPairs(lista, mint, solUsdFallback, solUsdAncora);
+    const conversao = r.reason.includes("convertido") ? " (USD→SOL do lote)" : "";
+    out.set(mint, {
+      mint,
+      priceSol: r.priceSol,
+      liquidityUsd: r.liquidityUsd,
+      source:
+        r.priceSol === null
+          ? `dexscreener (lote) — sem preço em SOL: ${r.reason}`
+          : `dexscreener (lote)${conversao}`,
+      fetchedAt,
+    });
   }
   return out;
 }
@@ -288,14 +451,40 @@ export async function fetchBatchPrices(mints: string[], options: BatchOptions = 
   const quotes = new Map<string, BatchQuote>();
   const problems: string[] = [];
   const sourcesUsed: string[] = [];
+  const divergences: DivergenceFinding[] = [];
+  const verification: BatchVerification = { attempted: false, source: null, checked: 0, problems: [] };
+  const book = options.sampleBook;
+  const thresholds = options.divergenceThresholds ?? DEFAULT_DIVERGENCE_THRESHOLDS;
   let requests = 0;
 
   const wanted = [...new Set(mints.filter(isQueryableMint))];
   if (wanted.length === 0) {
-    return { quotes, requests, problems: ["nenhum mint consultável na lista (vazio ou com endereços de mock)"], sourcesUsed };
+    return {
+      quotes,
+      requests,
+      problems: ["nenhum mint consultável na lista (vazio ou com endereços de mock)"],
+      sourcesUsed,
+      divergences,
+      verification,
+    };
   }
 
   const missing = (): string[] => wanted.filter((m) => quotes.get(m)?.priceSol == null);
+
+  /**
+   * Compara com a outra fonte (se houver) e registra a amostra. Preço ausente não é amostra:
+   * `null` nunca entra no livro, senão "sem dado" viraria "preço concordante".
+   */
+  const ingest = (found: Map<string, BatchQuote>): void => {
+    for (const q of found.values()) {
+      if (q.priceSol === null || !(q.priceSol > 0)) continue;
+      if (book) {
+        const finding = assessDivergence(q.mint, { source: q.source, priceSol: q.priceSol }, book, thresholds);
+        if (finding && finding.severity !== "ok") divergences.push(finding);
+        book.record({ mint: q.mint, source: q.source, priceSol: q.priceSol, at: q.fetchedAt });
+      }
+    }
+  };
 
   /**
    * NUNCA lança. Uma exceção de rede aqui não pode derrubar o gerenciador de posições nem o
@@ -326,17 +515,24 @@ export async function fetchBatchPrices(mints: string[], options: BatchOptions = 
       ? `${fonte}: falha de rede no lote de ${size} (${r.error})`
       : `${fonte}: HTTP ${r.status} no lote de ${size}`;
 
-  /** DexScreener — também é a única fonte de LIQUIDEZ, então roda sempre (para os que faltam). */
+  /**
+   * DexScreener — também é a única fonte de LIQUIDEZ, então roda sempre (para os que faltam).
+   *
+   * O wrapped SOL entra na lista de endereços: o preço dele no próprio payload é a âncora
+   * USD→SOL usada para tokens cujo par mais líquido NÃO é cotado em SOL (ex.: TOKEN/USDC). Isso
+   * não custa requisição extra — o endpoint aceita até 30 endereços por chamada.
+   */
   const dexscreenerFetch = async (): Promise<Map<string, BatchQuote>> => {
     const found = new Map<string, BatchQuote>();
-    for (const batch of chunk(missing().length > 0 ? missing() : wanted, DEXSCREENER_MAX_ADDRESSES_PER_CALL)) {
+    const alvos = [...new Set([...(missing().length > 0 ? missing() : wanted), SOL_MINT])];
+    for (const batch of chunk(alvos, DEXSCREENER_MAX_ADDRESSES_PER_CALL)) {
       const url = `${dexscreenerBaseUrl}/tokens/${batch.join(",")}`;
       const r = await getJson(url);
       if (!r.ok) {
         problems.push(describeFailure("dexscreener", r, batch.length));
         continue;
       }
-      for (const [mint, q] of parseDexScreenerBatch(r.body, now())) found.set(mint, q);
+      for (const [mint, q] of parseDexScreenerBatch(r.body, now(), options.solUsdFallback ?? null)) found.set(mint, q);
     }
     return found;
   };
@@ -346,11 +542,14 @@ export async function fetchBatchPrices(mints: string[], options: BatchOptions = 
     problems.push(`dexscreener: PULADO — ${dexRun.skipped.skippedReason}`);
   } else {
     for (const [mint, q] of dexRun.quotes) quotes.set(mint, q);
+    ingest(dexRun.quotes);
     if (dexRun.quotes.size > 0) sourcesUsed.push("dexscreener");
   }
 
   /** Jupiter Price v3 — só para o que ainda não tem preço. */
+  let jupiterAttempted = false;
   if (missing().length > 0) {
+    jupiterAttempted = true;
     const jupiterFetch = async (): Promise<Map<string, BatchQuote>> => {
       const found = new Map<string, BatchQuote>();
       // O SOL entra no lote para a conversão USD→SOL vir da MESMA resposta.
@@ -374,12 +573,15 @@ export async function fetchBatchPrices(mints: string[], options: BatchOptions = 
       problems.push(`jupiter price v3: PULADO — ${jupRun.skipped.skippedReason}`);
     } else {
       for (const [mint, q] of jupRun.quotes) quotes.set(mint, q);
+      ingest(jupRun.quotes);
       if (jupRun.quotes.size > 0) sourcesUsed.push("jupiter-price-v3");
     }
   }
 
   /** GeckoTerminal — terceira opinião independente. */
+  let geckoterminalAttempted = false;
   if (missing().length > 0) {
+    geckoterminalAttempted = true;
     const geckoFetch = async (): Promise<Map<string, BatchQuote>> => {
       const found = new Map<string, BatchQuote>();
       const ids = [...new Set([...missing(), SOL_MINT])];
@@ -400,7 +602,97 @@ export async function fetchBatchPrices(mints: string[], options: BatchOptions = 
       problems.push(`geckoterminal: PULADO — ${geckoRun.skipped.skippedReason}`);
     } else {
       for (const [mint, q] of geckoRun.quotes) quotes.set(mint, q);
+      ingest(geckoRun.quotes);
       if (geckoRun.quotes.size > 0) sourcesUsed.push("geckoterminal");
+    }
+  }
+
+  /* ------------------------------------------------------------------------- */
+  /* VERIFICAÇÃO CRUZADA — a segunda opinião que a cascata sozinha não produz    */
+  /* ------------------------------------------------------------------------- */
+
+  /**
+   * A cascata para assim que todos têm preço — ótimo para cota e péssimo para AUDITORIA: se o
+   * DexScreener responde tudo, nunca existe segunda fonte para comparar. Aqui pedimos uma
+   * segunda opinião para uma AMOSTRA pequena de tokens (`verifyMints`), sempre na primeira
+   * fonte que ainda NÃO respondeu neste ciclo. Custo máximo: 1 requisição extra por chamada.
+   *
+   * Se a amostra não tem nenhum token já precificado, não há o que verificar (cada fonte seria
+   * apenas mais uma tentativa de achar preço) — a verificação é pulada e o motivo fica visível.
+   */
+  const verifyTargets = [...new Set((options.verifyMints ?? []).filter(isQueryableMint))].filter(
+    (m) => (quotes.get(m)?.priceSol ?? null) !== null
+  );
+  if (verifyTargets.length > 0) {
+    const verifySource: "jupiter" | "geckoterminal" | null = !jupiterAttempted
+      ? "jupiter"
+      : !geckoterminalAttempted
+        ? "geckoterminal"
+        : null;
+
+    if (verifySource === null) {
+      verification.problems.push(
+        `verificação não feita: as três fontes já foram tentadas neste ciclo (amostra de ${verifyTargets.length} token(s))`
+      );
+    } else {
+      verification.attempted = true;
+      verification.source = verifySource === "jupiter" ? "jupiter-price-v3" : "geckoterminal";
+
+      const verifyFetch = async (): Promise<Map<string, BatchQuote>> => {
+        const found = new Map<string, BatchQuote>();
+        const ids = [...new Set([...verifyTargets, SOL_MINT])];
+        for (const batch of chunk(ids, verifySource === "jupiter" ? JUPITER_MAX_IDS_PER_CALL : GECKOTERMINAL_MAX_ADDRESSES_PER_CALL)) {
+          const url =
+            verifySource === "jupiter"
+              ? `${jupiterBaseUrl}/price/v3?ids=${batch.join(",")}`
+              : `${geckoterminalBaseUrl}/simple/networks/solana/token_price/${batch.join(",")}`;
+          const headers: Record<string, string> = verifySource === "jupiter" ? {} : { accept: "application/json" };
+          if (verifySource === "jupiter" && options.jupiterApiKey) headers["x-api-key"] = options.jupiterApiKey;
+          const r = await getJson(url, headers);
+          if (!r.ok) {
+            const msg = describeFailure(verification.source ?? verifySource, r, batch.length);
+            verification.problems.push(msg);
+            problems.push(`${msg} (verificação cruzada)`);
+            continue;
+          }
+          const parsed =
+            verifySource === "jupiter"
+              ? parseJupiterPriceBatch(r.body, now(), options.solUsdFallback ?? null).quotes
+              : parseGeckoTerminalBatch(r.body, now(), options.solUsdFallback ?? null).quotes;
+          for (const [mint, q] of parsed) found.set(mint, q);
+        }
+        return found;
+      };
+
+      const verifyBudget = verifySource === "jupiter" ? options.jupiterBudget : options.geckoterminalBudget;
+      const verifyRun = await runProvider(
+        verifyBudget,
+        { ...options, priority: options.verificationPriority ?? "background" },
+        verifyFetch
+      );
+      if (verifyRun.skipped) {
+        const msg = `${verification.source}: verificação cruzada PULADA — ${verifyRun.skipped.skippedReason}`;
+        verification.problems.push(msg);
+        problems.push(msg);
+      } else {
+        for (const target of verifyTargets) {
+          const candidato = verifyRun.quotes.get(target);
+          const referencia = quotes.get(target);
+          if (!candidato || candidato.priceSol === null || !(candidato.priceSol > 0)) continue;
+          if (!referencia || referencia.priceSol === null) continue;
+
+          verification.checked++;
+          const finding = compareSamples(
+            target,
+            { source: referencia.source, priceSol: referencia.priceSol, at: referencia.fetchedAt },
+            { source: candidato.source, priceSol: candidato.priceSol },
+            thresholds,
+            now()
+          );
+          if (finding && finding.severity !== "ok") divergences.push(finding);
+          if (book) book.record({ mint: target, source: candidato.source, priceSol: candidato.priceSol, at: candidato.fetchedAt });
+        }
+      }
     }
   }
 
@@ -412,5 +704,5 @@ export async function fetchBatchPrices(mints: string[], options: BatchOptions = 
     );
   }
 
-  return { quotes, requests, problems, sourcesUsed };
+  return { quotes, requests, problems, sourcesUsed, divergences, verification };
 }

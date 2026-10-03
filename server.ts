@@ -72,7 +72,21 @@ import {
   type HotPathStats,
 } from "./src/hotPath.js";
 import { buildBudgetRegistry, withBudget } from "./src/rateBudget.js";
-import { fetchBatchPrices, isQueryableMint, type BatchQuote, type BatchResult } from "./src/marketPriceFeed.js";
+import {
+  fetchBatchPrices,
+  isQueryableMint,
+  priceSolFromDexPairs,
+  SOL_MINT,
+  type BatchQuote,
+  type BatchResult,
+} from "./src/marketPriceFeed.js";
+import {
+  assessLiquidityDrop,
+  DEFAULT_DIVERGENCE_THRESHOLDS,
+  DEFAULT_LIQUIDITY_THRESHOLDS,
+  PriceSampleBook,
+  type DivergenceFinding,
+} from "./src/priceQuality.js";
 import { PumpPortalFeed, type PumpPortalEvent } from "./src/pumpPortalFeed.js";
 import { fetchRugCheckEvidence, rugCheckRiskReasons } from "./src/rugCheck.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
@@ -255,6 +269,16 @@ app.get("/api/health", (_req, res) => {
         "1 requisição por provedor por ciclo cobre até 30 (DexScreener/GeckoTerminal) ou 50 " +
         "(Jupiter Price) mints. Sem lote, o custo cresce 1 requisição POR POSIÇÃO por ciclo de 3s " +
         "— acima de 300 req/min o DexScreener devolve 429 justamente durante a operação.",
+      qualityNote: PRICE_DIVERGENCE_ENABLED
+        ? `Verificação cruzada LIGADA: compara cada preço com a amostra mais recente de OUTRA fonte ` +
+          `(janela ${PRICE_DIVERGENCE_THRESHOLDS.maxAgeMs}ms; warn ≥ ${(PRICE_DIVERGENCE_THRESHOLDS.warnPct * 100).toFixed(2)}%, ` +
+          `critical ≥ ${(PRICE_DIVERGENCE_THRESHOLDS.criticalPct * 100).toFixed(2)}%). Amostra de até ` +
+          `${PRICE_VERIFY_SAMPLE} token(s) por ciclo recebe segunda opinião. ` +
+          `verifications=0 com posições abertas significa que NÃO houve segunda opinião — ausência de ` +
+          `divergência não é aprovação, é falta de verificação. Queda de liquidez alerta em ` +
+          `${(LIQUIDITY_THRESHOLDS.warnDropPct * 100).toFixed(0)}% / ${(LIQUIDITY_THRESHOLDS.criticalDropPct * 100).toFixed(0)}% do pico (alerta, não venda automática).`
+        : "Verificação cruzada DESLIGADA por HFT_PRICE_DIVERGENCE=0: o preço usado é o da primeira " +
+          "fonte que responde, sem segunda opinião. NÃO use isto com capital real.",
     },
     pumpPortal: pumpPortalRef?.getHealth() ?? null,
     detectionNote:
@@ -692,7 +716,100 @@ const marketBatchStats = {
   lastSources: [] as string[],
   lastProblems: [] as string[],
   disabled: process.env.HFT_MARKET_BATCH === "0",
+  /** Comparações cruzadas de preço efetivamente feitas (o "verifiquei" — não o "achei"). */
+  verifications: 0,
+  /** Fontes usadas na verificação cruzada, na ordem (amostra rotativa). */
+  verificationSources: [] as string[],
+  /** Discordâncias entre fontes independentes desde o boot. */
+  divergences: 0,
+  lastDivergences: [] as Array<{
+    mint: string;
+    pct: number;
+    bps: number;
+    severity: string;
+    reference: { source: string; priceSol: number; ageMs: number };
+    candidate: { source: string; priceSol: number };
+    at: string;
+  }>,
 };
+
+/* -------------------------------------------------------------------------- */
+/* QUALIDADE DE PREÇO — liga/desliga, limiares e memória                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Lê um número de ambiente dentro de faixa, com aviso quando o valor é inválido.
+ *
+ * Não usar `Number(process.env.X)` cru: `Number("")` é 0 e `Number("abc")` é NaN — os dois
+ * passariam silenciosamente para dentro de um limiar de RISCO. Aqui valor inválido grita no
+ * boot e cai no padrão.
+ */
+function envNumberInRange(name: string, def: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    console.warn(
+      `[Qualidade de preço] ${name}="${raw}" é inválido (esperado número entre ${min} e ${max}); usando ${def}.`
+    );
+    return def;
+  }
+  return n;
+}
+
+/** Verificação cruzada de preço: LIGADA por padrão (é o que separa "preço" de "preço confiável"). */
+const PRICE_DIVERGENCE_ENABLED = process.env.HFT_PRICE_DIVERGENCE !== "0";
+
+const PRICE_DIVERGENCE_THRESHOLDS = {
+  warnPct:
+    envNumberInRange("HFT_PRICE_DIVERGENCE_WARN_BPS", DEFAULT_DIVERGENCE_THRESHOLDS.warnPct * 10_000, 1, 100_000) /
+    10_000,
+  criticalPct:
+    envNumberInRange(
+      "HFT_PRICE_DIVERGENCE_CRITICAL_BPS",
+      DEFAULT_DIVERGENCE_THRESHOLDS.criticalPct * 10_000,
+      1,
+      100_000
+    ) / 10_000,
+  maxAgeMs: envNumberInRange(
+    "HFT_PRICE_DIVERGENCE_MAX_AGE_MS",
+    DEFAULT_DIVERGENCE_THRESHOLDS.maxAgeMs,
+    1_000,
+    600_000
+  ),
+};
+if (PRICE_DIVERGENCE_THRESHOLDS.criticalPct < PRICE_DIVERGENCE_THRESHOLDS.warnPct) {
+  console.warn(
+    `[Qualidade de preço] critical (${PRICE_DIVERGENCE_THRESHOLDS.criticalPct}) < warn ` +
+      `(${PRICE_DIVERGENCE_THRESHOLDS.warnPct}): usando warn como critical para não classificar ` +
+      `divergência grande como pequena.`
+  );
+  PRICE_DIVERGENCE_THRESHOLDS.criticalPct = PRICE_DIVERGENCE_THRESHOLDS.warnPct;
+}
+
+/**
+ * Quantos tokens por ciclo recebem uma SEGUNDA opinião de preço. 0 desliga a amostra (a
+ * comparação continua acontecendo quando uma segunda fonte responde naturalmente).
+ * Custo: no máximo 1 requisição extra por ciclo (Jupiter Price cobre até 50 ids).
+ */
+const PRICE_VERIFY_SAMPLE = envNumberInRange("HFT_PRICE_VERIFY_SAMPLE", 2, 0, 20);
+
+const LIQUIDITY_THRESHOLDS = {
+  warnDropPct: envNumberInRange("HFT_LIQUIDITY_WARN_DROP_PCT", DEFAULT_LIQUIDITY_THRESHOLDS.warnDropPct * 100, 1, 100) / 100,
+  criticalDropPct:
+    envNumberInRange("HFT_LIQUIDITY_CRITICAL_DROP_PCT", DEFAULT_LIQUIDITY_THRESHOLDS.criticalDropPct * 100, 1, 100) / 100,
+};
+
+/** Memória de cotações por token/fonte — a base da comparação entre fontes. */
+const priceSampleBook = PRICE_DIVERGENCE_ENABLED ? new PriceSampleBook({ maxPerMint: 4, maxMints: 500 }) : null;
+/** Rotação da amostra de verificação: em N ciclos, todo token com posição é conferido. */
+let priceVerifyCursor = 0;
+/** Throttle de alerta por token/posição — sem isto, uma divergência persistente viraria spam de log. */
+const divergenceAlertedAt = new Map<string, number>();
+const liquidityAlertedAt = new Map<string, number>();
+const DIVERGENCE_ALERT_INTERVAL_MS = 120_000;
+const LIQUIDITY_ALERT_INTERVAL_MS = 300_000;
+
 
 /** Perfil de RPC efetivo (para o operador saber QUAL teto está valendo). */
 const HFT_RPC_PROFILE_EFETIVO = (process.env.HFT_RPC_PROFILE || "public").toLowerCase();
@@ -3073,7 +3190,8 @@ async function fetchRealOnChainTokenData(tokenMint: string, tokenName?: string):
      */
     const dexCall = await withBudget(
       budgets.dexscreener,
-      () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${tokenMint}`, { signal: AbortSignal.timeout(6000) }),
+      // O SOL vai na mesma chamada como âncora USD→SOL (custo zero, mesmo endpoint).
+      () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${tokenMint},${SOL_MINT}`, { signal: AbortSignal.timeout(6000) }),
       { maxWaitMs: 250 }
     );
     const dexRes = dexCall.value;
@@ -3082,16 +3200,24 @@ async function fetchRealOnChainTokenData(tokenMint: string, tokenName?: string):
       const solPairs = Array.isArray(dexData?.pairs)
         ? dexData.pairs.filter((p: any) => p.chainId === "solana")
         : [];
-      if (solPairs.length > 0) {
-        const bestPair = solPairs.sort(
+      const meusPares = solPairs.filter((p: any) => p?.baseToken?.address === tokenMint);
+      if (meusPares.length > 0) {
+        const bestPair = meusPares.sort(
           (a: any, b: any) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0)
         )[0];
         name = bestPair.baseToken?.name || name;
         symbol = bestPair.baseToken?.symbol || symbol;
-        priceSol = parseFloat(bestPair.priceNative) || 0;
-        liquidityUsd = bestPair.liquidity?.usd || 0;
+        // Regra única: par cotado em SOL usa priceNative; par em outra moeda converte por
+        // USD/SOL do payload; sem âncora, o preço fica ZERO e entra em missingChecks.
+        const preco = priceSolFromDexPairs(solPairs, tokenMint);
+        priceSol = preco.priceSol ?? 0;
+        liquidityUsd = preco.liquidityUsd ?? 0;
         poolSource = bestPair.dexId || "unknown";
         evidence.market = `DexScreener pair ${String(bestPair.pairAddress || "").slice(0, 10)}...`;
+        if (preco.priceSol === null) {
+          missingChecks.push("preço em SOL no DexScreener");
+          evidence.market += ` — sem preço em SOL: ${preco.reason}`;
+        }
         // Price impact NÃO é derivável de variação de preço. É função do tamanho da
         // ordem contra a profundidade do pool. Sem simulação de quote, não existe número.
         priceImpact = "Não medido (exige simulação de quote no tamanho da ordem)";
@@ -4018,29 +4144,30 @@ async function fetchReferenceMarketPrice(
   try {
     // Mesma política de cota do filtro profundo (ver comentário lá): sem vaga em 250 ms, o
     // preço de referência é declarado AUSENTE e a entrada paper é recusada — nunca inventada.
+    /**
+     * O wrapped SOL vai na MESMA requisição: ele é a âncora USD→SOL para o caso em que o par de
+     * maior liquidez do token é cotado em OUTRA moeda (ex.: USDC). Sem essa âncora, o
+     * `priceNative` do par estaria em USDC e seria lido como se fosse SOL — erro de ~200x que
+     * envenena PnL, stop e alvo. Custo: zero (mesmo endpoint, mesma chamada).
+     */
     const dexCall = await withBudget(
       budgets.dexscreener,
-      () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${mint}`, { signal: AbortSignal.timeout(6000) }),
+      () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${mint},${SOL_MINT}`, { signal: AbortSignal.timeout(6000) }),
       { maxWaitMs: 250 }
     );
     const res = dexCall.value;
     if (!res || !res.ok) return null;
     const data = await res.json();
-    const pairs = Array.isArray(data?.pairs)
-      ? data.pairs.filter((p: any) => p.chainId === "solana" && typeof p.priceNative === "string")
-      : [];
-    if (pairs.length === 0) return null;
 
-    const best = pairs.sort(
-      (a: any, b: any) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0)
-    )[0];
-    const priceSol = parseFloat(best.priceNative);
-    if (!Number.isFinite(priceSol) || priceSol <= 0) return null;
+    // Regra única de conversão (mesma função usada pelo lote): par em SOL usa priceNative;
+    // par em outra moeda converte por USD/SOL do payload; sem âncora, devolve null.
+    const r = priceSolFromDexPairs(data?.pairs, mint);
+    if (r.priceSol === null || !(r.priceSol > 0)) return null;
 
     return {
-      priceSol,
-      source: `DexScreener/${best.dexId} (pair ${String(best.pairAddress || "").slice(0, 8)}...)`,
-      liquidityUsd: best?.liquidity?.usd || 0,
+      priceSol: r.priceSol,
+      source: `DexScreener (${r.reason})`,
+      liquidityUsd: r.liquidityUsd ?? 0,
       fetchedAt: Date.now(),
     };
   } catch {
@@ -4693,8 +4820,17 @@ async function startAutonomousPositionManager(): Promise<void> {
        * Prioridade de SAÍDA: gerenciar posição é reduzir risco — cota não bloqueia.
        */
       const batchPricesThisCycle: BatchResult = await (async () => {
+        const vazio = (problemas: string[]): BatchResult => ({
+          quotes: new Map<string, BatchQuote>(),
+          requests: 0,
+          problems: problemas,
+          sourcesUsed: [],
+          divergences: [],
+          verification: { attempted: false, source: null, checked: 0, problems: [] },
+        });
+
         if (marketBatchStats.disabled) {
-          return { quotes: new Map<string, BatchQuote>(), requests: 0, problems: ["desligado por HFT_MARKET_BATCH=0"], sourcesUsed: [] };
+          return vazio(["desligado por HFT_MARKET_BATCH=0"]);
         }
         const mints = openPositions
           .filter((p: any) => isQueryableMint(p.mint))
@@ -4706,14 +4842,31 @@ async function startAutonomousPositionManager(): Promise<void> {
           .map((p: any) => p.mint as string);
 
         if (mints.length === 0) {
-          return { quotes: new Map<string, BatchQuote>(), requests: 0, problems: [], sourcesUsed: [] };
+          return vazio([]);
         }
+
+        /**
+         * AMOSTRA DE VERIFICAÇÃO (rotativa): a cascata para na primeira fonte que responde, então
+         * sem amostra NUNCA haveria segunda opinião — e "sem divergência" viraria sinônimo de
+         * "sem verificação". Aqui N tokens por ciclo (custo: no máximo 1 requisição) recebem
+         * segunda opinião, girando o cursor para que, em poucos ciclos, toda a carteira seja
+         * conferida contra uma fonte independente.
+         */
+        const amostra = Math.min(PRICE_VERIFY_SAMPLE, mints.length);
+        const verifyMints =
+          amostra > 0
+            ? Array.from({ length: amostra }, (_, i) => mints[(priceVerifyCursor + i) % mints.length])
+            : [];
+        if (amostra > 0) priceVerifyCursor = (priceVerifyCursor + amostra) % mints.length;
 
         const result = await fetchBatchPrices(mints, {
           dexscreenerBudget: budgets.dexscreener,
           jupiterBudget: budgets.jupiter,
           geckoterminalBudget: budgets.geckoterminal,
           priority: "exit",
+          sampleBook: priceSampleBook ?? undefined,
+          divergenceThresholds: PRICE_DIVERGENCE_THRESHOLDS,
+          verifyMints,
         });
 
         marketBatchStats.cycles++;
@@ -4723,8 +4876,67 @@ async function startAutonomousPositionManager(): Promise<void> {
         marketBatchStats.liquidityKnown += [...result.quotes.values()].filter((q) => q.liquidityUsd !== null).length;
         marketBatchStats.lastSources = result.sourcesUsed;
         marketBatchStats.lastProblems = result.problems.slice(-5);
+        marketBatchStats.verifications += result.verification.checked;
+        if (result.verification.attempted && result.verification.source) {
+          marketBatchStats.verificationSources = [
+            ...marketBatchStats.verificationSources.slice(-4),
+            result.verification.source,
+          ];
+        }
+
+        /**
+         * DIVERGÊNCIA ENTRE FONTES — alerta com os DOIS números e as DUAS fontes.
+         *
+         * Nunca silencioso e nunca decisório por si só: o achado é registrado no log operacional,
+         * anexado à posição (para o painel e para o pós-mortem) e contado no /api/health. NÃO
+         * dispara venda: uma divergência pode ser pool raso lido por uma fonte, e vender com
+         * base em leitura errada é tão ruim quanto não vender. Com capital real, a política de
+         * agir precisa de regra própria validada — não de um gatilho escondido aqui.
+         */
+        if (result.divergences.length > 0) {
+          marketBatchStats.divergences += result.divergences.length;
+          const agora = new Date().toISOString();
+          for (const d of result.divergences) {
+            marketBatchStats.lastDivergences = [
+              ...marketBatchStats.lastDivergences.slice(-4),
+              {
+                mint: d.mint,
+                pct: d.pct,
+                bps: d.bps,
+                severity: d.severity,
+                reference: d.reference,
+                candidate: d.candidate,
+                at: agora,
+              },
+            ];
+            const lastAlert = divergenceAlertedAt.get(d.mint) ?? 0;
+            if (Date.now() - lastAlert < DIVERGENCE_ALERT_INTERVAL_MS) continue;
+            divergenceAlertedAt.set(d.mint, Date.now());
+            const resumo =
+              `${d.mint.slice(0, 6)}… divergência de ${(d.pct * 100).toFixed(2)}% (${d.bps} bps, ${d.severity}): ` +
+              `${d.reference.source} diz ${d.reference.priceSol.toPrecision(6)} SOL (amostra de ${Math.round(d.reference.ageMs / 1000)}s atrás) ` +
+              `e ${d.candidate.source} diz ${d.candidate.priceSol.toPrecision(6)} SOL.`;
+            console.warn(`[Qualidade de preço] ${resumo}`);
+            dbStore.saveLog({
+              timestamp: agora,
+              level: d.severity === "critical" ? "CRITICAL" : "WARN",
+              component: "RISK_ENGINE",
+              message:
+                `[DIVERGÊNCIA DE PREÇO] ${resumo} Uma das fontes está errada (pool raso, par errado, ` +
+                `decimal trocado ou cache velho) — decisões de stop/alvo sobre preço divergente podem ` +
+                `${d.severity === "critical" ? "vender por engano e devem ser tratadas como indisponíveis até a checagem manual" : "sair da faixa esperada"}.`,
+              correlationId: `corr_divergence_${d.mint.slice(0, 8)}_${Date.now()}`,
+            });
+          }
+        }
+
         return result;
       })();
+
+      /** Divergências deste ciclo por token — usado no laço para anexar à posição. */
+      const divergenciaPorMint = new Map<string, DivergenceFinding>(
+        batchPricesThisCycle.divergences.map((d) => [d.mint, d])
+      );
 
       for (const pos of openPositions) {
         // POSIÇÕES PAPER: gestão de risco em modo sombra. Nenhuma assinatura, nenhuma
@@ -4824,6 +5036,72 @@ async function startAutonomousPositionManager(): Promise<void> {
           priceSource = batchQuote.source;
         }
 
+        /**
+         * DIVERGÊNCIA DESTE TOKEN: anexa à posição (visível no painel e no pós-mortem) e mantém
+         * o alerta já emitido no bloco do lote. O preço CONTINUA sendo usado para gestão — parar
+         * de gerir risco é pior —, mas fica registrado que ele veio de uma fonte sob suspeita.
+         */
+        const divergencia = divergenciaPorMint.get(pos.mint);
+        if (divergencia) {
+          pos.priceDivergence = {
+            observedAt: new Date().toISOString(),
+            pct: divergencia.pct,
+            bps: divergencia.bps,
+            severity: divergencia.severity,
+            reference: divergencia.reference,
+            candidate: divergencia.candidate,
+          };
+        }
+
+        /**
+         * LIQUIDEZ EM QUEDA — o DexScreener (fonte do lote) informa a liquidez do par, e a
+         * informação já foi PAGA em cota: ignorá-la seria desperdício. Remoção de LP é o sinal
+         * clássico de rug e antecede o preço cair.
+         *
+         * O que este bloco faz: compara com o PICO já observado e ALERTA (log + campo na posição)
+         * quando a queda passa dos limiares. O que NÃO faz: vender. Gatilho de saída automático
+         * por liquidez exige execução real autorizada e regra validada em paper — vender por
+         * leitura de um único pool seria trocar um risco por outro.
+         */
+        const liquidezAgora = batchQuote?.liquidityUsd ?? null;
+        if (liquidezAgora !== null && liquidezAgora > 0) {
+          const picoAnterior = Number((pos as any).liquidityUsdPeak);
+          const pico = Number.isFinite(picoAnterior) && picoAnterior > 0 ? Math.max(picoAnterior, liquidezAgora) : liquidezAgora;
+          (pos as any).liquidityUsdPeak = pico;
+          (pos as any).liquidityUsdLast = liquidezAgora;
+
+          const queda = assessLiquidityDrop(pico, liquidezAgora, LIQUIDITY_THRESHOLDS);
+          if (queda) {
+            const observadoEm = new Date().toISOString();
+            pos.liquidityAlert = {
+              observedAt: observadoEm,
+              peakUsd: queda.peakUsd,
+              currentUsd: queda.currentUsd,
+              dropPct: queda.dropPct,
+              severity: queda.severity,
+            };
+            const lastAlert = liquidityAlertedAt.get(pos.id) ?? 0;
+            if (Date.now() - lastAlert >= LIQUIDITY_ALERT_INTERVAL_MS) {
+              liquidityAlertedAt.set(pos.id, Date.now());
+              console.warn(
+                `[Liquidez] $${pos.token} caiu ${(queda.dropPct * 100).toFixed(1)}% do pico ` +
+                  `($${Math.round(queda.peakUsd)} → $${Math.round(queda.currentUsd)}) — ${queda.severity}`
+              );
+              dbStore.saveLog({
+                timestamp: observadoEm,
+                level: queda.severity === "critical" ? "CRITICAL" : "WARN",
+                component: "RISK_ENGINE",
+                message:
+                  `[LIQUIDEZ EM QUEDA] $${pos.token} (${pos.mint.slice(0, 6)}…): ` +
+                  `$${Math.round(queda.currentUsd)} agora contra pico de $${Math.round(queda.peakUsd)} observado pelo bot ` +
+                  `(−${(queda.dropPct * 100).toFixed(1)}%, ${queda.severity}). Remoção de liquidez é o padrão clássico de rug. ` +
+                  `ALERTA apenas: nenhuma venda foi disparada por este sinal.`,
+                correlationId: `corr_liquidity_${pos.id}_${Date.now()}`,
+              });
+            }
+          }
+        }
+
         if (!isMockMint && currentPriceSol === 0) {
           // Attempt 1: DexScreener (host vem da configuração, não hardcoded)
           try {
@@ -4835,19 +5113,18 @@ async function startAutonomousPositionManager(): Promise<void> {
              */
             const dexCall = await withBudget(
               budgets.dexscreener,
-              () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${pos.mint}`),
+              // O SOL entra na mesma chamada como âncora USD→SOL (ver fetchReferenceMarketPrice).
+              () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${pos.mint},${SOL_MINT}`),
               { priority: "exit" }
             );
             const dexRes = dexCall.value;
             if (dexRes?.ok) {
               const dexData = await dexRes.json();
-              if (dexData && dexData.pairs && dexData.pairs.length > 0) {
-                const solPairs = dexData.pairs.filter((p: any) => p.chainId === "solana");
-                const native = solPairs.find((p: any) => Number.isFinite(parseFloat(p.priceNative)));
-                if (native && parseFloat(native.priceNative) > 0) {
-                  currentPriceSol = parseFloat(native.priceNative);
-                  priceSource = "DexScreener API";
-                }
+              // Mesma regra do lote: `priceNative` só é SOL quando o par é cotado em SOL.
+              const r = priceSolFromDexPairs(dexData?.pairs, pos.mint);
+              if (r.priceSol !== null && r.priceSol > 0) {
+                currentPriceSol = r.priceSol;
+                priceSource = `DexScreener (${r.reason})`;
               }
             }
           } catch (err: any) {

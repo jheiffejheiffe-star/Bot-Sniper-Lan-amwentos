@@ -57,6 +57,23 @@ Os números acima estão codificados em `src/rateBudget.ts` (campo `source` de c
    GeckoTerminal (30) e usa o preço individual só como fallback. Sem lote, 10 posições = ~400
    req/min (acima do teto de 300 do DexScreener): o 429 estava garantido antes de qualquer
    problema de mercado. Contadores em `/api/health → marketBatch`.
+2c. **Segunda opinião de preço e liquidez (já implementado).** Preço de uma fonte só é preço
+   *até* outra discordar. A cada ciclo, **até 2 tokens** (rotativo, `HFT_PRICE_VERIFY_SAMPLE`)
+   recebem segunda opinião na primeira fonte que ainda não respondeu; quando a diferença passa de
+   5% (warn) / 15% (critical), o bot registra **os dois preços e as duas fontes** no log, na
+   posição e em `/api/health → marketBatch.divergences`. Isso importa porque a cascata para na
+   primeira fonte que responde: sem amostra, "sem divergência" seria apenas "sem verificação" —
+   o campo `verifications` existe exatamente para não deixar essa confusão acontecer. Custo
+   máximo: **1 requisição extra por ciclo**, com prioridade `background` (nunca fura cota).
+   O DexScreener também informa a **liquidez** no lote (dado já pago em cota): queda ≥ 50% / 80%
+   do pico observado gera alerta de remoção de LP. Nada disso vende sozinho — alerta não é
+   gatilho, e gatilho de saída por liquidez precisa de execução real autorizada + regra validada.
+2d. **`priceNative` NÃO é "preço em SOL" (correção de bug real).** No DexScreener, `priceNative`
+   é o preço do token na moeda de **cotação do par**. Em par TOKEN/USDC o número está em USDC e
+   vale ~200x o preço em SOL (SOL ≈ 200 USD); lido como SOL, ele inflava o PnL e — com capital
+   real — dispararia take-profit logo após a compra. Agora o par cotado em SOL usa `priceNative`,
+   par cotado em outra moeda converte por `priceUsd / USD-SOL do próprio payload` (o SOL vai na
+   MESMA requisição, custo zero) e, sem âncora, o preço é declarado **ausente** em vez de errado.
 3. **Servidor na mesma região do RPC — não a máquina de casa.** Bot rodando em casa (Brasil) até
    um RPC em us-east paga **~120–200 ms por chamada**; o mesmo código numa VPS gratuita da mesma
    região mede **uma ordem de grandeza menos**. É o maior ganho gratuito que existe, e o
@@ -146,6 +163,9 @@ lançamento visto pelas duas fontes vire **uma** decisão — a duplicata é con
 | `budgets.rugcheck.skipped` | `/api/system-truth` | evidência externa perdida por cota (o filtro local continua valendo) |
 | `marketBatch.requests` vs `mintsRequested` | `/api/health` | custo real de cota por ciclo: se `requests ≈ mintsRequested`, o lote não está sendo usado |
 | `marketBatch.lastSources` | `/api/health` | quem está fornecendo preço (cascata funcionando ou fonte principal caída) |
+| `marketBatch.verifications` | `/api/health` | **0 com posições abertas = não houve segunda opinião**; >0 = houve comparação cruzada de verdade |
+| `marketBatch.divergences` / `lastDivergences` | `/api/health` | fontes discordando acima do limiar — investigar pool/decimal antes de confiar no preço |
+| `liquidityUsdPeak` / `liquidityAlert` (na posição) | banco/`/api/positions` | queda de liquidez = remoção de LP em andamento; alerta, não venda |
 | `replay` / PnL paper | `npm run replay` | expectativa da estratégia — **não** "ganhou em 3 trades" |
 
 ## 7. Quando pagar: a ordem que rende mais por real
@@ -175,8 +195,10 @@ lançamento visto pelas duas fontes vire **uma** decisão — a duplicata é con
 - `npm run free:check` mede, mas **uma execução não é uma amostra**: rode em horários diferentes,
   com a rede que você vai usar de verdade.
 - **Preço pode vir de três fontes — e todas podem discordar.** O bot usa a primeira que responde
-  (DexScreener → Jupiter → GeckoTerminal) e registra qual foi; divergência entre fontes não é
-  detectada automaticamente. Para operar real, comparar fontes passa a ser requisito, não luxo.
+  (DexScreener → Jupiter → GeckoTerminal), registra qual foi e agora **compara com uma segunda
+  opinião em amostra rotativa** (`marketBatch.verifications` / `divergences`). O que ainda não há:
+  decisão automática sobre divergência (vetar entrada/reduzir posição) nem amostragem de TODOS os
+  tokens a cada ciclo — a amostra existe para dar evidência barata, não para substituir regra.
 - **Dependência de terceiro é risco operacional.** O feed da PumpPortal não é oficial da
   pump.fun; se ele cair ou mudar o formato, o contador `invalidMessages` sobe e a detecção volta
   a depender do WSS. Nada de capital deve repousar na premissa de que ele estará sempre lá.

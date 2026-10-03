@@ -68,6 +68,35 @@ export interface DBPosition {
   lastPriceAlertAt?: number;
   priceTelemetry?: { status: string; lastAttemptAt: string };
   /**
+   * Última discordância entre FONTES INDEPENDENTES de preço para este token
+   * (`src/priceQuality.ts`). Gravado na posição porque log em memória some e o pós-mortem
+   * precisa responder "o stop que vendeu por engano foi calculado sobre preço confiável?".
+   */
+  priceDivergence?: {
+    observedAt: string;
+    /** Diferença relativa (0,05 = 5%) e o mesmo em pontos-base. */
+    pct: number;
+    bps: number;
+    severity: string;
+    reference: { source: string; priceSol: number; ageMs: number };
+    candidate: { source: string; priceSol: number };
+  };
+  /** Pico de liquidez observado pelo bot (base do alerta de queda). */
+  liquidityUsdPeak?: number;
+  /** Última liquidez observada (USD) — pode ser `null` quando a fonte não informa. */
+  liquidityUsdLast?: number | null;
+  /**
+   * Alerta de queda de liquidez (remoção de LP). É ALERTA: nenhuma venda é disparada por ele
+   * nas versões atuais — ver o comentário no laço de gestão (`server.ts`).
+   */
+  liquidityAlert?: {
+    observedAt: string;
+    peakUsd: number;
+    currentUsd: number;
+    dropPct: number;
+    severity: string;
+  };
+  /**
    * Resultado da última reconciliação posição × cadeia (`src/positionDesync.ts`).
    * Gravado para que a divergência seja AUDITÁVEL depois do ciclo que a detectou —
    * log em memória some, o banco fica.

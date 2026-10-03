@@ -290,6 +290,47 @@ async function main(): Promise<void> {
   }
 
   /* ------------------------------------------------------------------ */
+  console.log("\n[3d] Divergência entre fontes (a segunda opinião de preço)");
+  {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const t0 = Date.now();
+    const livro = new PriceSampleBook();
+    const tri = await fetchBatchPrices([SOL_MINT], {
+      timeoutMs: 9_000,
+      sampleBook: livro,
+      verifyMints: [SOL_MINT],
+    });
+    const totalMs = Date.now() - t0;
+    const solQuote = tri.quotes.get(SOL_MINT) ?? null;
+    const detalhe =
+      `fonte principal=${tri.sourcesUsed[0] ?? "nenhuma"} | verificação=${
+        tri.verification.source ?? "não feita"
+      } (${tri.verification.checked} comparação(ões))`;
+    record(
+      "Divergência entre fontes",
+      tri.verification.checked > 0,
+      tri.verification.checked > 0
+        ? `${detalhe} em ${totalMs}ms | divergências acima do limiar: ${tri.divergences.length}` +
+          (tri.divergences.length > 0
+            ? ` — ${tri.divergences
+                .map((d) => `${d.bps} bps (${d.severity})`)
+                .join(", ")} — os DOIS preços saem no log do servidor`
+            : " | fontes concordam nesta amostra")
+        : `${detalhe} | NÃO houve segunda opinião: ${
+            tri.verification.problems[0] ?? tri.problems[0] ?? "motivo não registrado"
+          }`,
+      tri.verification.checked === 0
+    );
+    console.log(
+      `   • Sem segunda opinião, 'sem divergência' é apenas ausência de verificação — este estágio` +
+        ` existe para separar as duas coisas. Custo da amostra: 1 requisição extra por ciclo.`
+    );
+    if (solQuote) {
+      console.log(`   • SOL (referência) via ${solQuote.source}: ${solQuote.priceSol ?? "sem preço em SOL"}`);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
   console.log("\n[4] DexScreener (mercado)");
   const dex = await timedFetch(`${DEXSCREENER_BASE_URL}/tokens/${USDC_MINT}`);
   record(

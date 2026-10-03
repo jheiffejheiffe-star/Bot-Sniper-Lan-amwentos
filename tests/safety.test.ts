@@ -2674,14 +2674,14 @@ async function main(): Promise<void> {
   const BATCH_MINT_B = "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E";
 
   await test("DexScreener (lote): um par por token, escolhendo o de MAIOR liquidez", async () => {
-    const { parseDexScreenerBatch } = await import("../src/marketPriceFeed.js");
+    const { parseDexScreenerBatch, SOL_MINT } = await import("../src/marketPriceFeed.js");
     const quotes = parseDexScreenerBatch(
       {
         pairs: [
           // Pool raso do BATCH_MINT_A — deve ser DESCARTADO em favor do profundo.
-          { chainId: "solana", baseToken: { address: BATCH_MINT_A }, priceNative: "0.00000001", liquidity: { usd: 800 } },
-          { chainId: "solana", baseToken: { address: BATCH_MINT_A }, priceNative: "0.0000042", liquidity: { usd: 250000 } },
-          { chainId: "solana", baseToken: { address: BATCH_MINT_B }, priceNative: "0.001", liquidity: { usd: 9000 } },
+          { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: SOL_MINT }, priceNative: "0.00000001", liquidity: { usd: 800 } },
+          { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: SOL_MINT }, priceNative: "0.0000042", liquidity: { usd: 250000 } },
+          { chainId: "solana", baseToken: { address: BATCH_MINT_B }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 9000 } },
           // Outra chain: ignorada.
           { chainId: "ethereum", baseToken: { address: BATCH_MINT_A }, priceNative: "5", liquidity: { usd: 999999 } },
           // Entrada sem preço: mantém liquidez, preço null (nunca 0).
@@ -2700,6 +2700,66 @@ async function main(): Promise<void> {
     const semPreco = quotes.get("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1")!;
     assert.equal(semPreco.priceSol, null, "sem preço é null — nunca 0");
     assert.equal(semPreco.liquidityUsd, 500, "a liquidez que veio é preservada");
+  });
+
+  await test("DexScreener: par cotado em USDC NÃO é lido como SOL (bug de ~200x corrigido)", async () => {
+    const { priceSolFromDexPairs, parseDexScreenerBatch, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const pairs = [
+      // Par mais líquido do TOKEN é cotado em USDC: priceNative está em USDC (0.15 USDC por token),
+      // e NÃO em SOL. Interpretá-lo como SOL daria 0.15 SOL quando o real é 0.15/200 = 0.00075.
+      { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: USDC }, priceNative: "0.15", priceUsd: "0.15", liquidity: { usd: 400_000 } },
+      // Âncora: par de SOL contra USDC informa o USD/SOL no MESMO payload.
+      { chainId: "solana", baseToken: { address: SOL_MINT }, quoteToken: { address: USDC }, priceUsd: "200", liquidity: { usd: 5_000_000 } },
+    ];
+    const r = priceSolFromDexPairs(pairs, BATCH_MINT_A);
+    assert.equal(r.quoteToken, USDC);
+    assert.ok(Math.abs((r.priceSol as number) - 0.00075) < 1e-12, `esperado 0.00075, veio ${r.priceSol}`);
+    assert.ok((r.priceSol as number) < 0.01, "jamais aceitar 0.15 (o priceNative em USDC) como preço em SOL");
+
+    const quotes = parseDexScreenerBatch({ pairs }, 7);
+    assert.ok(Math.abs((quotes.get(BATCH_MINT_A)!.priceSol as number) - 0.00075) < 1e-12);
+    assert.ok(/USD→SOL/.test(quotes.get(BATCH_MINT_A)!.source), "a fonte precisa dizer que houve conversão");
+    assert.equal(quotes.get(SOL_MINT)!.priceSol, 1, "wrapped SOL vale 1 SOL por definição, qualquer que seja o par");
+  });
+
+  await test("DexScreener: par em outra moeda SEM âncora de SOL/USD devolve null (não inventa)", async () => {
+    const { priceSolFromDexPairs, parseDexScreenerBatch } = await import("../src/marketPriceFeed.js");
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const pairs = [
+      { chainId: "solana", baseToken: { address: BATCH_MINT_B }, quoteToken: { address: USDC }, priceNative: "1.5", priceUsd: "1.5", liquidity: { usd: 50_000 } },
+    ];
+    const r = priceSolFromDexPairs(pairs, BATCH_MINT_B);
+    assert.equal(r.priceSol, null, "sem SOL/USD não existe conversão honesta");
+    assert.ok(/fabricar/.test(r.reason));
+    const quotes = parseDexScreenerBatch({ pairs }, 7);
+    assert.equal(quotes.get(BATCH_MINT_B)!.priceSol, null);
+    assert.equal(quotes.get(BATCH_MINT_B)!.liquidityUsd, 50_000, "a liquidez que veio é preservada mesmo sem preço");
+    assert.ok(/sem preço em SOL/.test(quotes.get(BATCH_MINT_B)!.source), "o motivo precisa estar visível");
+  });
+
+  await test("lote: a requisição do DexScreener inclui o SOL como âncora da conversão", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const urls: string[] = [];
+    const result = await fetchBatchPrices([BATCH_MINT_A], {
+      fetchImpl: (async (url: string) => {
+        urls.push(url);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            pairs: [
+              { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: USDC }, priceNative: "0.15", priceUsd: "0.15", liquidity: { usd: 400_000 } },
+              { chainId: "solana", baseToken: { address: SOL_MINT }, quoteToken: { address: USDC }, priceUsd: "200", liquidity: { usd: 5_000_000 } },
+            ],
+          }),
+        } as any;
+      }) as any,
+    });
+    assert.ok(urls[0].includes(SOL_MINT), "o SOL precisa ir na MESMA chamada (custo zero)");
+    assert.ok(Math.abs((result.quotes.get(BATCH_MINT_A)!.priceSol as number) - 0.00075) < 1e-12);
+    assert.equal(result.requests, 1, "converter não pode custar requisição extra");
   });
 
   await test("Jupiter Price v3 (lote): USD→SOL com o SOL da MESMA resposta", async () => {
@@ -2756,7 +2816,7 @@ async function main(): Promise<void> {
   });
 
   await test("cascata: DexScreener responde tudo → NÃO gasta as outras fontes", async () => {
-    const { fetchBatchPrices } = await import("../src/marketPriceFeed.js");
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
     const chamadas: string[] = [];
     const result = await fetchBatchPrices([BATCH_MINT_A, BATCH_MINT_B], {
       fetchImpl: (async (url: string) => {
@@ -2766,8 +2826,8 @@ async function main(): Promise<void> {
           status: 200,
           json: async () => ({
             pairs: [
-              { chainId: "solana", baseToken: { address: BATCH_MINT_A }, priceNative: "0.001", liquidity: { usd: 1000 } },
-              { chainId: "solana", baseToken: { address: BATCH_MINT_B }, priceNative: "0.002", liquidity: { usd: 2000 } },
+              { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1000 } },
+              { chainId: "solana", baseToken: { address: BATCH_MINT_B }, quoteToken: { address: SOL_MINT }, priceNative: "0.002", liquidity: { usd: 2000 } },
             ],
           }),
         } as any;
@@ -2791,7 +2851,7 @@ async function main(): Promise<void> {
             ok: true,
             status: 200,
             json: async () => ({
-              pairs: [{ chainId: "solana", baseToken: { address: BATCH_MINT_A }, priceNative: "0.001", liquidity: { usd: 1234 } }],
+              pairs: [{ chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1234 } }],
             }),
           } as any;
         }
@@ -2913,6 +2973,336 @@ async function main(): Promise<void> {
       "o ganho de cota precisa ser visível no /api/health"
     );
     assert.ok(serverSrc.includes('HFT_MARKET_BATCH === "0"'), "precisa existir chave para voltar ao comportamento antigo");
+  });
+
+  // ---------------------------------------------------------------------------
+  // [21] QUALIDADE DE PREÇO — divergência entre fontes e liquidez em queda
+  // ---------------------------------------------------------------------------
+  console.log("\n[21] Qualidade de preço (divergência entre fontes e liquidez)");
+
+  const PQ_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+  const PQ_MINT_B = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+  const PQ_LIMIARES = { warnPct: 0.05, criticalPct: 0.15, maxAgeMs: 60_000 };
+
+  await test("divergência relativa: simétrica, normalizada pelo maior e null sem preço válido", async () => {
+    const { relativeDivergencePct } = await import("../src/priceQuality.js");
+    assert.equal(relativeDivergencePct(0.001, 0.002), 0.5);
+    assert.equal(relativeDivergencePct(0.002, 0.001), 0.5, "precisa ser simétrica");
+    assert.equal(relativeDivergencePct(1, 1), 0);
+    assert.equal(relativeDivergencePct(0, 1), null, "zero não é preço");
+    assert.equal(relativeDivergencePct(-1, 1), null);
+    assert.equal(relativeDivergencePct(Number.NaN, 1), null);
+    assert.equal(relativeDivergencePct("0.1" as any, 1), null, "string não é preço");
+  });
+
+  await test("classificação por faixa: ok abaixo de warn, warn entre, critical acima", async () => {
+    const { classifyDivergence } = await import("../src/priceQuality.js");
+    assert.equal(classifyDivergence(0.049, PQ_LIMIARES), "ok");
+    assert.equal(classifyDivergence(0.05, PQ_LIMIARES), "warn");
+    assert.equal(classifyDivergence(0.149, PQ_LIMIARES), "warn");
+    assert.equal(classifyDivergence(0.15, PQ_LIMIARES), "critical");
+    assert.equal(classifyDivergence(null, PQ_LIMIARES), null, "sem número não existe classificação");
+  });
+
+  await test("livro: a MESMA fonte não serve de referência (deriva de mercado não é divergência)", async () => {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook({ now: () => 1_000 });
+    livro.record({ mint: PQ_MINT, source: "dexscreener", priceSol: 0.001, at: 900 });
+    assert.equal(livro.freshestOtherSource(PQ_MINT, "dexscreener", 60_000), null);
+    const ref = livro.freshestOtherSource(PQ_MINT, "jupiter", 60_000);
+    assert.equal(ref?.source, "dexscreener");
+  });
+
+  await test("assessDivergence: compara com a outra fonte e devolve os DOIS preços e a idade", async () => {
+    const { PriceSampleBook, assessDivergence } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook({ now: () => 1_000 });
+    livro.record({ mint: PQ_MINT, source: "dexscreener", priceSol: 0.001, at: 900 });
+
+    const warn = assessDivergence(PQ_MINT, { source: "jupiter", priceSol: 0.0011 }, livro, PQ_LIMIARES);
+    assert.equal(warn?.severity, "warn");
+    assert.equal(warn?.bps, 909);
+    assert.equal(warn?.reference.source, "dexscreener");
+    assert.equal(warn?.reference.ageMs, 100, "a idade da amostra precisa viajar com o achado");
+
+    const critico = assessDivergence(PQ_MINT, { source: "geckoterminal", priceSol: 0.002 }, livro, PQ_LIMIARES);
+    assert.equal(critico?.severity, "critical");
+    assert.equal(critico?.pct, 0.5);
+
+    // Sem segunda opinião: null — que significa NÃO VERIFIQUEI, não está tudo certo.
+    assert.equal(assessDivergence(PQ_MINT_B, { source: "jupiter", priceSol: 1 }, livro, PQ_LIMIARES), null);
+  });
+
+  await test("livro: amostra fora da janela não é referência e o prune libera memória", async () => {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook({ now: () => 100_000 });
+    livro.record({ mint: PQ_MINT, source: "dexscreener", priceSol: 0.001, at: 1_000 });
+    assert.equal(livro.freshestOtherSource(PQ_MINT, "jupiter", 45_000), null, "45s é a janela padrão");
+    assert.equal(livro.prune(45_000), 1);
+    assert.equal(livro.size(), 0);
+  });
+
+  await test("livro: memória LIMITADA por token e por quantidade de tokens (sem vazamento)", async () => {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook({ maxPerMint: 2, maxMints: 2, now: () => 10_000 });
+    livro.record({ mint: "m1", source: "A", priceSol: 1, at: 1 });
+    livro.record({ mint: "m1", source: "A", priceSol: 2, at: 2 });
+    livro.record({ mint: "m1", source: "A", priceSol: 3, at: 3 });
+    assert.equal(livro.countFor("m1"), 2, "só as mais recentes ficam");
+    assert.equal(livro.latest("m1")?.priceSol, 3);
+
+    livro.record({ mint: "m2", source: "A", priceSol: 1, at: 4 });
+    livro.record({ mint: "m3", source: "A", priceSol: 1, at: 5 });
+    assert.equal(livro.size(), 2);
+    assert.equal(livro.latest("m1"), null, "o token registrado há mais tempo sai (evicção FIFO)");
+    assert.ok(livro.latest("m3"), "o mais novo permanece");
+  });
+
+  await test("livro: preço inválido (0, negativo, NaN, Infinity) NUNCA entra", async () => {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook();
+    for (const preco of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.equal(livro.record({ mint: PQ_MINT, source: "A", priceSol: preco as number, at: 1 }), false);
+    }
+    assert.equal(livro.record({ mint: PQ_MINT, source: "A", priceSol: 1, at: Number.NaN }), false, "sem instante não é amostra");
+    assert.equal(livro.size(), 0, "nada inválido ficou na memória");
+  });
+
+  await test("compareSamples: mesma fonte devolve null mesmo com preços muito diferentes", async () => {
+    const { compareSamples } = await import("../src/priceQuality.js");
+    const mesmo = compareSamples(
+      PQ_MINT,
+      { source: "dexscreener", priceSol: 0.001, at: 0 },
+      { source: "dexscreener", priceSol: 0.01 },
+      PQ_LIMIARES,
+      0
+    );
+    assert.equal(mesmo, null);
+    const outro = compareSamples(
+      PQ_MINT,
+      { source: "dexscreener", priceSol: 0.001, at: 0 },
+      { source: "geckoterminal", priceSol: 0.01 },
+      PQ_LIMIARES,
+      0
+    );
+    assert.equal(outro?.severity, "critical");
+  });
+
+  await test("lote: amostra de verificação traz segunda opinião e DETECTA divergência", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const urls: string[] = [];
+    const livro = new PriceSampleBook();
+    const result = await fetchBatchPrices([PQ_MINT, PQ_MINT_B], {
+      sampleBook: livro,
+      verifyMints: [PQ_MINT],
+      fetchImpl: (async (url: string) => {
+        urls.push(url);
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [
+                { chainId: "solana", baseToken: { address: PQ_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 50_000 } },
+                { chainId: "solana", baseToken: { address: PQ_MINT_B }, quoteToken: { address: SOL_MINT }, priceNative: "0.5", liquidity: { usd: 10_000 } },
+              ],
+            }),
+          } as any;
+        }
+        // Jupiter: 0.003 USD contra SOL 200 USD → 0.000015 SOL, contra 0.001 do DexScreener.
+        return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [PQ_MINT]: { usdPrice: 0.003 } }) } as any;
+      }) as any,
+    });
+
+    assert.equal(result.requests, 2, "1 requisição do lote + 1 da verificação cruzada");
+    assert.equal(result.verification.attempted, true);
+    assert.equal(result.verification.source, "jupiter-price-v3");
+    assert.equal(result.verification.checked, 1);
+    assert.equal(result.divergences.length, 1);
+    const d = result.divergences[0];
+    assert.equal(d.mint, PQ_MINT);
+    assert.equal(d.severity, "critical");
+    assert.equal(d.bps, 9850);
+    assert.ok(/dexscreener/.test(d.reference.source), "a referência é a fonte do ciclo");
+    assert.ok(/jupiter/.test(d.candidate.source), "o candidato é a fonte independente");
+    assert.ok(urls[1].includes("price/v3"), "a verificação usa o endpoint em LOTE da Jupiter");
+    assert.equal(livro.countFor(PQ_MINT), 2, "as duas amostras ficam no livro para os próximos ciclos");
+  });
+
+  await test("lote: preços que concordam → NENHUMA divergência, mas a verificação ACONTECEU", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const result = await fetchBatchPrices([PQ_MINT], {
+      sampleBook: new PriceSampleBook(),
+      verifyMints: [PQ_MINT],
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [{ chainId: "solana", baseToken: { address: PQ_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1_000 } }],
+            }),
+          } as any;
+        }
+        // 0.2 USD / 200 USD por SOL = exatamente 0.001 SOL.
+        return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [PQ_MINT]: { usdPrice: 0.2 } }) } as any;
+      }) as any,
+    });
+    assert.equal(result.divergences.length, 0);
+    assert.equal(result.verification.checked, 1, "ausência de divergência NÃO é ausência de verificação");
+  });
+
+  await test("lote: verificação pede a fonte que ainda NÃO respondeu (nunca a mesma)", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const urls: string[] = [];
+    const result = await fetchBatchPrices([PQ_MINT], {
+      verifyMints: [PQ_MINT],
+      fetchImpl: (async (url: string) => {
+        urls.push(url);
+        if (url.includes("dexscreener")) return { ok: true, status: 200, json: async () => ({ pairs: [] }) } as any;
+        if (url.includes("price/v3")) {
+          return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [PQ_MINT]: { usdPrice: 0.2 } }) } as any;
+        }
+        // GeckoTerminal: ainda não tinha sido tentada porque a Jupiter resolveu tudo.
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { attributes: { token_prices: { [SOL_MINT]: { price_usd: "201" }, [PQ_MINT]: { price_usd: "0.201" } } } },
+          }),
+        } as any;
+      }) as any,
+    });
+    assert.ok(urls[1].includes("price/v3"), "Jupiter foi a segunda tentativa do lote");
+    assert.equal(result.verification.attempted, true);
+    assert.equal(result.verification.source, "geckoterminal", "a verificação usa a fonte que AINDA não respondeu");
+    assert.ok(urls[2].includes("geckoterminal"), "e de fato chama o endpoint dela");
+    assert.equal(result.verification.checked, 1);
+    assert.equal(result.divergences.length, 0, "201 vs 200 é ruído de cotação, não divergência");
+  });
+
+  await test("lote: quando as TRÊS fontes já foram tentadas, a verificação é declarada impossível", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const result = await fetchBatchPrices([PQ_MINT], {
+      verifyMints: [PQ_MINT],
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) return { ok: true, status: 200, json: async () => ({ pairs: [] }) } as any;
+        if (url.includes("price/v3")) return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 } }) } as any;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { attributes: { token_prices: { [SOL_MINT]: { price_usd: "200" }, [PQ_MINT]: { price_usd: "0.2" } } } },
+          }),
+        } as any;
+      }) as any,
+    });
+    assert.equal(result.requests, 3, "as três fontes foram usadas para achar preço");
+    assert.equal(result.verification.attempted, false);
+    assert.equal(result.verification.checked, 0);
+    assert.ok(
+      result.verification.problems.some((p) => /três fontes já foram tentadas/.test(p)),
+      "o motivo de NÃO ter verificado precisa ser explícito"
+    );
+  });
+
+  await test("lote: verificação pulada por cota é REPORTADA (não vira silêncio)", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const { RateBudget } = await import("../src/rateBudget.js");
+    const jupiterBudget = new RateBudget({ name: "jupiter-teste", limit: 1, windowMs: 60_000, source: "teste" });
+    jupiterBudget.tryAcquire(); // consome a única vaga
+
+    const result = await fetchBatchPrices([PQ_MINT], {
+      verifyMints: [PQ_MINT],
+      jupiterBudget,
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [{ chainId: "solana", baseToken: { address: PQ_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1 } }],
+            }),
+          } as any;
+        }
+        throw new Error("não deveria chamar a rede com a cota esgotada");
+      }) as any,
+    });
+    assert.equal(result.verification.attempted, true);
+    assert.equal(result.verification.checked, 0);
+    assert.ok(result.verification.problems.some((p) => /PULADA/.test(p)));
+    assert.equal(jupiterBudget.skipped, 1, "o pulo entra no contador do orçamento");
+  });
+
+  await test("lote: verificação NUNCA fura a cota, nem quando o lote tem prioridade de saída", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const { RateBudget } = await import("../src/rateBudget.js");
+    const jupiterBudget = new RateBudget({ name: "jupiter-teste2", limit: 1, windowMs: 60_000, source: "teste" });
+    jupiterBudget.tryAcquire();
+
+    const result = await fetchBatchPrices([PQ_MINT], {
+      verifyMints: [PQ_MINT],
+      priority: "exit", // gestão de posição pode furar cota; a VERIFICAÇÃO não pode.
+      jupiterBudget,
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [{ chainId: "solana", baseToken: { address: PQ_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1 } }],
+            }),
+          } as any;
+        }
+        throw new Error("verificação não pode chamar a rede sem cota");
+      }) as any,
+    });
+    assert.equal(result.verification.attempted, true);
+    assert.equal(result.verification.checked, 0);
+    assert.equal(jupiterBudget.bypassed, 0, "verificação é dado adicional: nunca faz bypass de cota");
+    assert.equal(jupiterBudget.skipped, 1);
+  });
+
+  await test("liquidez: queda de 60% alerta warn; de 90% alerta critical; subida não alerta", async () => {
+    const { assessLiquidityDrop } = await import("../src/priceQuality.js");
+    const warn = assessLiquidityDrop(100_000, 40_000);
+    assert.equal(warn?.severity, "warn");
+    assert.ok(Math.abs((warn?.dropPct ?? 0) - 0.6) < 1e-9);
+    const critico = assessLiquidityDrop(100_000, 10_000);
+    assert.equal(critico?.severity, "critical");
+    assert.equal(assessLiquidityDrop(100_000, 60_000), null, "queda de 40% ainda não alerta");
+    assert.equal(assessLiquidityDrop(100_000, 120_000), null, "liquidez subiu: nada a declarar");
+    assert.equal(assessLiquidityDrop(0, 10), null, "sem pico válido não existe queda");
+    assert.equal(assessLiquidityDrop(100, Number.NaN), null);
+    assert.equal(assessLiquidityDrop(100, -5), null);
+  });
+
+  await test("regressão: divergência e liquidez são ALERTA — nenhuma venda automática", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("priceSampleBook"), "o livro de amostras precisa estar ligado ao laço");
+    assert.ok(serverSrc.includes("verifyMints"), "a amostra de verificação precisa ser passada ao lote");
+    assert.ok(serverSrc.includes("HFT_PRICE_DIVERGENCE") && serverSrc.includes("HFT_PRICE_VERIFY_SAMPLE"));
+    assert.ok(
+      /ALERTA apenas: nenhuma venda foi disparada por este sinal/.test(serverSrc),
+      "o alerta de liquidez não pode virar gatilho de venda sem autorização própria"
+    );
+    assert.ok(serverSrc.includes("liquidityUsdPeak"), "o pico de liquidez precisa ser acompanhado");
+    assert.equal(
+      /parseFloat\([a-zA-Z.]*priceNative\)/.test(serverSrc),
+      false,
+      "o server não pode ler priceNative cru: ele está na moeda de cotação do par, não em SOL"
+    );
+    assert.ok(
+      serverSrc.includes("priceSolFromDexPairs("),
+      "os dois caminhos de preço do DexScreener precisam usar a regra única de conversão"
+    );
+    const priceSrc = fs.readFileSync(path.join(repoRoot, "src/priceQuality.ts"), "utf8");
+    assert.ok(
+      !/sell|swap|sendTransaction/i.test(priceSrc),
+      "o módulo de qualidade de preço NÃO pode executar nada na rede"
+    );
   });
 
   console.log("\n=========================================");

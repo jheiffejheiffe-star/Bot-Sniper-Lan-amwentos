@@ -1402,3 +1402,97 @@ GET /api/health → marketBatch + budgets com 7 provedores
   acima de um limiar) passa a ser requisito. É o próximo passo natural de dados, não de latência.
 - Nenhuma das três fontes foi exercitada com rede real aqui (sandbox sem egress).
 - **Execução real (S6) continua pendente de autorização** e não é gratuita.
+
+---
+
+## Adendo 12 — Qualidade de preço: divergência entre fontes, liquidez em queda e um bug de 200x (2026-10-03)
+
+Autorização: *"Faça o melhor com as ferramentas disponíveis, se der certo vou pagar as ferramentas
+se necessário"*. Leitura aplicada: **seguir no plano gratuito** e fechar a pendência que o próprio
+Adendo 11 registrou como requisito para capital real. A menção a pagar foi tratada como intenção
+futura — não como autorização de gasto nem de entrada real.
+
+### 1. O que faltava (e por que não era latência)
+
+O Adendo 11 deixou explícito: os três preços vinham de fontes independentes, mas **nada comparava
+uma com a outra**. A cascata para na primeira fonte que responde — eficiente para cota, cega para
+auditoria: se o DexScreener responde tudo, nunca existe segunda opinião, e "sem divergência"
+passa a significar apenas "sem verificação".
+
+### 2. `src/priceQuality.ts` (novo)
+
+- **`PriceSampleBook`** — últimas cotações por token/fonte, com memória LIMITADA (`maxPerMint` 4,
+  `maxMints` 500, evicção FIFO) porque cache de preço sem teto é vazamento de memória em processo
+  de semanas. Preço ≤ 0/`NaN`/`Infinity` nunca entra: sem preço não é amostra, e "sem dado" não
+  pode virar "concordam".
+- **`relativeDivergencePct` / `classifyDivergence` / `compareSamples`** — diferença relativa
+  simétrica (normalizada pelo maior), faixas `ok`/`warn`/`critical` (5%/15% por padrão, ajustáveis
+  por env) e comparação de duas amostras explícitas. **Mesma fonte nunca é referência**: o mesmo
+  provedor responder duas vezes com preços diferentes é deriva de mercado, não divergência.
+- **`assessLiquidityDrop`** — queda relativa ao pico observado (50%/80%), usada como ALERTA.
+- Amostra mais velha que a janela (45 s padrão) não serve de referência e o achado carrega
+  `ageMs`: comparar preço de agora com preço de minutos atrás transformaria movimento normal em
+  "divergência" — o operador precisa do número e da idade, não de um veredito opaco.
+
+### 3. Amostra de verificação (a parte que faz a detecção existir de fato)
+
+`fetchBatchPrices` ganhou `sampleBook`, `divergenceThresholds` e `verifyMints`. A cada ciclo, o
+gerenciador pede segunda opinião para uma **amostra rotativa** de até 2 tokens
+(`HFT_PRICE_VERIFY_SAMPLE`), sempre na **primeira fonte que ainda não respondeu** (Jupiter →
+GeckoTerminal). Custo máximo: **1 requisição extra por ciclo**, com prioridade `background` — a
+verificação **nunca fura cota**, nem quando o lote roda com prioridade de saída (teste garante
+`bypassed === 0`). Se as três fontes já foram tentadas, a verificação é declarada **impossível**
+com motivo registrado, em vez de silenciosamente pulada.
+
+Fiação no `server.ts`: contadores `marketBatch.verifications` / `verificationSources` /
+`divergences` / `lastDivergences`, `qualityNote` no `/api/health`, e — no laço — `pos.priceDivergence`
++ alerta de liquidez com `pos.liquidityUsdPeak` / `pos.liquidityAlert` (campos novos em
+`DBPosition`, para o pós-mortem sobreviver ao log).
+
+**Nada disso vende.** Divergência e queda de liquidez geram log (WARN/CRITICAL), campo na posição
+e contador — nunca ordem. Há teste de regressão que falha se alguém transformar o alerta em
+gatilho sem autorização própria; há também teste que garante que `priceQuality.ts` não contém
+`sell|swap|sendTransaction`.
+
+### 4. Bug real de ~200x no caminho de preço (achado ao escrever os testes do parser)
+
+`priceNative` do DexScreener é o preço do token-base na moeda de **cotação do par**. Só coincide
+com "SOL por token" quando o par é cotado em wrapped SOL. Em par TOKEN/USDC, o número está em
+**USDC** — ~200x o preço em SOL (SOL ≈ 200 USD). Os três pontos que liam `priceNative` cru
+(parser do lote, preço de referência da entrada paper, fallback por posição) podiam, portanto,
+gravar um preço ~200x maior: PnL inventado, stop/alvo disparando por ruído de unidade e, com
+capital real, **take-profit imediato após a compra**.
+
+Correção (regra única, `priceSolFromDexPairs`): par cotado em SOL → `priceNative`; par cotado em
+outra moeda → `priceUsd / (USD/SOL do PRÓPRIO payload)`; sem âncora de SOL/USD → preço **ausente**
+com motivo, nunca o número errado. O wrapped SOL passou a ir na mesma requisição do DexScreener
+como âncora (custo zero — mesmo endpoint, até 30 endereços) e vale 1 SOL por definição. Testes
+travam a regra: par em USDC converte (0,15 USD → 0,00075 SOL, não 0,15), ausência de âncora
+devolve `null`, e o `server.ts` não pode voltar a ler `priceNative` cru.
+
+### 5. Estado verificado
+
+```
+npm run lint  → exit 0
+npm run test  → 151/151 (grupos [20] lote com 3 testes novos de conversão; [21] qualidade de
+                preço com 15 testes: livro limitado, mesma fonte, janela, preço inválido,
+                amostra rotativa, verificação que detecta divergência, concordância,
+                fonte esgotada, cota esgotada, verificação sem bypass, liquidez, regressão
+                alerta-only)
+npm run build → ok
+npm run free:check -- --quick → 15 estágios; [3d] mede a segunda opinião e, sem rede, registra
+                "NÃO houve segunda opinião: <motivo>" como PULADO — não como aprovação
+```
+
+### 6. O que continua NÃO verificado / aberto
+
+- **Nenhuma fonte foi exercitada com rede real neste sandbox** (sem egress): a primeira execução
+  de verdade é `npm run free:check` no VPS do operador.
+- **Política sobre divergência não é automática**: hoje é alerta. Vetar entrada, reduzir posição
+  ou pausar o par por divergência exige decisão explícita (e, para agir, execução real autorizada).
+- **Preço de ENTRADA ainda não tem verificação cruzada**: a amostra cobre o gerenciamento de
+  posições; o caminho de entrada (paper hoje) usa uma fonte por vez. Alinhar isso é pré-requisito
+  do S6 — junto com o IDL da instrução de compra.
+- `HFT_PRICE_DIVERGENCE=0` desliga o livro de amostras, mas a amostra rotativa continua comparando
+  (custo de cota e alerta permanecem). Semântica a alinhar caso o operador queira um kill switch
+  completo da verificação.
