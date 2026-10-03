@@ -1567,3 +1567,86 @@ npm run free:check → novo estágio [3e] mede a verificação de entrada no SEU
   comparativa ("as entradas verificadas tiveram expectativa diferente?") fica para quando houver
   amostra — com menos de `MIN_TRADES_FOR_CONFIDENCE` operações isso seria ruído, não estatística.
 - Entrada real (S6) segue **não autorizada**, e o gate de entrada roda em paper — isso não muda.
+
+## Adendo 14 — O perfil de RPC agora é CONFERIDO contra o endpoint (e quatro telemetrias fabricadas caíram) (2026-10-03)
+
+Autorização: *"OK, pode implementar"* — escopo declarado em duas partes: (1) guarda de coerência
+entre `HFT_RPC_PROFILE` (teto de cota) e o host de `RPC_ENDPOINT`/`RPC_FALLBACKS`; (2) limpeza da
+telemetria fabricada em `/api/jito-leader-schedule`, `HftProfiler.tsx` e `DiagnosticsPanel.tsx`.
+Nada aqui habilita entrada real: PAPER/SHADOW seguem sendo o único caminho ativo.
+
+### 1. Por que uma "guarda de coerência" e não só um aviso no README
+
+`HFT_RPC_PROFILE` diz ao `rateBudget` quantas requisições por segundo o processo pode gastar. O
+`RPC_ENDPOINT` diz onde elas vão. Se os dois discordam, o bot **opera com um teto que não existe**:
+`HFT_RPC_PROFILE=helius` + `RPC_ENDPOINT` público significa ~50 req/s declaradas gastas contra um
+endpoint gratuito compartilhado — o 429 chega exatamente no lançamento em que a decisão importa. O
+erro é assimétrico e silencioso: nada quebra no boot, nada aparece no log, e a perda só se
+materializa como *decisões puladas* (o rate limiter segura a requisição) ou como *erro de rede*
+tratado como "RPC fora do ar". Não é um erro de digitação: é um erro de configuração com
+consequência de execução.
+
+### 2. `src/rpcProfile.ts` (novo, puro) — `assessRpcCoherence`
+
+`assessRpcCoherence({ endpoint, websocket, fallbacks, declaredProfile })` devolve
+`{ declaredProfile, declaredProfileKnown, inferredFromEndpoint, coherent, usingPublicDefaultEndpoint,
+observations[{role,host,provider}], issues[{severity,code,message}] }`. Nove códigos, duas
+severidades:
+
+| Severidade | Códigos | Efeito |
+|---|---|---|
+| `mismatch` | `perfil-desconhecido`, `endpoint-publico-com-perfil-dedicado`, `perfil-nao-bate-endpoint`, `perfil-nao-bate-*` por provedores divergentes entre endpoint/WebSocket/fallback | em LIVE: `[Boot][RPC][FATAL]` + `exit(1)` |
+| `warn` | `endpoint-ausente`, `host-nao-verificavel`, `endpoint-dedicado-com-perfil-publico` (sub-utilização), WebSocket/fallback de provedor conhecido e diferente, `fallback-misto` | registra e segue |
+
+Três decisões de desenho que são escolha, não detalhe:
+
+- **Host desconhecido é `warn`, não `mismatch`.** Provedor próprio, proxy ou domínio customizado é
+  legítimo e comum — este código não tem como verificar a cota contratada. Bloquear o boot por não
+  conhecer o domínio transformaria a guarda em obstáculo; o texto do aviso diz o que conferir à mão.
+- **Sub-utilização avisa mas não bloqueia.** Perfil `public` com endpoint dedicado **não** estoura
+  cota — só desperdiça orçamento. É `warn` (o operador deve subir o perfil), não erro fatal.
+- **Só `mismatch` bloqueia, e só em LIVE.** PAPER/SHADOW registram `[Boot][RPC]` e seguem: teste não
+  deve exigir infraestrutura paga. A guarda protege **capital**, não a conveniência de quem testa.
+
+`hostFromUrl` devolve **somente o host** — nunca a URL completa, que costuma carregar a chave de API
+no path (`.../v0/API_KEY`). O log de boot e o `/api/health` podem ser copiados para um ticket sem
+vazar credencial; há teste garantindo que a URL com chave não aparece na saída.
+
+### 3. O que a limpeza de telemetria removeu (e a regra que fica)
+
+O critério aplicado foi o desta rodada: **métrica não medida não pode aparecer como se fosse
+medição**. Onde não há medição, o valor passa a ser `null` + rótulo "não medido" + o motivo.
+
+| Onde | Antes (fabricado) | Agora |
+|---|---|---|
+| `/api/jito-leader-schedule` | slot/regiões/reputação de líder Jito por RNG | `measured:false`; `currentSlot` medido dos nós RPC (ou `null`); `nextLeaderSlot`/`currentLeader`/`isJitoNextLeader`/`blockEngineReputation` = `null`; `regions: []`; `notMeasured{}` + `howToMeasure` |
+| `HftProfiler.tsx` | eventos/s, RX/TX, renders/s, jitter/GC e exposição por RNG; Jito "LANDED" sem envio | eventos/s = Δ`detection.eventCount`/Δt real; RTT da lista `rpcLatency[]` de `/api/rpc-nodes`; renders/s por contador real do componente (rotulado como do NAVEGADOR); jitter/GC/Jito = "não medido"; faixa no cabeçalho dizendo o que é do navegador |
+| `DiagnosticsPanel.tsx` | laudo decorativo (checks que sempre passavam; PTPv2/"drift física"/"< 1ns" sem medição) | 5 verificações reais (`/api/rpc-nodes`, `/api/health` + `rpcCoherence`, `/api/rpc-infra/blockhash`, `/api/operational-security/state` → `keyCustody`); falha de fetch = `failed`, nunca `passed`; aviso de que co-location é **declaração do operador, não medição** |
+| `MevExecutionEngine.tsx` | tip presets e transação fabricados a partir do `/api/submit-bundle` simulado | tip presets de `percentilesSol` de `/api/jito-tips` (+ `tipsMeasuredAt`/`tipsSource`); sem `mockTx`; banner SIMULADO; `LeaderSchedule` null-safe |
+| `/api/hft-telemetry` | `currentSlot = 278913410 + (Date.now()/400)%100000` (número que "anda" com o relógio do processo) | `currentSlot` = maior `lastSlot` medido em `rpcMetrics` **ou `null`**; payload agora traz `simulated: true` + `simulatedNote`, e o resto do painel continua declarado em `/api/system-truth → fabricatedEndpoints` |
+
+O último item merece nota: o slot não era só decorativo — ele é o mesmo número que aparece em
+painéis de execução, e um valor que cresce ~2,5 slots/s **parece** telemetria de rede. Quem lê "slot
+278.913.410" não desconfia. O teste de regressão agora limpa comentários antes de procurar código
+proibido (a documentação da correção cita o código removido) e, além de proibir a fórmula, exige que
+o endpoint **declare** `simulated: true` e que o slot venha de `rpcMetrics[].lastSlot`.
+
+### 4. Testes e evidências
+
+- `npm run lint` → 0 erros (`tsc --noEmit`, incluindo o estreitamento de tipo novo do `rpcProfile`).
+- `npm run test` → **175/175** (eram 161 no Adendo 13; o grupo [23] traz 14 testes novos).
+- `npm run build` → ok (`dist/server.cjs`).
+- Grupo [23] cobre: `hostFromUrl`/`inferRpcProvider` (incluindo URL com chave), os nove códigos de
+  coerência, `warn` de sub-utilização, `mismatch` de inverso, host próprio não-verificável, mistura
+  de fallbacks (`observations.length === 4`), regressões do boot (`rpcCoherence`, `process.exit(1)`
+  só com `mode === "LIVE"`), `/api/jito-leader-schedule`, painel MEV, `HftProfiler` e
+  `DiagnosticsPanel`.
+
+### 5. O que NÃO foi feito (limites desta autorização)
+
+- Coleta real de leader schedule Jito, de reputação de block engine e de RTT por região continua
+  **não implementada** — requer endpoints pagos ou medição própria; a resposta certa hoje é `null`
+  com o caminho de medição descrito em `howToMeasure`.
+- `HFT_RPC_PROFILE` continua sendo **declaração** do operador: a guarda verifica **coerência**
+  (perfil × host), não a cota contratada. Cota real se confere no painel do provedor.
+- Nada muda em PAPER/SHADOW, quarentena ou no gate de entrada — entrada real (S6) segue não autorizada.

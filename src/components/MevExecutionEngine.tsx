@@ -11,40 +11,59 @@ import {
   ShieldAlert,
   ArrowRight
 } from "lucide-react";
-import { JitoTips } from "../types";
+/**
+ * Presets de tip SEM valor inventado: `null` significa NÃO MEDIDO. O painel mostra "não medido"
+ * em vez de um número de vitrine — quem opera capital precisa saber quando não há dado.
+ */
+interface TipPresets {
+  low: number | null;
+  medium: number | null;
+  high: number | null;
+  extreme: number | null;
+}
+
+/**
+ * Regiões de block engine da Jito são um fato publicado (não medimos latência a partir daqui —
+ * este processo não está em nenhuma delas). A lista existe para o operador ESCOLHER a região
+ * mais próxima do seu servidor; o número em ms que existia aqui era invenção.
+ */
+const JITO_BLOCK_ENGINE_REGIONS = ["Amsterdam", "Frankfurt", "London", "New York", "Salt Lake City", "Singapore", "Tokyo"];
 
 interface MevExecutionEngineProps {
   selectedToken?: { name: string; mint: string } | null;
   onBundleSuccess?: (newTx: any) => void;
 }
 
+/**
+ * Escala de líderes: `null` = NÃO MEDIDO / não observável deste processo (ver o endpoint
+ * `/api/jito-leader-schedule`). Nada aqui é preenchido com valor de vitrine.
+ */
 interface LeaderSchedule {
-  currentSlot: number;
-  nextLeaderSlot: number;
-  currentLeader: string;
-  isJitoNextLeader: boolean;
-  blockEngineReputation: string;
+  measured?: boolean;
+  currentSlot: number | null;
+  nextLeaderSlot: number | null;
+  currentLeader: string | null;
+  isJitoNextLeader: boolean | null;
+  blockEngineReputation: string | null;
   regions: { name: string; delayMs: number }[];
 }
 
 export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecutionEngineProps) {
   // Tips state
-  const [tips, setTips] = useState<JitoTips>({ low: 0.0005, medium: 0.0015, high: 0.005, extreme: 0.02 });
-  const [congestion, setCongestion] = useState<"low" | "medium" | "high">("medium");
+  const [tips, setTips] = useState<TipPresets>({ low: null, medium: null, high: null, extreme: null });
+  /** Quando o tip floor foi medido pela última vez (null = nunca, nesta sessão de painel). */
+  const [tipsMeasuredAt, setTipsMeasuredAt] = useState<number | null>(null);
+  const [tipsSource, setTipsSource] = useState<string>("não medido");
 
   // Leader schedule state
   const [leaderInfo, setLeaderInfo] = useState<LeaderSchedule>({
-    currentSlot: 278913410,
-    nextLeaderSlot: 278913415,
-    currentLeader: "Jito Validator (Tokyo-A)",
-    isJitoNextLeader: true,
-    blockEngineReputation: "Elite (99.8th percentile)",
-    regions: [
-      { name: "Tokyo (ap-northeast-1)", delayMs: 4.8 },
-      { name: "Frankfurt (eu-central-1)", delayMs: 5.2 },
-      { name: "New York (us-east-4)", delayMs: 1.1 },
-      { name: "Amsterdam (eu-west-3)", delayMs: 6.0 }
-    ]
+    measured: false,
+    currentSlot: null,
+    nextLeaderSlot: null,
+    currentLeader: null,
+    isJitoNextLeader: null,
+    blockEngineReputation: null,
+    regions: [],
   });
 
   // Bundle inputs
@@ -52,7 +71,7 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
   const [tokenMint, setTokenMint] = useState("Cosm6718291882...pump");
   const [swapSol, setSwapSol] = useState("1.5");
   const [customTip, setCustomTip] = useState("0.002");
-  const [selectedRegion, setSelectedRegion] = useState("New York (us-east-4)");
+  const [selectedRegion, setSelectedRegion] = useState(JITO_BLOCK_ENGINE_REGIONS[3]);
 
   // Submission execution state
   const [submitting, setSubmitting] = useState(false);
@@ -66,19 +85,29 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
     }
   }, [selectedToken]);
 
-  // Fetch Tips
+  /**
+   * Tip floor REAL. A resposta de `/api/jito-tips` traz `percentilesSol` (p25/p50/p75/p95) —
+   * e o código anterior lia `data.tips`, campo que NÃO existe: o painel exibia presets fixos
+   * (0.0005/0.0015/0.005/0.02) como se fossem medição, e o "congestionamento" era `Math.random()`.
+   * Agora: sem `percentilesSol`, tudo fica `null` e o painel diz "não medido".
+   */
   useEffect(() => {
     const fetchTips = async () => {
       try {
         const res = await fetch("/api/jito-tips");
         const data = await res.json();
-        setTips(data.tips);
-        const rand = Math.random();
-        if (rand > 0.7) setCongestion("high");
-        else if (rand < 0.3) setCongestion("low");
-        else setCongestion("medium");
-      } catch (e) {
-        console.warn("Failed to fetch tips (using local fallback)", e);
+        const p = data?.percentilesSol;
+        if (data?.available && p && typeof p.p25 === "number") {
+          setTips({ low: p.p25, medium: p.p50 ?? null, high: p.p75 ?? null, extreme: p.p95 ?? p.p99 ?? null });
+          setTipsMeasuredAt(Date.now());
+          setTipsSource("Jito tip_floor (medido no backend)");
+        } else {
+          setTips({ low: null, medium: null, high: null, extreme: null });
+          setTipsSource(`não medido${data?.error ? ` — ${String(data.error).slice(0, 60)}` : ""}`);
+        }
+      } catch {
+        setTips({ low: null, medium: null, high: null, extreme: null });
+        setTipsSource("não medido — backend inacessível");
       }
     };
     fetchTips();
@@ -123,24 +152,17 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
       
       if (data) {
         setBundleResult(data);
-        
-        // If bundle landed, notify App context
-        if (data.landStatus === "Landed" && onBundleSuccess) {
-          const mockTx = {
-            id: data.bundleId,
-            token: tokenName.toUpperCase(),
-            mint: tokenMint.slice(0, 10) + "..." + tokenMint.slice(-4),
-            amount: `${swapSol} SOL`,
-            outAmount: `${(parseFloat(swapSol) * (150000 + Math.floor(Math.random() * 50000))).toLocaleString()} ${tokenName.toUpperCase()}`,
-            time: data.timestamp,
-            latencyMs: 4,
-            status: "success" as any,
-            block: 278913410 + Math.floor(Math.random() * 500),
-            tipSol: parseFloat(customTip),
-            route: `Jito Bundle (${selectedRegion.split(" ")[0]})`
-          };
-          onBundleSuccess(mockTx);
-        }
+
+        /**
+         * NADA DE TRANSAÇÃO FABRICADA. O endpoint `/api/submit-bundle` é um SIMULADOR declarado
+         * (`/api/system-truth` → fabricatedEndpoints): nenhum bundle sai daqui, logo não existe
+         * fill, preço de execução nem número de bloco. O código anterior montava uma "transação"
+         * com `outAmount` e `block` ALEATÓRIOS e a empurrava para a lista de operações do App —
+         * o painel exibia um trade que nunca existiu, com números inventados.
+         * Agora: o resultado aparece marcado como SIMULADO e nenhuma operação é registrada.
+         * `onBundleSuccess` segue existindo para quando houver submissão REAL (S6 autorizado).
+         */
+        void onBundleSuccess;
       }
     } catch (err) {
       console.error("Bundle dispatch failed", err);
@@ -149,7 +171,9 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
     }
   };
 
-  const applyTipPreset = (amount: number) => {
+  /** Só aplica preset MEDIDO: com `null` (fonte indisponível), o campo não é preenchido com ficção. */
+  const applyTipPreset = (amount: number | null) => {
+    if (amount === null) return;
     setCustomTip(amount.toString());
   };
 
@@ -167,9 +191,16 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20 text-[9px] font-mono font-bold text-emerald-400">
+        <div
+          className={`flex items-center gap-1.5 px-2 py-0.5 rounded border text-[9px] font-mono font-bold ${
+            tipsMeasuredAt !== null
+              ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+              : "bg-slate-800/60 border-slate-700 text-slate-400"
+          }`}
+          title={tipsSource}
+        >
           <Server className="w-3.5 h-3.5" />
-          BLOCK-ENGINE LINKED
+          {tipsMeasuredAt !== null ? "TIP FLOOR MEDIDO" : "TIP FLOOR NÃO MEDIDO"}
         </div>
       </div>
 
@@ -179,7 +210,7 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
         <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-850/80">
           <span className="block text-[8px] font-mono text-slate-500 uppercase">Solana Slot Atual</span>
           <span className="text-sm font-mono font-bold text-slate-200 mt-1 block flex items-center justify-between">
-            {leaderInfo.currentSlot.toLocaleString()}
+            {leaderInfo.currentSlot !== null ? leaderInfo.currentSlot.toLocaleString() : "não medido"}
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
           </span>
         </div>
@@ -188,11 +219,13 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
         <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-850/80">
           <span className="block text-[8px] font-mono text-slate-500 uppercase">Slot do Próximo Líder Jito</span>
           <span className="text-sm font-mono font-bold text-purple-400 mt-1 block flex items-center justify-between">
-            {leaderInfo.nextLeaderSlot.toLocaleString()}
-            <span className={`text-[8px] font-mono px-1 rounded ${
-              leaderInfo.isJitoNextLeader ? "bg-purple-500/10 text-purple-400" : "bg-slate-800 text-slate-400"
-            }`}>
-              {leaderInfo.isJitoNextLeader ? "JITO NEXT" : "NORMAL RPC"}
+            {leaderInfo.nextLeaderSlot !== null ? leaderInfo.nextLeaderSlot.toLocaleString() : "não medido"}
+            <span className="text-[8px] font-mono px-1 rounded bg-slate-800 text-slate-400">
+              {leaderInfo.nextLeaderSlot !== null
+                ? leaderInfo.isJitoNextLeader
+                  ? "JITO NEXT"
+                  : "NORMAL RPC"
+                : "SEM ESCALA DE LÍDERES"}
             </span>
           </span>
         </div>
@@ -201,7 +234,7 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
         <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-850/80">
           <span className="block text-[8px] font-mono text-slate-500 uppercase">Validador Ativo no Bloco</span>
           <span className="text-[10px] font-mono text-slate-300 mt-1 block truncate">
-            {leaderInfo.currentLeader}
+            {leaderInfo.currentLeader ?? "não medido (este processo não consulta a escala)"}
           </span>
         </div>
       </div>
@@ -213,7 +246,13 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
             <Zap className="w-3.5 h-3.5 text-amber-400" />
             Nível Recomendado de Gorjeta Jito (SOL)
           </span>
-          <span className="text-[9px] font-mono text-slate-500 uppercase">Congestionamento: <b className="text-cyan-400 font-bold">{congestion}</b></span>
+          <span className="text-[9px] font-mono text-slate-500 uppercase">
+            Tip floor p75:{" "}
+            <b className={tips.high !== null ? "text-cyan-400 font-bold" : "text-slate-400 font-bold"}>
+              {tips.high !== null ? `${tips.high} SOL` : "não medido"}
+            </b>
+            {tipsMeasuredAt !== null && <span className="text-slate-600"> · fonte: Jito (medido)</span>}
+          </span>
         </div>
         <div className="grid grid-cols-4 gap-2">
           <button
@@ -222,7 +261,7 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
             className="p-2 bg-slate-950 hover:bg-slate-900 border border-slate-850 rounded text-center transition-all cursor-pointer"
           >
             <span className="block text-[8px] font-mono text-slate-500 uppercase">Baixo</span>
-            <span className="text-xs font-mono font-bold text-slate-300 block mt-0.5">{tips.low}</span>
+            <span className="text-xs font-mono font-bold text-slate-300 block mt-0.5">{tips.low ?? "não medido"}</span>
           </button>
           <button
             type="button"
@@ -230,7 +269,7 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
             className="p-2 bg-slate-950 hover:bg-slate-900 border border-slate-850 rounded text-center transition-all cursor-pointer"
           >
             <span className="block text-[8px] font-mono text-slate-500 uppercase">Médio</span>
-            <span className="text-xs font-mono font-bold text-cyan-400 block mt-0.5">{tips.medium}</span>
+            <span className="text-xs font-mono font-bold text-cyan-400 block mt-0.5">{tips.medium ?? "não medido"}</span>
           </button>
           <button
             type="button"
@@ -238,7 +277,7 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
             className="p-2 bg-slate-950 hover:bg-slate-900 border border-slate-850 rounded text-center transition-all cursor-pointer"
           >
             <span className="block text-[8px] font-mono text-slate-500 uppercase">Alto</span>
-            <span className="text-xs font-mono font-bold text-emerald-400 block mt-0.5">{tips.high}</span>
+            <span className="text-xs font-mono font-bold text-emerald-400 block mt-0.5">{tips.high ?? "não medido"}</span>
           </button>
           <button
             type="button"
@@ -246,7 +285,7 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
             className="p-2 bg-slate-950 hover:bg-slate-900 border border-slate-850 rounded text-center transition-all cursor-pointer"
           >
             <span className="block text-[8px] font-mono text-slate-500 uppercase">Extremo</span>
-            <span className="text-xs font-mono font-bold text-amber-400 block mt-0.5">{tips.extreme}</span>
+            <span className="text-xs font-mono font-bold text-amber-400 block mt-0.5">{tips.extreme ?? "não medido"}</span>
           </button>
         </div>
       </div>
@@ -307,9 +346,12 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
               disabled={submitting}
               className="w-full bg-slate-950 border border-slate-850 focus:border-purple-500 rounded px-1.5 py-1.5 text-[10px] font-mono text-slate-200 focus:outline-none cursor-pointer"
             >
-              {leaderInfo.regions.map((reg) => (
+              {(leaderInfo.regions.length > 0
+                ? leaderInfo.regions.map((reg) => ({ name: reg.name }))
+                : JITO_BLOCK_ENGINE_REGIONS.map((name) => ({ name }))
+              ).map((reg) => (
                 <option key={reg.name} value={reg.name}>
-                  {reg.name.split(" ")[0]} ({reg.delayMs}ms)
+                  {reg.name}
                 </option>
               ))}
             </select>
@@ -373,8 +415,14 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
             </span>
           </div>
 
+          {bundleResult.simulated === true && (
+            <div className="mb-2 p-1.5 bg-amber-500/10 border border-amber-500/30 rounded text-[10px] font-mono text-amber-300 font-bold">
+              SIMULADO — nenhum bundle foi enviado on-chain. Sem fill, sem preço de execução, sem
+              slot. Esta tela demonstra a mecânica; o envio real depende do S6 (não autorizado).
+            </div>
+          )}
           <p className="text-[10px] font-mono leading-relaxed text-slate-300 mb-2">
-            <b>Status:</b> {bundleResult.landStatus} <br />
+            <b>Status:</b> {bundleResult.simulated === true ? "SIMULADO (não é landing real)" : bundleResult.landStatus} <br />
             <b>Detalhe:</b> {bundleResult.landReason}
           </p>
 
@@ -399,10 +447,10 @@ export function MevExecutionEngine({ selectedToken, onBundleSuccess }: MevExecut
 
       {/* Network Latency Stats footer */}
       <div className="mt-3.5 pt-2 border-t border-slate-850/60 flex items-center justify-between text-[9px] font-mono text-slate-500 uppercase tracking-wider">
-        <span>BlockEngine Jitter: &lt; 0.2ms</span>
+        <span>Jitter do block engine: não medido (tip floor medido ≠ jitter de rede)</span>
         <span className="flex items-center gap-1">
-          <Activity className="w-3 h-3 text-purple-400 animate-pulse" />
-          Pre-Mempool Shield Enabled
+          <Activity className="w-3 h-3 text-slate-500" />
+          nenhum bundle enviado por este processo
         </span>
       </div>
     </div>

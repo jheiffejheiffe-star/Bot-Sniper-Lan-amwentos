@@ -50,16 +50,30 @@ export function HftProfiler() {
   const [currentLatency, setCurrentLatency] = useState<number>(4.2);
   const [totalEvents, setTotalEvents] = useState<number>(154820);
   
-  // Live moving metrics for Saúde do Robô
-  const [eventsPerSec, setEventsPerSec] = useState<number>(14840);
-  const [avgRttJito, setAvgRttJito] = useState<number>(1.2);
-  const [avgRttTriton, setAvgRttTriton] = useState<number>(15.4);
-  const [avgRttHelius, setAvgRttHelius] = useState<number>(11.8);
-  const [jitoAcceptanceRate, setJitoAcceptanceRate] = useState<number>(98.35);
-  const [bundlesSent, setBundlesSent] = useState<number>(1280);
-  const [bundlesAccepted, setBundlesAccepted] = useState<number>(1259);
-  const [activeExposure, setActiveExposure] = useState<number>(1.20);
-  const [reactRendersPerSec, setReactRendersPerSec] = useState<number>(2.4);
+  /**
+   * MÉTRICAS DE SAÚDE — REGRA DESTA TELA: `null` = NÃO MEDIDO.
+   *
+   * A versão anterior exibia "RPC Helius Geyser Hub: 11.8 ms", "Jito acceptance 98.35%" e
+   * "Exposição 1.20 SOL" gerados por `Math.random()` a cada tick. Números assim parecem
+   * telemetria e fazem o operador decidir sobre ficção. Agora:
+   *   - latência de RPC vem de `/api/rpc-nodes` (p95 MEDIDO por nó configurado);
+   *   - eventos/s vem do delta real de `detection.eventCount` em `/api/health`;
+   *   - exposição vem da soma das posições abertas em `/api/positions`;
+   *   - Jito (bundles/acceptance) NÃO é medido: nenhum bundle é enviado por este processo.
+   */
+  interface MeasuredNode {
+    name: string;
+    host: string;
+    latencyMs: number | null;
+    metricsSource: string;
+  }
+  const [rpcLatency, setRpcLatency] = useState<MeasuredNode[]>([]);
+  const [eventsPerSec, setEventsPerSec] = useState<number | null>(null);
+  const [bundlesSent] = useState<number>(0);
+  const [activeExposure, setActiveExposure] = useState<number | null>(null);
+  const [reactRendersPerSec, setReactRendersPerSec] = useState<number | null>(null);
+  /** Amostra anterior de eventos, para calcular taxa REAL entre leituras. */
+  const lastEventSampleRef = useRef<{ count: number; at: number } | null>(null);
 
   // Benchmark state
   const [benchmarkResult, setBenchmarkResult] = useState<{
@@ -92,7 +106,81 @@ export function HftProfiler() {
     }
   }, [profilerLogs]);
 
-  // Real-time telemetry generator
+  /**
+   * MEDIÇÃO REAL (1/3): latência p95 por nó RPC configurado.
+   * `metricsSource: "unavailable"` → sem amostra: mostramos "não medido", nunca um número.
+   */
+  useEffect(() => {
+    if (!isActive) return;
+    const fetchNodes = async () => {
+      try {
+        const res = await fetch("/api/rpc-nodes");
+        const data = await res.json();
+        const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+        setRpcLatency(
+          nodes.slice(0, 3).map((n: any) => ({
+            name: String(n?.name ?? "RPC"),
+            host: String(n?.url ?? ""),
+            latencyMs: typeof n?.latency === "number" && n.latency > 0 && n?.metricsSource !== "unavailable" ? n.latency : null,
+            metricsSource: String(n?.metricsSource ?? "unavailable"),
+          }))
+        );
+      } catch {
+        setRpcLatency([]);
+      }
+    };
+    void fetchNodes();
+    const interval = setInterval(fetchNodes, 5000);
+    return () => clearInterval(interval);
+  }, [isActive]);
+
+  /**
+   * MEDIÇÃO REAL (2/3): eventos/s a partir do delta de `detection.eventCount` e exposição a
+   * partir das posições abertas. Sem dado → `null` → a tela escreve "não medido".
+   */
+  useEffect(() => {
+    if (!isActive) return;
+    const fetchTruth = async () => {
+      try {
+        const [healthRes, posRes] = await Promise.all([fetch("/api/health"), fetch("/api/positions")]);
+        const health = await healthRes.json();
+        const count = health?.detection?.eventCount;
+        if (typeof count === "number") {
+          const anterior = lastEventSampleRef.current;
+          const agora = Date.now();
+          if (anterior && agora > anterior.at) {
+            const delta = count - anterior.count;
+            setEventsPerSec(delta >= 0 ? Math.round((delta / (agora - anterior.at)) * 1000) : null);
+          }
+          lastEventSampleRef.current = { count, at: agora };
+          setTotalEvents(count);
+        } else {
+          setEventsPerSec(null);
+        }
+        if (posRes.ok) {
+          const positions = await posRes.json();
+          if (Array.isArray(positions)) {
+            const abertas = positions.filter((p: any) => p?.status === "open" || !p?.status);
+            setActiveExposure(
+              abertas.reduce((acc: number, p: any) => acc + (Number.isFinite(Number(p?.sizeSol)) ? Number(p.sizeSol) : 0), 0)
+            );
+          } else {
+            setActiveExposure(null);
+          }
+        } else {
+          setActiveExposure(null);
+        }
+      } catch {
+        setEventsPerSec(null);
+        setActiveExposure(null);
+      }
+    };
+    void fetchTruth();
+    const interval = setInterval(fetchTruth, 5000);
+    return () => clearInterval(interval);
+  }, [isActive]);
+
+  // Real-time telemetry generator (APENAS métricas do NAVEGADOR — ver etiqueta DEMO na tela)
   useEffect(() => {
     if (!isActive) return;
 
@@ -123,36 +211,27 @@ export function HftProfiler() {
       // Network Latency
       const latencyVal = parseFloat((4.2 + randVariance * 0.4 + (isStressTesting ? 1.5 : 0)).toFixed(2));
       
-      // Events processed
-      const stepEvents = Math.floor(1250 + (isStressTesting ? 6200 : 0) + (isOptimized ? 120 : 0) + Math.random() * 300);
-
-      // Fluctuations for Robot Health parameters
-      setEventsPerSec(() => Math.floor(14500 + Math.random() * 800));
-      setAvgRttJito(prev => parseFloat(Math.max(0.8, Math.min(2.5, prev + (Math.random() - 0.5) * 0.1)).toFixed(2)));
-      setAvgRttTriton(prev => parseFloat(Math.max(12.0, Math.min(18.0, prev + (Math.random() - 0.5) * 0.4)).toFixed(2)));
-      setAvgRttHelius(prev => parseFloat(Math.max(9.0, Math.min(14.0, prev + (Math.random() - 0.5) * 0.3)).toFixed(2)));
-      setReactRendersPerSec(prev => parseFloat(Math.max(1.8, Math.min(3.5, prev + (Math.random() - 0.5) * 0.2)).toFixed(1)));
-      
-      // Jito Landing fluctuations
-      if (Math.random() > 0.85) {
-        setBundlesSent(p => p + 1);
-        if (Math.random() > 0.05) {
-          setBundlesAccepted(p => p + 1);
+      /**
+       * As métricas de REDE/JITO/EXPOSIÇÃO saíram daqui de propósito: elas agora vêm de
+       * medição real (efeitos acima). O que continua neste gerador é apenas o que é
+       * genuinamente do NAVEGADOR (carga da aba, memória do heap, render) — e isso é
+       * etiquetado como DEMO na própria tela, porque também não é medição do bot.
+       */
+      // Renders/s MEDIDOS (delta real do contador de renders deste componente).
+      {
+        const agora = Date.now();
+        const anterior = lastRenderSampleRef.current;
+        const decorrido = agora - anterior.at;
+        if (decorrido >= 900) {
+          setReactRendersPerSec(parseFloat((((renderCountRef.current - anterior.count) / decorrido) * 1000).toFixed(1)));
+          lastRenderSampleRef.current = { count: renderCountRef.current, at: agora };
         }
       }
-      setJitoAcceptanceRate(() => {
-        if (bundlesSent === 0) return 98.35;
-        return parseFloat(((bundlesAccepted / bundlesSent) * 100).toFixed(2));
-      });
-
-      // Exposure fluctuates mildly
-      setActiveExposure(prev => parseFloat(Math.max(0.5, Math.min(2.8, prev + (Math.random() - 0.5) * 0.05)).toFixed(2)));
 
       setCurrentRenderTime(renderVal);
       setCurrentCpu(cpuVal);
       setCurrentMemory(memoryVal);
       setCurrentLatency(latencyVal);
-      setTotalEvents(prev => prev + stepEvents);
 
       // Warning detectors
       if (renderVal > 4.0) {
@@ -170,7 +249,9 @@ export function HftProfiler() {
           cpuLoad: cpuVal,
           memoryHeap: memoryVal,
           latencyMs: latencyVal,
-          eventCount: stepEvents
+          // `eventCount` do gráfico local é o número de AMOSTRAS deste gráfico (medido aqui),
+          // não a contagem de eventos da rede — que vem de /api/health, em outro campo.
+          eventCount: prev.length + 1
         };
         const next = [...prev, newMetric];
         if (next.length > 15) next.shift();
@@ -180,7 +261,7 @@ export function HftProfiler() {
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [isActive, isStressTesting, isOptimized, bundlesSent, bundlesAccepted]);
+  }, [isActive, isStressTesting, isOptimized]);
 
   // Run Benchmark load test
   const runLoadTest = async () => {
@@ -253,6 +334,14 @@ export function HftProfiler() {
     addLog("Estatísticas do perfilador resetadas.", "info");
   };
 
+  /**
+   * RENDERS/S REAIS: conta renders deste componente e converte em taxa. É do navegador, não do
+   * bot — mas é MEDIÇÃO, não `Math.random()`. A tela diz a origem.
+   */
+  const renderCountRef = useRef(0);
+  const lastRenderSampleRef = useRef<{ count: number; at: number }>({ count: 0, at: Date.now() });
+  renderCountRef.current += 1;
+
   const chartData = useMemo(() => metricsHistory, [metricsHistory]);
 
   return (
@@ -265,7 +354,10 @@ export function HftProfiler() {
           <Activity className="w-5 h-5 text-cyan-400 animate-pulse" />
           <div>
             <h2 className="text-sm font-display font-bold text-slate-100 uppercase tracking-tight">Diagnósticos de Operação e Performance</h2>
-            <span className="text-[9px] font-mono text-cyan-400 block uppercase tracking-wider">Métricas Reais de Saúde & Estresse HFT</span>
+            <span className="text-[9px] font-mono text-cyan-400 block uppercase tracking-wider">
+              Latência de RPC, eventos e exposição vêm do backend (MEDIDO). CPU/RAM/render são do
+              NAVEGADOR e marcados como demo — não são métricas do bot.
+            </span>
           </div>
         </div>
 
@@ -309,23 +401,24 @@ export function HftProfiler() {
                   <span className="text-[8px] font-mono text-emerald-400 bg-emerald-500/10 px-1 py-0.5 rounded uppercase font-bold">Excelente</span>
                 </div>
                 <div className="space-y-1 text-[10px] font-mono">
-                  <div className="flex justify-between items-center">
-                    <span className="text-slate-500">RPC Principal Jito (NY4):</span>
-                    <span className="text-slate-200 font-bold">{avgRttJito} ms</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-slate-500">RPC Backplane Triton:</span>
-                    <span className="text-slate-200">{avgRttTriton} ms</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-slate-500">RPC Helius Geyser Hub:</span>
-                    <span className="text-slate-200">{avgRttHelius} ms</span>
-                  </div>
+                  {rpcLatency.length === 0 && (
+                    <div className="text-slate-500">não medido — nenhum nó RPC medido por este processo</div>
+                  )}
+                  {rpcLatency.map((n) => (
+                    <div key={`${n.name}-${n.host}`} className="flex justify-between items-center gap-2">
+                      <span className="text-slate-500 truncate" title={n.host}>
+                        {n.name}:
+                      </span>
+                      <span className={n.latencyMs !== null ? "text-slate-200" : "text-slate-500"}>
+                        {n.latencyMs !== null ? `${n.latencyMs} ms` : "não medido"}
+                      </span>
+                    </div>
+                  ))}
                 </div>
               </div>
               <div className="mt-2.5 pt-2 border-t border-slate-900 flex justify-between items-center text-[9px] font-mono">
-                <span className="text-slate-500">RTT MÉDIO RPC:</span>
-                <span className="text-cyan-400 font-bold">{( (avgRttJito + avgRttTriton + avgRttHelius) / 3 ).toFixed(2)} ms</span>
+                <span className="text-slate-500">FONTE:</span>
+                <span className="text-cyan-400 font-bold">p95 dos nós configurados (medido)</span>
               </div>
             </div>
 
@@ -342,12 +435,14 @@ export function HftProfiler() {
                 <div className="space-y-2">
                   <div className="flex justify-between items-center font-mono text-[10px]">
                     <span className="text-slate-500">Eventos de Mempool /s:</span>
-                    <span className="text-amber-400 font-extrabold">{eventsPerSec.toLocaleString()} ev/s</span>
+                    <span className={eventsPerSec !== null ? "text-amber-400 font-extrabold" : "text-slate-500"}>
+                      {eventsPerSec !== null ? `${eventsPerSec.toLocaleString()} ev/s` : "não medido"}
+                    </span>
                   </div>
                   <div className="w-full bg-slate-900 h-1.5 rounded overflow-hidden">
                     <div 
                       className="bg-amber-500 h-full transition-all duration-300"
-                      style={{ width: `${Math.min(100, (eventsPerSec / 20000) * 100)}%` }}
+                      style={{ width: `${eventsPerSec !== null ? Math.min(100, (eventsPerSec / 20000) * 100) : 0}%` }}
                     ></div>
                   </div>
                   <div className="flex justify-between text-[8px] font-mono text-slate-500 uppercase">
@@ -410,21 +505,21 @@ export function HftProfiler() {
                 <div className="space-y-1 text-[10px] font-mono">
                   <div className="flex justify-between items-center">
                     <span className="text-slate-500">Taxa de Inclusão (Landing):</span>
-                    <span className="text-purple-400 font-bold">{jitoAcceptanceRate}%</span>
+                    <span className="text-slate-500 font-bold">não medido</span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-slate-500">Bundles Aceitos:</span>
-                    <span className="text-slate-300 font-bold">{bundlesAccepted} / {bundlesSent}</span>
+                    <span className="text-slate-500 font-bold">{bundlesSent} / 0 enviados</span>
                   </div>
                   <div className="flex justify-between items-center">
-                    <span className="text-slate-500">Provedor Jito Block Engine:</span>
-                    <span className="text-slate-300">Frankfurt / NY4</span>
+                    <span className="text-slate-500">Tip floor Jito:</span>
+                    <span className="text-slate-300">medido no backend (/api/jito-tips)</span>
                   </div>
                 </div>
               </div>
               <div className="mt-2.5 pt-2 border-t border-slate-900 flex justify-between items-center text-[9px] font-mono">
-                <span className="text-slate-500">MEV SHIELD:</span>
-                <span className="text-emerald-400 font-bold">100% CONTRA FRONT-RUNNING</span>
+                <span className="text-slate-500">ENVIO REAL DE BUNDLE:</span>
+                <span className="text-slate-400 font-bold">S6 NÃO AUTORIZADO</span>
               </div>
             </div>
 
@@ -472,7 +567,9 @@ export function HftProfiler() {
                 <div className="space-y-1 text-[10px] font-mono">
                   <div className="flex justify-between items-center">
                     <span className="text-slate-500">Exposição Ativa (SOL):</span>
-                    <span className="text-orange-400 font-bold">{activeExposure} SOL</span>
+                    <span className={activeExposure !== null ? "text-orange-400 font-bold" : "text-slate-500"}>
+                      {activeExposure !== null ? `${activeExposure.toFixed(4)} SOL` : "não medido"}
+                    </span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-slate-500">Exposição Máxima Auto:</span>
@@ -511,13 +608,13 @@ export function HftProfiler() {
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-slate-500">Event Loop Jitter:</span>
-                    <span className="text-emerald-400 font-bold">0.08 ms</span>
+                    <span className="text-slate-500 font-bold">não medido</span>
                   </div>
                 </div>
               </div>
               <div className="mt-2.5 pt-2 border-t border-slate-900 flex justify-between items-center text-[9px] font-mono">
                 <span className="text-slate-500">GARBAGE COLLECTION:</span>
-                <span className="text-emerald-400">{"AUTOMÁTICO < 0.2ms"}</span>
+                <span className="text-slate-500">{"não medido"}</span>
               </div>
             </div>
 
@@ -534,7 +631,9 @@ export function HftProfiler() {
                 <div className="space-y-1 text-[10px] font-mono">
                   <div className="flex justify-between items-center">
                     <span className="text-slate-500">Ciclo de Render/s:</span>
-                    <span className="text-slate-200 font-bold">{reactRendersPerSec} renders/s</span>
+                    <span className="text-slate-200 font-bold">
+                      {reactRendersPerSec !== null ? `${reactRendersPerSec} renders/s (medido neste navegador)` : "medindo..."}
+                    </span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-slate-500">Componentes Lentos:</span>

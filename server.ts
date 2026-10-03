@@ -91,6 +91,11 @@ import {
   assessEntryPrice,
   type EntryPriceAssessment,
 } from "./src/entryQuality.js";
+import {
+  assessRpcCoherence,
+  describeRpcCoherence,
+  type RpcCoherence,
+} from "./src/rpcProfile.js";
 import { PumpPortalFeed, type PumpPortalEvent } from "./src/pumpPortalFeed.js";
 import { fetchRugCheckEvidence, rugCheckRiskReasons } from "./src/rugCheck.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
@@ -267,6 +272,16 @@ app.get("/api/health", (_req, res) => {
      * `skipped > 0` no dexscreener, por exemplo, significa "faltou dado por cota".
      */
     budgets: budgets.resumo(),
+    /**
+     * O perfil de cota só vale o que o endpoint conectado suporta. Este bloco diz o que foi
+     * inferido do HOST (nunca da chave) e onde a declaração não bate com o conectado.
+     */
+    rpcCoherence: {
+      ...rpcCoherence,
+      note:
+        "coherent=false significa que HFT_RPC_PROFILE contradiz o endpoint conectado. Em modo " +
+        "PAPER/SHADOW o bot segue e registra; em LIVE ele recusa subir.",
+    },
     /**
      * Qualidade do preço de ENTRADA: o preço de entrada é o denominador de todo o PnL da posição.
      * `singleSource > 0` significa que o bot está entrando com preço não verificado (aceitável em
@@ -855,6 +870,48 @@ const LIQUIDITY_ALERT_INTERVAL_MS = 300_000;
 
 /** Perfil de RPC efetivo (para o operador saber QUAL teto está valendo). */
 const HFT_RPC_PROFILE_EFETIVO = (process.env.HFT_RPC_PROFILE || "public").toLowerCase();
+
+/**
+ * COERÊNCIA ENTRE PERFIL DE COTA E ENDPOINT DE RPC (`src/rpcProfile.ts`).
+ *
+ * O perfil e o endpoint são variáveis INDEPENDENTES — e nada impedia a combinação que já
+ * aconteceu de verdade neste projeto: perfil de um provedor (teto alto) com o endpoint público
+ * (teto baixo). O resultado é `429` exatamente na janela em que o bot mais precisa do RPC.
+ *
+ * Política: em PAPER/SHADOW, avisa alto e segue (testar com o endpoint público é legítimo);
+ * em LIVE, **recusa subir** quando há mismatch — a mesma doutrina do boot de modo
+ * ("subir meio-configurado é pior do que não subir"), porque o teto errado se manifesta como
+ * perda de sinal no meio da operação, não como erro visível.
+ */
+const rpcCoherence: RpcCoherence = assessRpcCoherence({
+  endpoint: process.env.RPC_ENDPOINT,
+  websocket: process.env.RPC_WEBSOCKET,
+  fallbacks: process.env.RPC_FALLBACKS,
+  declaredProfile: HFT_RPC_PROFILE_EFETIVO,
+});
+{
+  const linhas = describeRpcCoherence(rpcCoherence);
+  console.log(`[Boot][RPC] ${linhas[0]}`);
+  for (const aviso of linhas.slice(1)) {
+    console.warn(`[Boot][RPC] ${aviso}`);
+  }
+  if (!rpcCoherence.coherent) {
+    const mode = getRuntimeModeResolution().mode;
+    if (mode === "LIVE") {
+      console.error(
+        "[Boot][RPC][FATAL] Perfil de cota incoerente com o endpoint conectado em modo LIVE: " +
+          "o bot assinaria transações com um teto que o endpoint não suporta (ou deixaria de " +
+          "operar por teto baixo demais). Corrija HFT_RPC_PROFILE/RPC_ENDPOINT antes de subir."
+      );
+      process.exit(1);
+    }
+    console.warn(
+      `[Boot][RPC] modo ${mode}: seguindo com a incoerência REGISTRADA (visível em ` +
+        `GET /api/health → rpcCoherence). Em LIVE isto impediria o boot.`
+    );
+  }
+}
+
 if (process.env.HFT_BUDGET_DISABLED === "1") {
   console.warn(
     "[Cota] HFT_BUDGET_DISABLED=1 — orçamentos DESLIGADOS. Em plano gratuito isto troca uma " +
@@ -1240,7 +1297,12 @@ app.get("/api/system-truth", (_req, res) => {
   const mode = getRuntimeModeResolution();
 
   const simulatedEndpoints = [
-    { path: "/api/hft-telemetry", why: "latências, P50/P99, inclusion rate e bundles enviados são RNG" },
+    {
+      path: "/api/hft-telemetry",
+      why:
+        "latências, P50/P99, inclusion rate e bundles enviados são RNG (o payload traz `simulated: true`). " +
+        "EXCEÇÃO: `currentSlot` é MEDIDO (último slot visto nos nós de /api/rpc-nodes) ou `null`.",
+    },
     { path: "/metrics", why: "p95/p99, inclusion rate e bundles enviados são RNG (padrão Prometheus mantido por compatibilidade)" },
     { path: "/api/predictive-score", why: "score/confiança/recomendação são RNG" },
     { path: "/api/geyser-stream", why: "contadores de blobs/transações/slots são RNG" },
@@ -2627,7 +2689,19 @@ solana_hft_db_transaction_commits ${dbStats.transactionCount}
 });
 
 app.get("/api/hft-telemetry", (_req, res) => {
-  const currentSlot = 278913410 + Math.floor((Date.now() / 400) % 100000);
+  /**
+   * SLOT: MEDIDO ou null. Antes era `278913410 + (Date.now()/400) % 100000` — um número que
+   * "anda" com o relógio do processo e parece telemetria de rede, mas não é: nenhuma medição
+   * entra ali. Mesmo padrão já corrigido em /api/geyser-stream.
+   *
+   * O RESTANTE deste endpoint (latências de tick, P50/P99, inclusion rate) está declarado em
+   * `/api/system-truth → fabricatedEndpoints` como SIMULADO: é um painel de demonstração. O
+   * campo `simulated: true` abaixo existe para que nenhum consumidor o confunda com medição.
+   */
+  const measuredSlots = Object.values(rpcMetrics)
+    .map((m) => m.lastSlot)
+    .filter((v): v is number => typeof v === "number" && v > 0);
+  const currentSlot: number | null = measuredSlots.length > 0 ? Math.max(...measuredSlots) : null;
   
   const ticks = Array.from({ length: 12 }, (_, i) => {
     const time = new Date(Date.now() - (11 - i) * 2000).toLocaleTimeString().split(' ')[0];
@@ -2688,6 +2762,13 @@ app.get("/api/hft-telemetry", (_req, res) => {
   };
 
   res.json({
+    /** Este painel é DEMONSTRAÇÃO (ver fabricatedEndpoints em /api/system-truth). */
+    simulated: true,
+    simulatedNote:
+      "Latências, P50/P99, taxas de inclusão e contadores de bundles deste endpoint são " +
+      "SIMULADOS para demonstração do HUD. NÃO são medição de rede nem de execução. O único " +
+      "campo medido é currentSlot (último slot observado nos nós RPC configurados).",
+    
     currentSlot,
     ticks,
     p95: {
@@ -2817,38 +2898,77 @@ app.get("/api/geyser-stream", (_req, res) => {
   });
 });
 
-// 4.5 API: Jito Leader Schedule & Bundle Telemetry
+/**
+ * 4.5 API: Jito Leader Schedule — AGORA HONESTO (era RNG).
+ *
+ * AUDITORIA 2026-10-02 + revisão 2026-10-03: este endpoint devolvia líder, escalas, regiões,
+ * delays e "reputação do block engine" gerados por RNG — inclusive com nomes de terceiros
+ * ("Helius Validator #4") — e o painel exibia tudo como se fosse telemetria. Nada disso é
+ * observável deste processo:
+ *
+ *   - QUEM produz o próximo bloco exige a escala de líderes do epoch (`getSlotLeaders`),
+ *     cruzada com a identidade dos validadores Jito;
+ *   - latência por região exige medir RTT A PARTIR de cada região (este processo não está nelas);
+ *   - "reputação do block engine" não é dado público — a Jito não publica esse ranking.
+ *
+ * O que PODE ser dito com evidência: o último slot que os nós configurados responderam
+ * (mesma medição de `/api/rpc-nodes`) e a cotação de tip real (`/api/jito-tips`). O resto
+ * volta como `null` com o motivo, porque número inventado aqui vira decisão de tip/região
+ * baseada em ficção.
+ */
 app.get("/api/jito-leader-schedule", (_req, res) => {
-  const currentSlot = 278913410 + Math.floor((Date.now() / 400) % 100000);
-  const nextLeaderSlot = currentSlot + (5 - (Math.floor(Date.now() / 400) % 5));
-  
-  const regions = [
-    { name: "London (Equinix LD4)", delayMs: coLocationActive ? 0.15 : 8.5 },
-    { name: "Frankfurt (eu-central-1)", delayMs: coLocationActive ? 0.35 : 5.2 },
-    { name: "Tokyo (ap-northeast-1)", delayMs: coLocationActive ? 4.1 : 4.8 },
-    { name: "New York (us-east-4)", delayMs: coLocationActive ? 0.8 : 1.1 }
-  ];
+  const measuredSlots = Object.values(rpcMetrics)
+    .map((m) => m.lastSlot)
+    .filter((v): v is number => typeof v === "number" && v > 0);
+  const currentSlot: number | null = measuredSlots.length > 0 ? Math.max(...measuredSlots) : null;
 
-  const leaders = [
-    "Jito Validator (Tokyo-A)",
-    "Firedancer Testnet (NY-C)",
-    "Helius Validator #4",
-    "Triton BareMetal-12",
-    "Jito Validator (Frankfurt-B)"
-  ];
-
-  const currentLeader = leaders[Math.floor((Date.now() / 2000) % leaders.length)];
-
-  res.json({
+  return res.json({
+    measured: currentSlot !== null,
     currentSlot,
-    nextLeaderSlot,
-    currentLeader,
-    regions,
-    isJitoNextLeader: nextLeaderSlot % 3 === 0, // 33% chance
-    blockEngineReputation: coLocationActive ? "Direct Peer (100th percentile)" : "Elite (99.8th percentile)"
+    currentSlotSource:
+      currentSlot !== null
+        ? "medido: último slot observado nos nós RPC configurados (mesma fonte de /api/rpc-nodes)"
+        : "NÃO MEDIDO: nenhum nó RPC respondeu neste processo — null de propósito, nunca 0",
+    // Não observável deste processo: null com motivo, nunca RNG.
+    nextLeaderSlot: null,
+    currentLeader: null,
+    isJitoNextLeader: null,
+    blockEngineReputation: null,
+    regions: [],
+    notMeasured: {
+      nextLeaderSlot:
+        "exige a escala de líderes do epoch (getSlotLeaders) cruzada com a identidade dos " +
+        "validadores Jito — este processo não consulta a escala.",
+      currentLeader: "idem: a identidade do produtor do bloco atual não é consultada aqui.",
+      regions:
+        "latência por região (LD4/Tóquio/NY) só é mensurável A PARTIR de cada região; medir de " +
+        "outro lugar mede outra coisa.",
+      blockEngineReputation:
+        "não é dado público: a Jito não publica ranking de block engines — qualquer número " +
+        "aqui seria invenção.",
+    },
+    howToMeasure:
+      "A cotação de tip real está em GET /api/jito-tips (tip_floor da Jito, medido). Para a " +
+      "escala de líderes, consulte getSlotLeaders/getEpochSchedule no RPC e cruze com a lista " +
+      "pública de validadores Jito — este endpoint não faz isso hoje.",
+    coLocation: {
+      declaredByOperator: coLocationActive,
+      note:
+        "declaração do operador (estado salvo). Este processo NÃO consegue medir a posição " +
+        "física do host — declaração não é medição.",
+    },
   });
 });
 
+/**
+ * SIMULADOR DE BUNDLE — DECLARADO COMO TAL.
+ *
+ * Este endpoint NÃO envia bundle algum: ele simula mecânica de tip/landing para estudo do
+ * fluxo. Está listado em `/api/system-truth → fabricatedEndpoints`, e a resposta agora diz
+ * isso EM CAMPO (`simulated: true`, `onChainEffect: "nenhum"`) porque o painel consumia o
+ * resultado como se fosse landing real e chegava a registrar uma "transação" com preço e
+ * bloco inventados. Submissão real de bundle depende do S6 (não autorizado).
+ */
 app.post("/api/submit-bundle", (req, res) => {
   const { tokenName, tokenMint, solAmount, priorityTip, region } = req.body;
   
@@ -2872,13 +2992,19 @@ app.post("/api/submit-bundle", (req, res) => {
   const result = {
     bundleId,
     timestamp,
+    /** NENHUM bundle é enviado por este endpoint — ver comentário acima. */
+    simulated: true,
+    onChainEffect: "nenhum",
+    simulatedNote:
+      "Resultado SIMULADO: sem assinatura, sem envio, sem slot, sem fill. Nenhum valor desta " +
+      "resposta é evidência de landing on-chain (submissão real depende do S6, não autorizado).",
     landStatus,
-    landReason,
+    landReason: `[SIMULADO] ${landReason}`,
     tipSol: tipAmount,
     region: region || "Tokyo",
     gasSavedSol: landStatus === "Reverted" ? 0.05 + tipAmount : 0.0,
     bundleTrace: [
-      `[Jito BlockEngine] Handshake estabelecido com relayer no node de ${region || "Tokyo"}`,
+      `[Jito BlockEngine] Handshake estabelecido com relayer no node de ${region || "Tokyo"} [SIMULADO — nenhum handshake ocorreu]`,
       `[Atomic Packer] Empacotando transações: [Tx1: Buy Swap (${solAmount} SOL de ${tokenName || "TOKEN"})] + [Tx2: Validator Tip Transfer (${tipAmount} SOL)]`,
       `[Signature Service] Assinando pacote com chave AES-256 (Decriptação volátil: 0.12ms)`,
       landStatus === "Dropped"

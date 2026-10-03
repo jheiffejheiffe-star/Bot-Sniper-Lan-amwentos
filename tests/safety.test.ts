@@ -30,6 +30,19 @@ const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "hft-test-"));
 process.chdir(sandboxDir);
 
 let passed = 0;
+
+/**
+ * Remove comentários de linha e de bloco antes de procurar código proibido.
+ *
+ * Necessário porque os comentários deste projeto CITAM o código fabricado que foi removido
+ * ("antes: `278913410 + Date.now()/400`") — sem esta limpeza, a própria documentação da
+ * correção faria o teste de regressão falhar.
+ */
+function codigoSemComentarios(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+}
 const failures: string[] = [];
 
 async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
@@ -2098,6 +2111,34 @@ async function main(): Promise<void> {
       "evento decorativo precisa se declarar como tal no payload"
     );
     assert.ok(/feed: \{[\s\S]{0,120}real: realCount/.test(serverSrc), "a API precisa contar real vs simulado");
+
+    /**
+     * /api/hft-telemetry: o painel continua sendo DEMONSTRAÇÃO, mas o slot tem de vir de medição
+     * (último slot dos nós RPC) e o payload tem de se declarar simulado. Sem isso, um consumidor
+     * externo (ou o operador) lê "slot 278.xxx.xxx" como estado real da rede.
+     */
+    const telemetryBloco = codigoSemComentarios(
+      serverSrc.slice(
+        serverSrc.indexOf('app.get("/api/hft-telemetry"'),
+        serverSrc.indexOf('app.get("/api/geyser-stream"')
+      )
+    );
+    assert.ok(
+      /simulated: true/.test(telemetryBloco),
+      "/api/hft-telemetry precisa declarar `simulated: true` no payload"
+    );
+    assert.ok(
+      /Object\.values\(rpcMetrics\)[\s\S]{0,120}\.lastSlot/.test(telemetryBloco),
+      "currentSlot de /api/hft-telemetry precisa vir de medição (rpcMetrics[].lastSlot), não do relógio"
+    );
+    assert.ok(
+      /const currentSlot: number \| null = measuredSlots/.test(telemetryBloco),
+      "currentSlot precisa ser MEDIDO ou null — nunca um número inventado"
+    );
+    assert.ok(
+      !/Math\.random\(\)/.test(telemetryBloco.split("const currentSlot")[0]),
+      "o slot não pode ser decidido por RNG antes da medição"
+    );
     assert.ok(serverSrc.includes("unmeasured"), "o que não é medido precisa ser listado como não medido");
 
     // O painel não pode afirmar co-localização nem exibir números que a API não devolve.
@@ -3475,6 +3516,179 @@ async function main(): Promise<void> {
       !/sell|swap|sendTransaction/i.test(entrySrc),
       "o módulo de qualidade de entrada NÃO pode executar nada na rede"
     );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [23] COERÊNCIA DE PERFIL DE RPC + telemetria fabricada removida
+  // ---------------------------------------------------------------------------
+  console.log("\n[23] Coerência perfil↔endpoint e remoção de telemetria fabricada");
+
+  const HELIUS_URL = "https://mainnet.helius-rpc.com/?api-key=SEGREDO_NAO_PODE_VAZAR";
+  const QUICKNODE_URL = "https://divine-wildflower.solana-mainnet.quiknode.pro/abc123/";
+  const SYNDICA_URL = "https://solana-mainnet.api.syndica.io/api-key/xyz";
+
+  await test("hostFromUrl: devolve SÓ o host — a chave da URL nunca aparece", async () => {
+    const { hostFromUrl } = await import("../src/rpcProfile.js");
+    const host = hostFromUrl(HELIUS_URL);
+    assert.equal(host, "mainnet.helius-rpc.com");
+    assert.equal(host.includes("SEGREDO"), false, "a query com a chave não pode vazar");
+    assert.equal(hostFromUrl("não é url"), "");
+    assert.equal(hostFromUrl(undefined), "");
+    assert.equal(hostFromUrl(""), "");
+  });
+
+  await test("inferRpcProvider: reconhece os provedores e devolve unknown sem inventar", async () => {
+    const { inferRpcProvider } = await import("../src/rpcProfile.js");
+    assert.equal(inferRpcProvider(HELIUS_URL), "helius");
+    assert.equal(inferRpcProvider(QUICKNODE_URL), "quicknode");
+    assert.equal(inferRpcProvider("https://solana-mainnet.g.alchemy.com/v2/chave"), "alchemy");
+    assert.equal(inferRpcProvider(SYNDICA_URL), "syndica");
+    assert.equal(inferRpcProvider("https://api.mainnet-beta.solana.com"), "public");
+    assert.equal(inferRpcProvider("https://rpc.minhaempresa.com.br"), "unknown");
+  });
+
+  await test("coerência: endpoint Helius + perfil helius → COERENTE", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({
+      endpoint: HELIUS_URL,
+      websocket: "wss://mainnet.helius-rpc.com/?api-key=x",
+      declaredProfile: "helius",
+    });
+    assert.equal(r.coherent, true);
+    assert.equal(r.inferredFromEndpoint, "helius");
+    assert.deepEqual(r.issues, []);
+    // A URL completa NÃO pode aparecer nas observações: só o host.
+    assert.equal(JSON.stringify(r).includes("SEGREDO"), false);
+  });
+
+  await test("coerência: perfil dedicado com endpoint VAZIO (público) → INCOERENTE", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({ endpoint: "", declaredProfile: "syndica" });
+    assert.equal(r.coherent, false, "era exatamente a config da preview: teto 100 req/s no endpoint público");
+    assert.equal(r.usingPublicDefaultEndpoint, true);
+    assert.ok(r.issues.some((i) => i.code === "endpoint-publico-com-perfil-dedicado" && i.severity === "mismatch"));
+    assert.ok(r.issues.some((i) => i.code === "endpoint-ausente" && i.severity === "warn"));
+  });
+
+  await test("coerência: endpoint de um provedor com perfil de outro → INCOERENTE nos dois sentidos", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const a = assessRpcCoherence({ endpoint: QUICKNODE_URL, declaredProfile: "helius" });
+    assert.equal(a.coherent, false);
+    assert.ok(a.issues.some((i) => i.code === "perfil-nao-bate-endpoint"));
+
+    // Endpoint dedicado com perfil "public": não é incoerência (não estoura cota), mas é
+    // sub-utilização — o bot pula decisões que a cota suportaria.
+    const b = assessRpcCoherence({ endpoint: HELIUS_URL, declaredProfile: "public" });
+    assert.equal(b.coherent, true);
+    assert.ok(b.issues.some((i) => i.code === "endpoint-dedicado-com-perfil-publico" && i.severity === "warn"));
+  });
+
+  await test("coerência: perfil desconhecido → INCOERENTE (hoje ele cai silenciosamente em public)", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({ endpoint: HELIUS_URL, declaredProfile: "helios" });
+    assert.equal(r.declaredProfileKnown, false);
+    assert.equal(r.coherent, false);
+    assert.ok(r.issues.some((i) => i.code === "perfil-desconhecido" && i.severity === "mismatch"));
+  });
+
+  await test("coerência: provedor PRÓPRIO é aviso, não erro (não bloqueia quem sabe o que faz)", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({ endpoint: "https://rpc.minhaempresa.com.br", declaredProfile: "helius" });
+    assert.equal(r.coherent, true, "host desconhecido é NÃO VERIFICÁVEL, não incoerente");
+    assert.ok(r.issues.some((i) => i.code === "host-nao-verificavel" && i.severity === "warn"));
+  });
+
+  await test("coerência: WebSocket e fallbacks de outro provedor geram AVISO", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({
+      endpoint: HELIUS_URL,
+      websocket: "wss://divine.solana-mainnet.quiknode.pro/abc",
+      fallbacks: `${QUICKNODE_URL},https://solana-mainnet.g.alchemy.com/v2/k`,
+      declaredProfile: "helius",
+    });
+    assert.equal(r.coherent, true, "avisos não bloqueiam o boot");
+    assert.ok(r.issues.some((i) => i.code === "perfil-nao-bate-websocket"));
+    assert.ok(r.issues.some((i) => i.code === "fallback-misto"));
+    assert.equal(r.observations.length, 4, "endpoint + websocket + 2 fallbacks observados");
+    assert.equal(JSON.stringify(r).includes("abc123"), false, "nem o path do provedor deve vazar");
+  });
+
+  await test("coerência: descrição em texto não contém URL completa nem chave", async () => {
+    const { assessRpcCoherence, describeRpcCoherence } = await import("../src/rpcProfile.js");
+    const linhas = describeRpcCoherence(assessRpcCoherence({ endpoint: HELIUS_URL, declaredProfile: "syndica" }));
+    const texto = linhas.join("\n");
+    assert.equal(texto.includes("SEGREDO"), false);
+    assert.ok(/perfil declarado="syndica"/.test(texto));
+    assert.ok(linhas.length > 1, "achados precisam aparecer linha a linha");
+  });
+
+  await test("regressão: o boot RECUSA subir em LIVE quando o perfil é incoerente", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("assessRpcCoherence("), "o boot precisa avaliar a coerência");
+    assert.ok(serverSrc.includes("rpcCoherence:"), "a coerência precisa ser visível no /api/health");
+    const bloco = serverSrc.slice(
+      serverSrc.indexOf("const rpcCoherence: RpcCoherence"),
+      serverSrc.indexOf("if (process.env.HFT_BUDGET_DISABLED === \"1\")")
+    );
+    assert.ok(/if \(!rpcCoherence\.coherent\)/.test(bloco), "incoerência precisa ser tratada");
+    assert.ok(/mode === "LIVE"/.test(bloco), "em LIVE o trato é diferente do PAPER");
+    assert.ok(/process\.exit\(1\)/.test(bloco), "em LIVE, incoerência impede o boot");
+  });
+
+  await test("regressão: escala de líderes Jito não é mais inventada", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.equal(
+      /278913410 \+ Math\.floor/.test(serverSrc),
+      false,
+      "slot derivado do relógio do processo não pode voltar"
+    );
+    assert.equal(/Helius Validator #4/.test(serverSrc), false, "nome de validador inventado não pode voltar");
+    assert.equal(/Elite \(99\.8th percentile\)/.test(serverSrc), false, "reputação inventada não pode voltar");
+    const bloco = serverSrc.slice(
+      serverSrc.indexOf('app.get("/api/jito-leader-schedule"'),
+      serverSrc.indexOf('app.post("/api/submit-bundle"')
+    );
+    assert.ok(/nextLeaderSlot: null/.test(bloco), "não observável precisa ser null, não RNG");
+    assert.ok(/notMeasured:/.test(bloco), "o motivo de não medir precisa estar no payload");
+    assert.ok(/measured: currentSlot !== null/.test(bloco), "o único número permitido é o slot MEDIDO");
+    assert.ok(/coLocation:/.test(bloco) && /declaração não é medição/.test(bloco));
+  });
+
+  await test("regressão: painel MEV não registra trade a partir de bundle SIMULADO", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ui = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/components/MevExecutionEngine.tsx"), "utf8"));
+    assert.equal(
+      /Math\.random\(\) \* 50000/.test(ui),
+      false,
+      "outAmount aleatório na lista de operações não pode voltar"
+    );
+    assert.equal(/278913410 \+ Math\.floor/.test(ui), false, "bloco aleatório não pode voltar");
+    assert.ok(/data\.simulated === true/.test(ui) || /bundleResult\.simulated === true/.test(ui), "o simulador precisa ser rotulado");
+    assert.ok(/void onBundleSuccess;/.test(ui), "bundle simulado NÃO pode alimentar a lista de operações");
+    assert.ok(/percentilesSol/.test(ui), "o tip floor exibido precisa vir da resposta real da API");
+    assert.equal(/setTips\(data\.tips\)/.test(ui), false, "campo `tips` não existe na resposta — não pode voltar");
+  });
+
+  await test("regressão: painel de performance exibe MEDIÇÃO, não RNG, nos campos de infraestrutura", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ui = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/components/HftProfiler.tsx"), "utf8"));
+    assert.equal(/avgRttHelius/.test(ui), false, "RTT Helius fabricado não pode voltar");
+    assert.equal(/avgRttTriton/.test(ui), false);
+    assert.equal(/Jito Acceptance|jitoAcceptanceRate/.test(ui), false, "landing rate inventado não pode voltar");
+    assert.ok(/\/api\/rpc-nodes/.test(ui), "latência precisa vir da medição do backend");
+    assert.ok(/\/api\/positions/.test(ui), "exposição precisa vir das posições reais");
+    assert.ok(/não medido/.test(ui), "campo sem dado precisa dizer 'não medido'");
+  });
+
+  await test("regressão: painel de diagnósticos não exibe laudo decorativo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ui = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/components/DiagnosticsPanel.tsx"), "utf8"));
+    assert.equal(/PTPv2|drift física|<1ns/.test(ui), false, "PTP inventado não pode voltar");
+    assert.equal(/ShredStream co-localizado|Canal Elite ativo/.test(ui), false, "canal inventado não pode voltar");
+    assert.ok(/\/api\/rpc-nodes/.test(ui) && /\/api\/health/.test(ui) && /blockhash/.test(ui), "as checagens precisam ser reais");
+    assert.ok(/declaração não é medição|NÃO mede a posição física/.test(ui), "declaração e medição precisam estar separadas na tela");
   });
 
   console.log("\n=========================================");
