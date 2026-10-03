@@ -72,6 +72,7 @@ import {
   type HotPathStats,
 } from "./src/hotPath.js";
 import { buildBudgetRegistry, withBudget } from "./src/rateBudget.js";
+import { fetchBatchPrices, isQueryableMint, type BatchQuote, type BatchResult } from "./src/marketPriceFeed.js";
 import { PumpPortalFeed, type PumpPortalEvent } from "./src/pumpPortalFeed.js";
 import { fetchRugCheckEvidence, rugCheckRiskReasons } from "./src/rugCheck.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
@@ -248,6 +249,13 @@ app.get("/api/health", (_req, res) => {
      * `skipped > 0` no dexscreener, por exemplo, significa "faltou dado por cota".
      */
     budgets: budgets.resumo(),
+    marketBatch: {
+      ...marketBatchStats,
+      cohortsNote:
+        "1 requisição por provedor por ciclo cobre até 30 (DexScreener/GeckoTerminal) ou 50 " +
+        "(Jupiter Price) mints. Sem lote, o custo cresce 1 requisição POR POSIÇÃO por ciclo de 3s " +
+        "— acima de 300 req/min o DexScreener devolve 429 justamente durante a operação.",
+    },
     pumpPortal: pumpPortalRef?.getHealth() ?? null,
     detectionNote:
       "connected=true apenas indica que as subscrições de logs foram ACEITAS pelo RPC. " +
@@ -670,6 +678,22 @@ const budgets = buildBudgetRegistry({
   rpcProfile: process.env.HFT_RPC_PROFILE,
   disabled: process.env.HFT_BUDGET_DISABLED === "1",
 });
+/**
+ * Estatísticas do preço EM LOTE (ciclo do gerenciador de posições). Tudo medido:
+ * quantas requisições foram realmente feitas, quantos mints vieram com preço e quais fontes
+ * responderam. É o número que mostra o ganho de cota no plano gratuito.
+ */
+const marketBatchStats = {
+  cycles: 0,
+  mintsRequested: 0,
+  priced: 0,
+  liquidityKnown: 0,
+  requests: 0,
+  lastSources: [] as string[],
+  lastProblems: [] as string[],
+  disabled: process.env.HFT_MARKET_BATCH === "0",
+};
+
 /** Perfil de RPC efetivo (para o operador saber QUAL teto está valendo). */
 const HFT_RPC_PROFILE_EFETIVO = (process.env.HFT_RPC_PROFILE || "public").toLowerCase();
 if (process.env.HFT_BUDGET_DISABLED === "1") {
@@ -4658,6 +4682,50 @@ async function startAutonomousPositionManager(): Promise<void> {
         continue;
       }
 
+      /**
+       * PREÇOS EM LOTE — UMA passada por ciclo para TODAS as posições.
+       *
+       * Antes: 1 requisição DexScreener por posição e, se falhasse, 1 cotação Jupiter por posição
+       * — a cada 3 s. Dez posições passavam de 400 req/min, acima do teto público de 300/min:
+       * o bot garantia 429 no meio da operação. Agora: 1 requisição por provedor por ciclo
+       * (DexScreener cobre 30 tokens, Jupiter 50, GeckoTerminal 30).
+       *
+       * Prioridade de SAÍDA: gerenciar posição é reduzir risco — cota não bloqueia.
+       */
+      const batchPricesThisCycle: BatchResult = await (async () => {
+        if (marketBatchStats.disabled) {
+          return { quotes: new Map<string, BatchQuote>(), requests: 0, problems: ["desligado por HFT_MARKET_BATCH=0"], sourcesUsed: [] };
+        }
+        const mints = openPositions
+          .filter((p: any) => isQueryableMint(p.mint))
+          .filter((p: any) => Number.isFinite(Number(p.sizeSol)) && Number(p.sizeSol) > 0)
+          .filter((p: any) => {
+            const b = priceTelemetryBackoff.get(p.id);
+            return !b || Date.now() >= b.nextPollAt;
+          })
+          .map((p: any) => p.mint as string);
+
+        if (mints.length === 0) {
+          return { quotes: new Map<string, BatchQuote>(), requests: 0, problems: [], sourcesUsed: [] };
+        }
+
+        const result = await fetchBatchPrices(mints, {
+          dexscreenerBudget: budgets.dexscreener,
+          jupiterBudget: budgets.jupiter,
+          geckoterminalBudget: budgets.geckoterminal,
+          priority: "exit",
+        });
+
+        marketBatchStats.cycles++;
+        marketBatchStats.mintsRequested += mints.length;
+        marketBatchStats.requests += result.requests;
+        marketBatchStats.priced += [...result.quotes.values()].filter((q) => q.priceSol !== null).length;
+        marketBatchStats.liquidityKnown += [...result.quotes.values()].filter((q) => q.liquidityUsd !== null).length;
+        marketBatchStats.lastSources = result.sourcesUsed;
+        marketBatchStats.lastProblems = result.problems.slice(-5);
+        return result;
+      })();
+
       for (const pos of openPositions) {
         // POSIÇÕES PAPER: gestão de risco em modo sombra. Nenhuma assinatura, nenhuma
         // transação. Sem este desvio, o gerenciador tentaria VENDER tokens que nunca
@@ -4745,7 +4813,18 @@ async function startAutonomousPositionManager(): Promise<void> {
 
         const isMockMint = !pos.mint || pos.mint.includes("...") || pos.mint.length < 32;
 
-        if (!isMockMint) {
+        /**
+         * Attempt 0: preço vindo do LOTE deste ciclo (o caminho barato). Se o lote não trouxe
+         * preço para ESTE mint, cai nas tentativas por posição abaixo — que continuam existindo
+         * como fallback, com prioridade de saída e backoff.
+         */
+        const batchQuote = isMockMint ? undefined : batchPricesThisCycle.quotes.get(pos.mint);
+        if (batchQuote && batchQuote.priceSol !== null && batchQuote.priceSol > 0) {
+          currentPriceSol = batchQuote.priceSol;
+          priceSource = batchQuote.source;
+        }
+
+        if (!isMockMint && currentPriceSol === 0) {
           // Attempt 1: DexScreener (host vem da configuração, não hardcoded)
           try {
             /**

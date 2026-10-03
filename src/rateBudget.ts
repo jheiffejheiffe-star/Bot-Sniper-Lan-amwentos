@@ -232,6 +232,14 @@ export const MARKET_BUDGET_SPECS = {
     windowMs: 60_000,
     source: "Jupiter API Free: 60 req/min por ORGANIZAÇÃO (≈1 req/s) — criar mais chaves não aumenta o limite",
   } as BudgetSpec,
+  geckoterminal: {
+    name: "geckoterminal",
+    limit: 30,
+    windowMs: 60_000,
+    source:
+      "GeckoTerminal API pública (beta, grátis e sem chave): 30 chamadas/min — aceita até 30 " +
+      "endereços por chamada no endpoint token_price",
+  } as BudgetSpec,
   rugcheck: {
     name: "rugcheck",
     limit: 5,
@@ -258,6 +266,7 @@ export interface BudgetRegistry {
   rpc: RateBudget;
   dexscreener: RateBudget;
   jupiter: RateBudget;
+  geckoterminal: RateBudget;
   rugcheck: RateBudget;
   jitoTipFloor: RateBudget;
   jitoBlockEngine: RateBudget;
@@ -293,6 +302,7 @@ export function buildBudgetRegistry(options: BuildBudgetOptions = {}): BudgetReg
   const rpc = new RateBudget(effective(profile), now);
   const dexscreener = new RateBudget(effective(MARKET_BUDGET_SPECS.dexscreener), now);
   const jupiter = new RateBudget(effective(MARKET_BUDGET_SPECS.jupiter), now);
+  const geckoterminal = new RateBudget(effective(MARKET_BUDGET_SPECS.geckoterminal), now);
   const rugcheck = new RateBudget(effective(MARKET_BUDGET_SPECS.rugcheck), now);
   const jitoTipFloor = new RateBudget(effective(MARKET_BUDGET_SPECS.jitoTipFloor), now);
   const jitoBlockEngine = new RateBudget(effective(MARKET_BUDGET_SPECS.jitoBlockEngine), now);
@@ -301,13 +311,15 @@ export function buildBudgetRegistry(options: BuildBudgetOptions = {}): BudgetReg
     rpc,
     dexscreener,
     jupiter,
+    geckoterminal,
     rugcheck,
     jitoTipFloor,
     jitoBlockEngine,
-    snapshot: () => [rpc, dexscreener, jupiter, rugcheck, jitoTipFloor, jitoBlockEngine].map((b) => b.snapshot()),
+    snapshot: () =>
+      [rpc, dexscreener, jupiter, geckoterminal, rugcheck, jitoTipFloor, jitoBlockEngine].map((b) => b.snapshot()),
     resumo: () => {
       const out: Record<string, { used: number; limit: number; janelaMs: number; skipped: number; bypassed: number; perfil: string }> = {};
-      for (const b of [rpc, dexscreener, jupiter, rugcheck, jitoTipFloor, jitoBlockEngine]) {
+      for (const b of [rpc, dexscreener, jupiter, geckoterminal, rugcheck, jitoTipFloor, jitoBlockEngine]) {
         out[b.spec.name] = {
           used: b.used(),
           limit: b.spec.limit,

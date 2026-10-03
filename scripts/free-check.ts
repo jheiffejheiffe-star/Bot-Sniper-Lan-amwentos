@@ -40,6 +40,7 @@ import { RPC_ENDPOINT, RPC_WEBSOCKET } from "../src/realExecution.js";
 import { RPC_PROFILES, buildBudgetRegistry, type RpcProfileName } from "../src/rateBudget.js";
 import { PumpPortalFeed } from "../src/pumpPortalFeed.js";
 import { fetchRugCheckEvidence } from "../src/rugCheck.js";
+import { fetchBatchPrices } from "../src/marketPriceFeed.js";
 import { getRuntimeModeResolution } from "../src/runtimeMode.js";
 
 const args = process.argv.slice(2);
@@ -264,6 +265,28 @@ async function main(): Promise<void> {
           `${h.invalidMessages} inválidas, ${h.duplicatesDropped} duplicadas)`
       );
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[3c] Preço em LOTE (as três fontes gratuitas, 1 requisição cada)");
+  {
+    const mintsLote = [SOL_MINT, USDC_MINT];
+    const t0 = Date.now();
+    const lote = await fetchBatchPrices(mintsLote, { timeoutMs: 9_000 });
+    const totalMs = Date.now() - t0;
+    const comPreco = [...lote.quotes.values()].filter((q) => q.priceSol !== null).length;
+    record(
+      "Preço em lote (2 mints)",
+      comPreco > 0,
+      `${lote.requests} requisição(ões) em ${totalMs}ms para ${mintsLote.length} mints | ` +
+        `fontes=${lote.sourcesUsed.join("+") || "nenhuma"} | com preço=${comPreco}/${mintsLote.length}` +
+        (lote.problems.length > 0 ? ` | avisos: ${lote.problems.slice(0, 2).join(" / ")}` : "")
+    );
+    // Mostra o custo comparado: sem lote seria 1 requisição por mint.
+    console.log(
+      `   • Sem lote seriam ${mintsLote.length} requisições; em lote custou ${lote.requests}. ` +
+        `Com 30 posições: 30 → 1 (DexScreener/GeckoTerminal) ou 1 (Jupiter, até 50 ids).`
+    );
   }
 
   /* ------------------------------------------------------------------ */

@@ -1337,3 +1337,68 @@ npm start (produção)      → PAPER; /api/health.pumpPortal e /api/system-trut
 - **RugCheck não garante nada** e não substitui as checagens on-chain do próprio bot.
 - **Execução real (S6) continua não implementada** — e não é gratuita: taxa de rede e tip são
   custo real, e o `sendTransaction` do plano gratuito da Helius é limitado a 1/s.
+
+---
+
+## Adendo 11 (2026-10-03) — Preço de mercado EM LOTE: escalar o gratuito sem 429
+
+Segundo pedido de *"use as melhores ferramentas gratuitas"*. O que faltava não era outra fonte —
+era **usar as fontes que já existem do jeito certo**. Em plano gratuito o limitante é COTA, e o
+gerenciador de posições gastava uma requisição POR POSIÇÃO por ciclo de 3 s.
+
+### 1. A conta que estava prestes a quebrar
+
+Com 10 posições abertas: 10 requisições DexScreener + até 10 cotações Jupiter **a cada 3 s** =
+mais de **400 req/min** contra um teto público de **300 req/min**. O bug não estava no mercado:
+estava garantido na aritmética. O `429` apareceria exatamente quando houvesse posição para
+gerenciar — ou seja, sempre no momento em que o bot mais precisa do preço (stop/take/trailing).
+
+### 2. Contratos verificados (e por que estes três)
+
+| Fonte | Chamada em lote | Limite publicado |
+|---|---|---|
+| DexScreener | `/latest/dex/tokens/{mints}` — **até 30** endereços | 300 req/min |
+| Jupiter Price v3 | `/price/v3?ids={mints}` — **até 50 ids** | 60 req/min (mesmo balde da cotação no Free) |
+| GeckoTerminal | `/simple/networks/solana/token_price/{mints}` — até 30 | 30 req/min, grátis, sem chave |
+
+`src/marketPriceFeed.ts` (novo) faz **cascata**: DexScreener primeiro (é a única que dá
+`priceNative` — preço JÁ em SOL, sem conversão — e liquidez), Jupiter Price para quem ficou sem
+preço, GeckoTerminal como terceira opinião independente. O SOL (`So111...`) entra SEMPRE no lote
+das duas últimas para que a conversão USD→SOL venha da MESMA resposta: converter com um SOL/USD
+velho ou de fora seria fabricar preço — e preço errado dispara venda por engano.
+
+### 3. Fiação e ganho medido
+
+O laço de gestão passou a montar **uma** requisição por provedor por ciclo para todos os mints
+geríveis (exit priority: cota não bloqueia gerenciar risco) e a usar o preço individual apenas
+como fallback (Attempt 0 → Attempt 1/2 preservados). Com 30 posições: **30 → 1**. Contadores em
+`/api/health → marketBatch` (`requests` vs `mintsRequested` mostra na hora se o lote parou de
+funcionar). Chave de volta ao comportamento antigo: `HFT_MARKET_BATCH=0`.
+
+### 4. Bug real encontrado pela execução (de novo o mesmo padrão)
+
+`fetchBatchPrices` deixava a exceção de rede **propagar**: a primeira execução do `free:check`
+num sandbox sem egress morreu inteira (`falha inesperada: fetch failed`). Um helper de dado de
+mercado não pode derrubar o chamador. Agora toda falha de rede/timeout vira `problema` com
+motivo, a cascata continua para a próxima fonte e existe teste específico para o caso
+("rede cai (fetch LANÇA)"). É o terceiro bug desta natureza que só a execução real revelou.
+
+### 5. Estado verificado
+
+```
+npm run lint  → exit 0
+npm run test  → 132/132 (grupo [20]: 12 testes — parsing das 3 fontes, escolha do par de maior
+                liquidez, conversão USD→SOL com SOL do lote, "sem SOL NÃO converte", cascata com
+                parada antecipada, 3 fontes caídas, chunks 30/50/30, pulo por cota, rede que lança)
+npm run build → ok
+npm run free:check -- --quick → estágio [3c] mede o lote (aqui degrada com motivo, sem derrubar)
+GET /api/health → marketBatch + budgets com 7 provedores
+```
+
+### 6. O que continua NÃO verificado / aberto
+
+- **Divergência entre fontes não é detectada automaticamente.** O bot usa a primeira que responde
+  e registra qual foi; para operar capital real, comparar fontes (e alertar quando divergirem
+  acima de um limiar) passa a ser requisito. É o próximo passo natural de dados, não de latência.
+- Nenhuma das três fontes foi exercitada com rede real aqui (sandbox sem egress).
+- **Execução real (S6) continua pendente de autorização** e não é gratuita.

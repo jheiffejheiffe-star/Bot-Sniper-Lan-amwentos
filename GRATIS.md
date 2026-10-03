@@ -32,7 +32,9 @@ promete lucro e não vende facilidade: diz o que o dinheiro compra e o que o có
 | Detecção | **WSS `logsSubscribe`** (qualquer plano) | sem custo por notificação | Cobre Pump.fun + Raydium + Meteora | depende do WS do provedor |
 | Detecção | **PumpPortal `subscribeNewToken` / `subscribeMigration`** ✅ *implementado* | grátis, sem chave | Entrega o **mint direto** na criação → **sem `getTransaction`** neste caminho | é serviço de terceiro; uma conexão só (a doc avisa que múltiplas podem banir) |
 | Filtro de risco | **RugCheck `/report`** ✅ *implementado* | grátis | Segundo par de olhos: score, riscos, freeze authority, LP | ~5 req/min relatado; é evidência ADICIONAL (nunca aprova) |
-| Preço/liquidez | **DexScreener API pública** | 300 req/min (tokens/pairs/search) | Preço, liquidez, pares | 429 em rajada se não houver orçamento |
+| Preço/liquidez | **DexScreener API pública** | 300 req/min · **até 30 tokens por chamada** | Preço em SOL + liquidez | 429 em rajada se não houver orçamento |
+| Preço (reserva) | **Jupiter Price API v3** | 60 req/min (mesmo balde da cotação) · **até 50 ids** | Preço USD→SOL com o SOL do próprio lote | compartilha cota com as cotações |
+| Preço (3ª opinião) | **GeckoTerminal** | 30 req/min, grátis, sem chave · até 30 por chamada | Preço quando as duas acima caem | teto baixo: é reserva, não caminho principal |
 | Cotação de saída | **Jupiter Free** | **60 req/min por organização** (≈1/s) | Cotação de swap para preço/saída | criar mais chaves **não** aumenta |
 | Execução | **Jito block engine** | 1 req/s por IP por região; tip mínimo 1000 lamports | Bundles e status de landing | 429 ao consultar em loop |
 | Servidor | **Oracle Cloud Always Free** | Ampere A1: 4 OCPU / 24 GB / 10 TB saída | Máquina sempre ligada, perto do RPC | "out of host capacity" é comum; Frankfurt/Singapura provisionam melhor |
@@ -49,6 +51,12 @@ Os números acima estão codificados em `src/rateBudget.ts` (campo `source` de c
    (espera até 250–300 ms e depois **pula contando**) > **fundo** (medição de RTT cede na hora).
    `skipped > 0` significa "faltou dado por cota"; `bypassed > 0` significa "a saída passou acima
    da cota de propósito".
+2b. **Chamadas em LOTE (já implementado).** Orçamento limita o dano; lote multiplica a
+   capacidade. O gerenciador de posições monta **uma** requisição por provedor por ciclo, com
+   cascata DexScreener (30 tokens, preço em SOL + liquidez) → Jupiter Price v3 (50 ids) →
+   GeckoTerminal (30) e usa o preço individual só como fallback. Sem lote, 10 posições = ~400
+   req/min (acima do teto de 300 do DexScreener): o 429 estava garantido antes de qualquer
+   problema de mercado. Contadores em `/api/health → marketBatch`.
 3. **Servidor na mesma região do RPC — não a máquina de casa.** Bot rodando em casa (Brasil) até
    um RPC em us-east paga **~120–200 ms por chamada**; o mesmo código numa VPS gratuita da mesma
    região mede **uma ordem de grandeza menos**. É o maior ganho gratuito que existe, e o
@@ -136,6 +144,8 @@ lançamento visto pelas duas fontes vire **uma** decisão — a duplicata é con
 | `pumpPortal.eventsEmitted` | `/api/health` | prova de vida do feed gratuito (log de conexão **não** é prova) |
 | `pumpPortal.invalidMessages` | `/api/health` | contrato do provedor mudou: ajustar o parser com o dado observado, sem chutar |
 | `budgets.rugcheck.skipped` | `/api/system-truth` | evidência externa perdida por cota (o filtro local continua valendo) |
+| `marketBatch.requests` vs `mintsRequested` | `/api/health` | custo real de cota por ciclo: se `requests ≈ mintsRequested`, o lote não está sendo usado |
+| `marketBatch.lastSources` | `/api/health` | quem está fornecendo preço (cascata funcionando ou fonte principal caída) |
 | `replay` / PnL paper | `npm run replay` | expectativa da estratégia — **não** "ganhou em 3 trades" |
 
 ## 7. Quando pagar: a ordem que rende mais por real
@@ -164,6 +174,9 @@ lançamento visto pelas duas fontes vire **uma** decisão — a duplicata é con
   desatualizado — o lugar de corrigir é `src/rateBudget.ts`.
 - `npm run free:check` mede, mas **uma execução não é uma amostra**: rode em horários diferentes,
   com a rede que você vai usar de verdade.
+- **Preço pode vir de três fontes — e todas podem discordar.** O bot usa a primeira que responde
+  (DexScreener → Jupiter → GeckoTerminal) e registra qual foi; divergência entre fontes não é
+  detectada automaticamente. Para operar real, comparar fontes passa a ser requisito, não luxo.
 - **Dependência de terceiro é risco operacional.** O feed da PumpPortal não é oficial da
   pump.fun; se ele cair ou mudar o formato, o contador `invalidMessages` sobe e a detecção volta
   a depender do WSS. Nada de capital deve repousar na premissa de que ele estará sempre lá.
