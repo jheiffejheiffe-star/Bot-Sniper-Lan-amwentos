@@ -331,6 +331,43 @@ async function main(): Promise<void> {
   }
 
   /* ------------------------------------------------------------------ */
+  console.log("\n[3e] Preço de ENTRADA verificado (o denominador de todo o PnL)");
+  {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const { DEFAULT_DIVERGENCE_THRESHOLDS } = await import("../src/priceQuality.js");
+    const t0 = Date.now();
+    // DEXSCREENER_BASE_URL não é reexportada pelo módulo de lote; o lote já traz a URL default.
+    const lote = await fetchBatchPrices([USDC_MINT], { timeoutMs: 9_000, verifyMints: [USDC_MINT] });
+    const totalMs = Date.now() - t0;
+    const quote = lote.quotes.get(USDC_MINT) ?? null;
+    const comparacao = lote.verification.comparisons.find((c) => c.mint === USDC_MINT) ?? null;
+    const avaliacao = assessEntryPrice({
+      quote: quote ? { priceSol: quote.priceSol, source: quote.source } : null,
+      comparison: comparacao
+        ? {
+            referenceSource: comparacao.referenceSource,
+            candidateSource: comparacao.candidateSource,
+            bps: comparacao.bps,
+            severity: comparacao.severity,
+          }
+        : null,
+      thresholds: DEFAULT_DIVERGENCE_THRESHOLDS,
+    });
+    record(
+      "Preço de entrada verificado",
+      avaliacao.accepted && avaliacao.status === "verified",
+      `status=${avaliacao.status} | aceita=${avaliacao.accepted} | fontes=${avaliacao.sources.join(" + ") || "nenhuma"} | ` +
+        `divergência=${avaliacao.divergenceBps === null ? "n/d" : `${avaliacao.divergenceBps} bps`} | ${totalMs}ms | ` +
+        `${avaliacao.reason}`,
+      avaliacao.status !== "verified"
+    );
+    console.log(
+      "   • 'single_source' é dito em voz alta: significa entrada ACEITA porém MARCADA como não verificada.\n" +
+        "     'divergent' significa RECUSA de entrada — melhor perder o lançamento do que gravar PnL sobre preço errado."
+    );
+  }
+
+  /* ------------------------------------------------------------------ */
   console.log("\n[4] DexScreener (mercado)");
   const dex = await timedFetch(`${DEXSCREENER_BASE_URL}/tokens/${USDC_MINT}`);
   record(

@@ -1496,3 +1496,74 @@ npm run free:check -- --quick → 15 estágios; [3d] mede a segunda opinião e, 
 - `HFT_PRICE_DIVERGENCE=0` desliga o livro de amostras, mas a amostra rotativa continua comparando
   (custo de cota e alerta permanecem). Semântica a alinhar caso o operador queira um kill switch
   completo da verificação.
+
+---
+
+## Adendo 13 — Preço de ENTRADA verificado: o último ponto de fonte única (2026-10-03)
+
+Autorização: *"OK, faça seu melhor com as ferramentas disponíveis"* — mesmo escopo do Adendo 12:
+seguir no gratuito, sem gasto e sem entrada real. O Adendo 12 fechou a comparação entre fontes no
+**gerenciamento** de posições e listou, como pendência explícita, que o **preço de entrada** ainda
+vinha de uma fonte só. É essa pendência que este adendo fecha.
+
+### 1. Por que o preço de entrada merece tratamento separado
+
+No gerenciamento, um preço errado dispara uma decisão errada — ruim, mas reversível no ciclo
+seguinte. Na ENTRADA, o preço é o **denominador de todo o PnL da posição**: `pnlPercent`,
+stop-loss, take-profit, trailing e o ponto zero do replay são todos percentuais dele. Um erro de
+leitura na entrada não "piora um pouco" o resultado — ele **define** o resultado e contamina a
+estatística que serve para decidir se a estratégia tem edge. Antes, o `priceNative` de um par em
+USDC (o bug de ~200x do Adendo 12) podia entrar exatamente por aqui.
+
+### 2. `src/entryQuality.ts` (novo) — cinco classificações, nenhuma implícita
+
+| Status | Quando | Política |
+|---|---|---|
+| `verified` | duas fontes independentes concordam dentro do aviso | aceita |
+| `verified_with_warning` | concordam, diferença ≥ warn (5% padrão) | aceita e REGISTRA |
+| `single_source` | só uma fonte respondeu | aceita, mas MARCA a posição como não verificada |
+| `divergent` | diferença ≥ crítico (15% padrão) | **RECUSA** |
+| `unavailable` | nenhuma fonte com preço | **RECUSA** |
+
+Dois pontos de desenho que são decisão, não detalhe: (a) a severidade é **recalculada dos bps**
+com os mesmos limiares da gestão — um chamador que declare `severity: "ok"` com 50% de diferença
+não engana o módulo (há teste); (b) `single_source` **aceita** por padrão, porque "sem segunda
+opinião" é ausência de prova, não prova de erro — recusar ali faria o bot parar de coletar dados
+toda vez que uma API gratuita piscasse. Quem opera capital real vira
+`HFT_ENTRY_ALLOW_SINGLE_SOURCE=0` e passa a exigir duas fontes.
+
+### 3. Fiação
+
+`resolveEntryPrice()` substitui `fetchReferenceMarketPrice()` no caminho paper: usa o MESMO
+`fetchBatchPrices` do gerenciador (cascata gratuita + `verifyMints`) com a verificação em
+prioridade **`background`** — ela nunca fura cota — e o SOL como âncora de conversão na mesma
+requisição. A procedência vai para: a posição (`entryPriceVerification`), o registro de avaliação
+(`entryVerificationStatus`, `entryDivergenceBps` — para o replay conseguir estratificar depois), o
+log (com as duas fontes nomeadas) e os contadores `GET /api/health → entryQuality`.
+`BatchVerification` ganhou `comparisons`: **todas** as comparações, inclusive as que concordaram —
+sem isso, "sem divergência" e "sem verificação" seriam indistinguíveis justamente no caminho de
+entrada.
+
+### 4. Estado verificado
+
+```
+npm run lint  → exit 0
+npm run test  → 161/161 (grupo [22]: 10 testes novos — as cinco classificações, recusa em
+                divergência crítica, severidade recalculada dos bps, fonte única aceita e
+                recusada, verificação desligada, preço inválido/ausente, comparação "ok" vinda
+                do lote, e regressão estrutural: server sem fonte única + verificação em fundo)
+npm run build → ok
+npm run free:check → novo estágio [3e] mede a verificação de entrada no SEU ambiente e diz o
+                status (verified / single_source / divergent) com o motivo, sem derrubar o script
+```
+
+### 5. O que continua aberto (declarado)
+
+- **Nada foi exercitado com rede real neste sandbox** (sem egress): a validação é o
+  `npm run free:check` no VPS do operador.
+- **A recusa por divergência é a única política automática adicionada**; as demais (vetar por
+  `single_source`, reduzir posição em divergência de gestão) continuam decisão do operador.
+- O replay **ainda não estratifica** por `entryVerificationStatus`: o campo é gravado, a análise
+  comparativa ("as entradas verificadas tiveram expectativa diferente?") fica para quando houver
+  amostra — com menos de `MIN_TRADES_FOR_CONFIDENCE` operações isso seria ruído, não estatística.
+- Entrada real (S6) segue **não autorizada**, e o gate de entrada roda em paper — isso não muda.

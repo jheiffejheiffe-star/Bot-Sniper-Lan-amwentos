@@ -74,6 +74,14 @@ Os números acima estão codificados em `src/rateBudget.ts` (campo `source` de c
    real — dispararia take-profit logo após a compra. Agora o par cotado em SOL usa `priceNative`,
    par cotado em outra moeda converte por `priceUsd / USD-SOL do próprio payload` (o SOL vai na
    MESMA requisição, custo zero) e, sem âncora, o preço é declarado **ausente** em vez de errado.
+2e. **Preço de ENTRADA verificado (já implementado).** O preço de entrada é o denominador de
+   TODO o PnL da posição: stop, alvo, trailing e replay são percentuais dele. A entrada resolve o
+   preço pela cascata gratuita e pede **segunda opinião** a outra fonte: **duas concordando** →
+   entra (`verified` / `verified_with_warning`); **uma só** → entra marcada como `single_source`
+   (a posição carrega `entryPriceVerification`); **divergência acima do limiar crítico** →
+   **entrada recusada** (`divergent`), porque aí há evidência de erro grosseiro, não de mercado
+   em movimento. Contadores em `/api/health → entryQuality`. Para capital real,
+   `HFT_ENTRY_ALLOW_SINGLE_SOURCE=0` passa a exigir duas fontes independentes.
 3. **Servidor na mesma região do RPC — não a máquina de casa.** Bot rodando em casa (Brasil) até
    um RPC em us-east paga **~120–200 ms por chamada**; o mesmo código numa VPS gratuita da mesma
    região mede **uma ordem de grandeza menos**. É o maior ganho gratuito que existe, e o
@@ -165,6 +173,8 @@ lançamento visto pelas duas fontes vire **uma** decisão — a duplicata é con
 | `marketBatch.lastSources` | `/api/health` | quem está fornecendo preço (cascata funcionando ou fonte principal caída) |
 | `marketBatch.verifications` | `/api/health` | **0 com posições abertas = não houve segunda opinião**; >0 = houve comparação cruzada de verdade |
 | `marketBatch.divergences` / `lastDivergences` | `/api/health` | fontes discordando acima do limiar — investigar pool/decimal antes de confiar no preço |
+| `entryQuality.verified` vs `singleSource` | `/api/health` | proporção de entradas com preço NÃO verificado — se for alta, alguma fonte gratuita está falhando |
+| `entryQuality.divergent` | `/api/health` | entradas RECUSADAS por divergência entre fontes: evidência de erro grosseiro (investigar pool/decimal) |
 | `liquidityUsdPeak` / `liquidityAlert` (na posição) | banco/`/api/positions` | queda de liquidez = remoção de LP em andamento; alerta, não venda |
 | `replay` / PnL paper | `npm run replay` | expectativa da estratégia — **não** "ganhou em 3 trades" |
 

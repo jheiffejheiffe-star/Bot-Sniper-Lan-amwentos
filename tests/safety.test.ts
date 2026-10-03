@@ -3305,6 +3305,178 @@ async function main(): Promise<void> {
     );
   });
 
+  // ---------------------------------------------------------------------------
+  // [22] PREÇO DE ENTRADA — a verificação que impede abrir posição sobre número errado
+  // ---------------------------------------------------------------------------
+  console.log("\n[22] Qualidade do preço de entrada (duas fontes ou recusa)");
+
+  const EN_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+  const EN_LIMIARES = { warnPct: 0.05, criticalPct: 0.15, maxAgeMs: 45_000 };
+  const EN_QUOTE = { priceSol: 0.001, source: "dexscreener (lote)" };
+
+  await test("entrada: duas fontes concordando → verified e aceita", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "dexscreener (lote)", candidateSource: "jupiter price/v3 (lote)", bps: 12, severity: "ok" },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "verified");
+    assert.equal(r.accepted, true);
+    assert.equal(r.priceSol, 0.001);
+    assert.equal(r.divergenceBps, 12);
+    assert.deepEqual(r.sources, ["dexscreener (lote)", "jupiter price/v3 (lote)"]);
+    assert.ok(/concordam/.test(r.reason));
+  });
+
+  await test("entrada: diferença acima do aviso → verified_with_warning (aceita e REGISTRA)", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "A", candidateSource: "B", bps: 900, severity: "warn" },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "verified_with_warning");
+    assert.equal(r.accepted, true);
+    assert.equal(r.severity, "warn");
+    assert.ok(/aviso/.test(r.reason));
+  });
+
+  await test("entrada: divergência CRÍTICA → RECUSA abrir posição (evidência de erro grosseiro)", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "dexscreener (lote)", candidateSource: "geckoterminal (lote)", bps: 3000, severity: "critical" },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "divergent");
+    assert.equal(r.accepted, false, "entrada divergente NÃO pode abrir posição");
+    assert.equal(r.severity, "critical");
+    assert.ok(/envenena PnL/.test(r.reason), "o motivo precisa explicar a consequência, não só o número");
+    assert.ok(r.reason.includes("dexscreener") && r.reason.includes("geckoterminal"), "as duas fontes precisam ser nomeadas");
+  });
+
+  await test("entrada: severidade é recalculada dos bps com os MESMOS limiares da gestão", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    // Severidade declarada "ok" mas bps crítico: quem manda é o número, não o rótulo de quem chamou.
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "A", candidateSource: "B", bps: 5000, severity: "ok" },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "divergent");
+    assert.equal(r.accepted, false);
+  });
+
+  await test("entrada: fonte única → aceita mas MARCADA como não verificada", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({ quote: EN_QUOTE, comparison: null, thresholds: EN_LIMIARES });
+    assert.equal(r.status, "single_source");
+    assert.equal(r.accepted, true);
+    assert.equal(r.divergenceBps, null, "sem segunda opinião não existe número de divergência");
+    assert.ok(/NÃO verificado/.test(r.reason));
+    assert.ok(/não é prova de erro/.test(r.reason), "ausência de segunda opinião não pode virar acusação");
+  });
+
+  await test("entrada: com allowSingleSource=false, fonte única é RECUSADA", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({ quote: EN_QUOTE, comparison: null, thresholds: EN_LIMIARES, allowSingleSource: false });
+    assert.equal(r.status, "single_source");
+    assert.equal(r.accepted, false, "política de capital real pode exigir duas fontes");
+  });
+
+  await test("entrada: verificação desligada aceita o preço mas NÃO finge que verificou", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "A", candidateSource: "B", bps: 9000, severity: "critical" },
+      thresholds: EN_LIMIARES,
+      enabled: false,
+    });
+    assert.equal(r.status, "single_source");
+    assert.equal(r.accepted, true);
+    assert.equal(r.divergenceBps, null);
+    assert.ok(/DESLIGADA/.test(r.reason));
+  });
+
+  await test("entrada: sem preço nenhum → unavailable e recusa (nunca inventa)", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    for (const quote of [null, undefined, { priceSol: null, source: "A" }, { priceSol: 0, source: "A" } as any, { priceSol: Number.NaN, source: "A" } as any, { priceSol: -1, source: "A" } as any]) {
+      const r = assessEntryPrice({ quote, comparison: null, thresholds: EN_LIMIARES });
+      assert.equal(r.status, "unavailable");
+      assert.equal(r.accepted, false);
+      assert.equal(r.priceSol, null);
+    }
+  });
+
+  await test("entrada: lote entrega a comparação mesmo quando as fontes CONCORDAM", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const result = await fetchBatchPrices([EN_MINT], {
+      verifyMints: [EN_MINT],
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [
+                { chainId: "solana", baseToken: { address: EN_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 20_000 } },
+              ],
+            }),
+          } as any;
+        }
+        // 0.2 USD / 200 USD por SOL = 0.001 SOL → concordam exatamente.
+        return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [EN_MINT]: { usdPrice: 0.2 } }) } as any;
+      }) as any,
+    });
+    assert.equal(result.divergences.length, 0);
+    assert.equal(result.verification.comparisons.length, 1, "a comparação precisa existir mesmo com severidade ok");
+    const c = result.verification.comparisons[0];
+    assert.equal(c.mint, EN_MINT);
+    assert.equal(c.severity, "ok");
+    assert.equal(c.bps, 0);
+    assert.ok(/dexscreener/.test(c.referenceSource) && /jupiter/.test(c.candidateSource));
+
+    // E o caminho de entrada transforma isso em "verified".
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const quote = result.quotes.get(EN_MINT)!;
+    const r = assessEntryPrice({
+      quote: { priceSol: quote.priceSol, source: quote.source },
+      comparison: { referenceSource: c.referenceSource, candidateSource: c.candidateSource, bps: c.bps, severity: c.severity },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "verified");
+    assert.equal(r.accepted, true);
+  });
+
+  await test("regressão: o caminho de entrada usa preço VERIFICADO e recusa divergente", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.equal(
+      /fetchReferenceMarketPrice/.test(serverSrc),
+      false,
+      "a função de fonte única não pode voltar: o preço de entrada agora é resolvido com verificação"
+    );
+    assert.ok(serverSrc.includes("resolveEntryPrice("), "o caminho paper precisa resolver o preço de entrada");
+    assert.ok(serverSrc.includes("assessEntryPrice("), "a política de aceitação precisa vir do módulo dedicado");
+    assert.ok(
+      /if \(!entry\.assessment\.accepted\)/.test(serverSrc),
+      "entrada com preço divergente precisa ser RECUSADA, não apenas registrada"
+    );
+    assert.ok(serverSrc.includes("entryPriceVerification"), "a procedência do preço precisa ficar gravada na posição");
+    assert.ok(serverSrc.includes("entryVerificationStatus"), "o registro de avaliação precisa carregar o status");
+    assert.ok(serverSrc.includes("HFT_ENTRY_VERIFY") && serverSrc.includes("HFT_ENTRY_ALLOW_SINGLE_SOURCE"));
+    assert.ok(serverSrc.includes("entryQuality:"), "os contadores precisam ser visíveis no /api/health");
+    // A verificação de entrada NUNCA pode ter prioridade de saída (furaria cota).
+    const bloco = serverSrc.slice(serverSrc.indexOf("async function resolveEntryPrice"), serverSrc.indexOf("async function resolveEntryPrice") + 2000);
+    assert.ok(/verificationPriority: "background"/.test(bloco), "verificação de entrada é dado adicional: nunca fura cota");
+    const entrySrc = fs.readFileSync(path.join(repoRoot, "src/entryQuality.ts"), "utf8");
+    assert.ok(
+      !/sell|swap|sendTransaction/i.test(entrySrc),
+      "o módulo de qualidade de entrada NÃO pode executar nada na rede"
+    );
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

@@ -87,6 +87,10 @@ import {
   PriceSampleBook,
   type DivergenceFinding,
 } from "./src/priceQuality.js";
+import {
+  assessEntryPrice,
+  type EntryPriceAssessment,
+} from "./src/entryQuality.js";
 import { PumpPortalFeed, type PumpPortalEvent } from "./src/pumpPortalFeed.js";
 import { fetchRugCheckEvidence, rugCheckRiskReasons } from "./src/rugCheck.js";
 import { recorder, loadBacktestDataset, listDataFiles } from "./src/eventRecorder.js";
@@ -263,6 +267,21 @@ app.get("/api/health", (_req, res) => {
      * `skipped > 0` no dexscreener, por exemplo, significa "faltou dado por cota".
      */
     budgets: budgets.resumo(),
+    /**
+     * Qualidade do preço de ENTRADA: o preço de entrada é o denominador de todo o PnL da posição.
+     * `singleSource > 0` significa que o bot está entrando com preço não verificado (aceitável em
+     * teste, desde que contado); `divergent > 0` significa que ele RECUSOU entradas por evidência
+     * de erro grosseiro entre fontes.
+     */
+    entryQuality: {
+      ...entryQualityStats,
+      verifyEnabled: ENTRY_VERIFY_ENABLED,
+      allowSingleSource: ENTRY_ALLOW_SINGLE_SOURCE,
+      note:
+        "verified = duas fontes independentes concordam; verified_with_warning = concordam com aviso; " +
+        "single_source = só uma fonte respondeu (posição MARCADA como não verificada); divergent = " +
+        "evidência de erro grosseiro, entrada RECUSADA; unavailable = nenhum preço, entrada RECUSADA.",
+    },
     marketBatch: {
       ...marketBatchStats,
       cohortsNote:
@@ -802,6 +821,29 @@ const LIQUIDITY_THRESHOLDS = {
 
 /** Memória de cotações por token/fonte — a base da comparação entre fontes. */
 const priceSampleBook = PRICE_DIVERGENCE_ENABLED ? new PriceSampleBook({ maxPerMint: 4, maxMints: 500 }) : null;
+
+/**
+ * VERIFICAÇÃO DO PREÇO DE ENTRADA — o preço de entrada é o denominador de todo o PnL da posição
+ * (stop, alvo e replay são percentuais dele). Entrar com preço de fonte única é aceitável na
+ * fase de teste, desde que a posição fique MARCADA como não verificada; entrar com fontes
+ * discordando em 30% é diferente: é evidência de erro grosseiro, e isso RECUSA.
+ */
+const ENTRY_VERIFY_ENABLED = process.env.HFT_ENTRY_VERIFY !== "0";
+const ENTRY_ALLOW_SINGLE_SOURCE = process.env.HFT_ENTRY_ALLOW_SINGLE_SOURCE !== "0";
+
+/** Estatísticas de qualidade da entrada — quantas foram aceitas, marcadas e recusadas, e por quê. */
+const entryQualityStats = {
+  evaluated: 0,
+  verified: 0,
+  verifiedWithWarning: 0,
+  singleSource: 0,
+  divergent: 0,
+  unavailable: 0,
+  lastStatus: null as string | null,
+  lastSources: [] as string[],
+  lastDivergenceBps: null as number | null,
+  lastReason: null as string | null,
+};
 /** Rotação da amostra de verificação: em N ciclos, todo token com posição é conferido. */
 let priceVerifyCursor = 0;
 /** Throttle de alerta por token/posição — sem isto, uma divergência persistente viraria spam de log. */
@@ -4005,8 +4047,8 @@ Respond in a short, scannable JSON object with these keys:
   // 8. MODO PAPER (default): registra a decisão com preço REAL de mercado, sem
   //    assinar nada e sem tocar a rede.
   // ---------------------------------------------------------------------------
-  const reference = await fetchReferenceMarketPrice(tokenMint);
-  if (!reference) {
+  const entry = await resolveEntryPrice(tokenMint);
+  if (!entry || entry.assessment.priceSol === null) {
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
       level: "WARN",
@@ -4020,6 +4062,39 @@ Respond in a short, scannable JSON object with these keys:
     hotPathInFlight.release(tokenMint);
     return;
   }
+
+  /**
+   * PREÇO DIVERGENTE ENTRE FONTES: NÃO ABRIR. É diferente de "sem preço" — aqui existe número,
+   * mas duas fontes independentes discordam além do limiar, ou seja, há EVIDÊNCIA de erro
+   * grosseiro em uma delas. Abrir posição nesse estado grava no banco um resultado que não é o
+   * resultado da estratégia, e depois nenhum relatório consegue separar os dois.
+   */
+  if (!entry.assessment.accepted) {
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "WARN",
+      component: "RISK_ENGINE",
+      message:
+        `[Daemon PAPER] Entrada RECUSADA para ${tokenName.toUpperCase()} (${tokenMint.slice(0, 8)}...): ` +
+        `${entry.assessment.reason}. ` +
+        (entry.assessment.divergenceBps !== null
+          ? `Diferença medida: ${entry.assessment.divergenceBps} bps entre ${entry.assessment.sources.join(" e ")}. `
+          : "") +
+        `Contadores em /api/health → entryQuality.`,
+      correlationId,
+    });
+    reportSignalRejected("preço de entrada divergente entre fontes");
+    hotPathInFlight.release(tokenMint);
+    return;
+  }
+
+  /** Preço aceito: daqui para baixo `reference` é o preço VERIFICADO, com procedência registrada. */
+  const reference = {
+    priceSol: entry.assessment.priceSol as number,
+    source: entry.assessment.sources.join(" + ") || "fonte desconhecida",
+    liquidityUsd: entry.liquidityUsd,
+    fetchedAt: entry.fetchedAt,
+  };
 
   const paperSizeSol = tradingSolAmount;
   const paperTxId = `paper_${Date.now()}`;
@@ -4063,6 +4138,16 @@ Respond in a short, scannable JSON object with these keys:
     timeOpened: new Date().toLocaleTimeString(),
     mode: "paper",
     priceSource: reference.source,
+    // Procedência do preço de entrada: sobrevive ao restart e permite estratificar o replay.
+    entryPriceVerification: {
+      status: entry.assessment.status,
+      sources: entry.assessment.sources,
+      divergenceBps: entry.assessment.divergenceBps,
+      severity: entry.assessment.severity,
+      accepted: entry.assessment.accepted,
+      reason: entry.assessment.reason,
+      checkedAt: new Date().toISOString(),
+    },
   } as any);
 
   // Custo round-trip estimado: em paper mode é a métrica que mais importa, porque mostra
@@ -4075,7 +4160,10 @@ Respond in a short, scannable JSON object with these keys:
     component: "RISK_ENGINE",
     message:
       `[Daemon PAPER] Posição sombra registrada para ${tokenName.toUpperCase()} @ ${reference.priceSol.toPrecision(6)} SOL/token ` +
-      `(fonte: ${reference.source}, liquidez: $${Math.round(reference.liquidityUsd).toLocaleString()}). ` +
+      `(fonte: ${reference.source}, liquidez: $${Math.round(reference.liquidityUsd).toLocaleString()}, ` +
+      `verificação de preço: ${entry.assessment.status}` +
+      (entry.assessment.divergenceBps !== null ? ` — diferença entre fontes ${entry.assessment.divergenceBps} bps` : "") +
+      `). ` +
       `Break-even estimado round-trip: ${paperCosts.toFixed(2)}% — se o take-profit é 15%, ` +
       `isso representa ${(paperCosts / 15 * 100).toFixed(0)}% do alvo consumido em custos. NENHUMA transação foi enviada.`,
     correlationId,
@@ -4102,6 +4190,8 @@ Respond in a short, scannable JSON object with these keys:
     entryPriceSol: reference.priceSol,
     entryPriceSource: reference.source,
     estimatedCostsBps: Math.round(paperCosts * 100),
+    entryVerificationStatus: entry.assessment.status,
+    entryDivergenceBps: entry.assessment.divergenceBps,
     deepFilterMs: deepElapsedMs,
     deepFilterBudgetMs: DEEP_FILTER_BUDGET_MS,
   });
@@ -4129,50 +4219,91 @@ Respond in a short, scannable JSON object with these keys:
   hotPathInFlight.release(tokenMint);
 }
 
+/** Resultado da resolução do preço de entrada: o número e — igualmente importante — a PROCEDÊNCIA. */
+interface ResolvedEntryPrice {
+  assessment: EntryPriceAssessment;
+  liquidityUsd: number;
+  fetchedAt: number;
+}
+
 /**
- * Busca preço de referência REAL de mercado (SOL por token) via DexScreener,
- * escolhendo o par de MAIOR LIQUIDEZ — não o primeiro da lista.
+ * Resolve o preço de ENTRADA com verificação entre fontes independentes.
  *
- * Por que não o primeiro par: o código anterior usava `solPairs[0]`, que pode ser um
- * pool raso/desatualizado. Preço de um pool ilíquido não é preço de mercado; usar isso
- * como entry price produz PnL errado e stop-loss disparando por ruído de pool vazio.
+ * ## Por que não basta uma fonte (como era antes)
+ *
+ * O preço de entrada é o denominador de todo o PnL: stop, alvo, trailing e replay são
+ * percentuais dele. Uma leitura errada (pool raso, par em outra moeda — ver o bug de 200x no
+ * Adendo 12, decimal trocado) não "piora um pouco" o resultado: ela DEFINE o resultado e
+ * contamina toda a estatística. Uma fonte responde "li uma vez"; duas fontes independentes
+ * respondem "não é erro grosseiro".
+ *
+ * ## Como resolve (o MESMO caminho do gerenciador de posições)
+ *
+ * `fetchBatchPrices` com `verifyMints: [mint]`: a cascata acha o preço (DexScreener → Jupiter
+ * Price v3 → GeckoTerminal) e o SOL entra como âncora da conversão USD→SOL; em seguida uma
+ * segunda opinião é pedida à primeira fonte que ainda não respondeu. Custo: 1–2 requisições
+ * gratuitas, com a verificação em prioridade `background` (nunca fura cota).
+ *
+ * ## Política (explícita — ver `src/entryQuality.ts`)
+ *
+ * - duas fontes concordando → aceita (com ou sem aviso de diferença);
+ * - uma fonte só → aceita e MARCA a posição como não verificada (recusar aqui pararia o bot
+ *   quando uma API gratuita piscasse, e "sem segunda opinião" ≠ "prova de erro");
+ * - fontes divergindo além do limiar crítico → RECUSA a entrada;
+ * - nenhuma fonte com preço → RECUSA (nunca inventa).
  */
-async function fetchReferenceMarketPrice(
-  mint: string
-): Promise<{ priceSol: number; source: string; liquidityUsd: number; fetchedAt: number } | null> {
+async function resolveEntryPrice(mint: string): Promise<ResolvedEntryPrice | null> {
   if (!isValidPubkey(mint)) return null;
-  try {
-    // Mesma política de cota do filtro profundo (ver comentário lá): sem vaga em 250 ms, o
-    // preço de referência é declarado AUSENTE e a entrada paper é recusada — nunca inventada.
-    /**
-     * O wrapped SOL vai na MESMA requisição: ele é a âncora USD→SOL para o caso em que o par de
-     * maior liquidez do token é cotado em OUTRA moeda (ex.: USDC). Sem essa âncora, o
-     * `priceNative` do par estaria em USDC e seria lido como se fosse SOL — erro de ~200x que
-     * envenena PnL, stop e alvo. Custo: zero (mesmo endpoint, mesma chamada).
-     */
-    const dexCall = await withBudget(
-      budgets.dexscreener,
-      () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${mint},${SOL_MINT}`, { signal: AbortSignal.timeout(6000) }),
-      { maxWaitMs: 250 }
-    );
-    const res = dexCall.value;
-    if (!res || !res.ok) return null;
-    const data = await res.json();
 
-    // Regra única de conversão (mesma função usada pelo lote): par em SOL usa priceNative;
-    // par em outra moeda converte por USD/SOL do payload; sem âncora, devolve null.
-    const r = priceSolFromDexPairs(data?.pairs, mint);
-    if (r.priceSol === null || !(r.priceSol > 0)) return null;
+  const batch = await fetchBatchPrices([mint], {
+    dexscreenerBudget: budgets.dexscreener,
+    jupiterBudget: budgets.jupiter,
+    geckoterminalBudget: budgets.geckoterminal,
+    // Entrada NÃO é gestão de risco (não reduz exposição): espera até 250 ms por cota e, sem
+    // vaga, declara ausência em vez de furar o orçamento.
+    priority: "normal",
+    maxWaitMs: 250,
+    verificationPriority: "background",
+    sampleBook: priceSampleBook ?? undefined,
+    divergenceThresholds: PRICE_DIVERGENCE_THRESHOLDS,
+    verifyMints: ENTRY_VERIFY_ENABLED ? [mint] : [],
+  });
 
-    return {
-      priceSol: r.priceSol,
-      source: `DexScreener (${r.reason})`,
-      liquidityUsd: r.liquidityUsd ?? 0,
-      fetchedAt: Date.now(),
-    };
-  } catch {
-    return null;
-  }
+  const quote = batch.quotes.get(mint) ?? null;
+  const comparacao = batch.verification.comparisons.find((c) => c.mint === mint) ?? null;
+
+  const assessment = assessEntryPrice({
+    quote: quote ? { priceSol: quote.priceSol, source: quote.source } : null,
+    comparison: comparacao
+      ? {
+          referenceSource: comparacao.referenceSource,
+          candidateSource: comparacao.candidateSource,
+          bps: comparacao.bps,
+          severity: comparacao.severity,
+        }
+      : null,
+    thresholds: PRICE_DIVERGENCE_THRESHOLDS,
+    allowSingleSource: ENTRY_ALLOW_SINGLE_SOURCE,
+    enabled: ENTRY_VERIFY_ENABLED,
+  });
+
+  entryQualityStats.evaluated++;
+  if (assessment.status === "verified") entryQualityStats.verified++;
+  else if (assessment.status === "verified_with_warning") entryQualityStats.verifiedWithWarning++;
+  else if (assessment.status === "single_source") entryQualityStats.singleSource++;
+  else if (assessment.status === "divergent") entryQualityStats.divergent++;
+  else entryQualityStats.unavailable++;
+
+  entryQualityStats.lastStatus = assessment.status;
+  entryQualityStats.lastSources = assessment.sources;
+  entryQualityStats.lastDivergenceBps = assessment.divergenceBps;
+  entryQualityStats.lastReason = assessment.reason;
+
+  return {
+    assessment,
+    liquidityUsd: quote?.liquidityUsd ?? 0,
+    fetchedAt: quote?.fetchedAt ?? Date.now(),
+  };
 }
 
 /**
@@ -4826,7 +4957,7 @@ async function startAutonomousPositionManager(): Promise<void> {
           problems: problemas,
           sourcesUsed: [],
           divergences: [],
-          verification: { attempted: false, source: null, checked: 0, problems: [] },
+          verification: { attempted: false, source: null, checked: 0, comparisons: [], problems: [] },
         });
 
         if (marketBatchStats.disabled) {
@@ -5113,7 +5244,7 @@ async function startAutonomousPositionManager(): Promise<void> {
              */
             const dexCall = await withBudget(
               budgets.dexscreener,
-              // O SOL entra na mesma chamada como âncora USD→SOL (ver fetchReferenceMarketPrice).
+              // O SOL entra na mesma chamada como âncora USD→SOL (ver resolveEntryPrice).
               () => fetch(`${DEXSCREENER_BASE_URL}/tokens/${pos.mint},${SOL_MINT}`),
               { priority: "exit" }
             );

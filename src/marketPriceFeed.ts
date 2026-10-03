@@ -102,6 +102,18 @@ export interface BatchResult {
   verification: BatchVerification;
 }
 
+/** Uma comparação cruzada entre duas fontes para o mesmo token, mesmo quando ELAS CONCORDAM. */
+export interface VerificationComparison {
+  mint: string;
+  referenceSource: string;
+  candidateSource: string;
+  referencePriceSol: number;
+  candidatePriceSol: number;
+  pct: number;
+  bps: number;
+  severity: "ok" | "warn" | "critical";
+}
+
 export interface BatchVerification {
   /** A verificação cruzada foi tentada neste ciclo? */
   attempted: boolean;
@@ -109,6 +121,12 @@ export interface BatchVerification {
   source: string | null;
   /** Quantas comparações cruzadas foram efetivamente feitas. */
   checked: number;
+  /**
+   * TODAS as comparações feitas (inclusive as que concordaram). `divergences` guarda só as
+   * relevantes; esta lista é o que permite ao caminho de ENTRADA saber que houve verificação e
+   * QUAL foi o resultado — sem ela, "sem divergência" e "sem verificação" seriam indistinguíveis.
+   */
+  comparisons: VerificationComparison[];
   problems: string[];
 }
 
@@ -452,7 +470,7 @@ export async function fetchBatchPrices(mints: string[], options: BatchOptions = 
   const problems: string[] = [];
   const sourcesUsed: string[] = [];
   const divergences: DivergenceFinding[] = [];
-  const verification: BatchVerification = { attempted: false, source: null, checked: 0, problems: [] };
+  const verification: BatchVerification = { attempted: false, source: null, checked: 0, comparisons: [], problems: [] };
   const book = options.sampleBook;
   const thresholds = options.divergenceThresholds ?? DEFAULT_DIVERGENCE_THRESHOLDS;
   let requests = 0;
@@ -689,7 +707,19 @@ export async function fetchBatchPrices(mints: string[], options: BatchOptions = 
             thresholds,
             now()
           );
-          if (finding && finding.severity !== "ok") divergences.push(finding);
+          if (finding) {
+            verification.comparisons.push({
+              mint: target,
+              referenceSource: referencia.source,
+              candidateSource: candidato.source,
+              referencePriceSol: referencia.priceSol,
+              candidatePriceSol: candidato.priceSol,
+              pct: finding.pct,
+              bps: finding.bps,
+              severity: finding.severity,
+            });
+            if (finding.severity !== "ok") divergences.push(finding);
+          }
           if (book) book.record({ mint: target, source: candidato.source, priceSol: candidato.priceSol, at: candidato.fetchedAt });
         }
       }

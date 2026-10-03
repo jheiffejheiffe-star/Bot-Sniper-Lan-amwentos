@@ -75,6 +75,13 @@ export interface RecordedAssessment {
   /** Custos estimados naquele instante, para o replay recalcular break-even. */
   estimatedCostsBps: number | null;
   /**
+   * Qualidade do preço de ENTRADA: quantas fontes independentes o confirmaram e quanto elas
+   * concordavam. Sem este campo, o replay não consegue separar "resultado da estratégia" de
+   * "resultado de uma entrada com preço duvidoso" — e a estatística fica contaminada sem aviso.
+   */
+  entryVerificationStatus?: string | null;
+  entryDivergenceBps?: number | null;
+  /**
    * Tempo MEDIDO do filtro profundo e o orçamento vigente (S5). Sem estes dois números,
    * "por que não entrei nesse lançamento" vira arqueologia: o registro mostra se o sinal
    * foi reprovado por evidência ou por estouro de orçamento.

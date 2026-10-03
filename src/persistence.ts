@@ -81,6 +81,21 @@ export interface DBPosition {
     reference: { source: string; priceSol: number; ageMs: number };
     candidate: { source: string; priceSol: number };
   };
+  /**
+   * Como o preço de ENTRADA foi confirmado (`src/entryQuality.ts`): quantas fontes independentes
+   * responderam, quanto concordavam e se a entrada foi aceita com ou sem verificação. Fica na
+   * posição porque é o que permite ao replay separar o resultado da ESTRATÉGIA do resultado de
+   * uma entrada com preço duvidoso — e porque log em memória não sobrevive ao restart.
+   */
+  entryPriceVerification?: {
+    status: string;
+    sources: string[];
+    divergenceBps: number | null;
+    severity: string | null;
+    accepted: boolean;
+    reason: string;
+    checkedAt: string;
+  };
   /** Pico de liquidez observado pelo bot (base do alerta de queda). */
   liquidityUsdPeak?: number;
   /** Última liquidez observada (USD) — pode ser `null` quando a fonte não informa. */
