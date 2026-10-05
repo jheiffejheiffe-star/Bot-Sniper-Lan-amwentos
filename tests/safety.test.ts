@@ -5205,6 +5205,604 @@ async function main(): Promise<void> {
     assert.ok(/rawTransactionBase64/.test(src), "recebe bytes JÁ assinados — é o chamador que assina");
   });
 
+  // [28] S9 — RÓTULOS DE RESULTADO E VALIDAÇÃO ESTATÍSTICA
+  console.log("\n[28] Rótulos de resultado (S9): base de cálculo explícita e veredito honesto");
+
+  await test("rótulo: só PnL LÍQUIDO medido on-chain entra na validação (o resto é excluído com motivo)", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const base = { id: "t1", token: "TST", mint: "mint1", amount: "0.01 SOL", outAmount: "1000", block: 10, tipSol: 0.000001, route: "Jupiter Manual Jito Exit", time: new Date().toISOString(), latencyMs: 900 };
+
+    const win = ol.labelTrade({ ...base, status: "success", mode: "live", signature: "sig", pnlNetSol: 0.01, measuredOnChain: true } as any);
+    assert.equal(win.label, "win");
+    assert.equal(win.basis, "net_measured");
+    assert.equal(win.excluded, false);
+    assert.ok(win.pnlNetSol === 0.01 && win.pnlPercent === null, "o rótulo medido não carrega percentual de preço");
+
+    const loss = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: -0.004, measuredOnChain: true } as any);
+    assert.equal(loss.label, "loss");
+
+    // Empate com epsilon DECLARADO (1.000 lamports = 1 base fee).
+    const empate = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: 0.0000005, measuredOnChain: true } as any);
+    assert.equal(empate.label, "breakeven");
+    assert.equal(ol.BREAKEVEN_EPSILON_SOL, 0.000001);
+
+    /**
+     * O CASO QUE MAIS IMPORTA: PnL presente mas NÃO medido on-chain. Tratar como win seria usar um
+     * número que não passou pela cadeia — a definição de PnL fabricado.
+     */
+    const naoMedido = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: 0.01, measuredOnChain: false } as any);
+    assert.equal(naoMedido.basis, "none");
+    assert.equal(naoMedido.excluded, true);
+    assert.ok(naoMedido.pnlNetSol === null, "sem medição on-chain o valor NÃO é promovido a resultado");
+  });
+
+  await test("rótulo: paper, tentativa falhada e perna de entrada ficam FORA da conclusão", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const base = { id: "t", token: "T", mint: "m", amount: "a", outAmount: "b", block: 1, tipSol: 0, time: new Date().toISOString(), latencyMs: 100 };
+
+    const paper = ol.labelTrade({ ...base, status: "paper", mode: "paper", pnlNetSol: 0.5, measuredOnChain: true } as any);
+    assert.equal(paper.label, "win", "paper tem rótulo (é diagnóstico útil)");
+    assert.equal(paper.excluded, true, "…mas NUNCA entra na validação");
+    assert.equal(paper.exclusionReason, "modo paper");
+
+    const falhou = ol.labelTrade({ ...base, status: "failed", mode: "live", route: "Jito Exit falhou" } as any);
+    assert.equal(falhou.label, "failed_attempt");
+    assert.equal(falhou.excluded, true);
+    assert.ok(/CUSTO/.test(falhou.reason), "tentativa falhada é custo, não desfecho de estratégia");
+    assert.equal(falhou.attemptKind, "exit", "a rota de saída classifica a tentativa como saída");
+    assert.equal(falhou.attemptKindSource, "texto");
+
+    const recusada = ol.labelTrade({ ...base, status: "rejected", mode: "live", route: "Jupiter → Jito bundle [pump.fun curva]" } as any);
+    assert.equal(recusada.label, "failed_attempt");
+
+    // Perna de ENTRADA confirmada: não tem resultado por natureza.
+    const entrada = ol.labelTrade({ ...base, status: "confirmed", mode: "live", signature: "s", route: "Jupiter → Jito bundle [pump.fun curva]" } as any);
+    assert.equal(entrada.label, "entry_leg");
+    assert.equal(entrada.excluded, true);
+    assert.ok(/só existe quando a posição é fechada/.test(entrada.reason));
+
+    // PnL presente sem status conhecido e sem medição: NÃO MEDIDO, não "zero".
+    const semNumero = ol.labelTrade({ ...base, status: "unknown", mode: "live" } as any);
+    assert.equal(semNumero.label, "unresolved");
+    assert.ok(/NÃO MEDIDO/.test(semNumero.reason));
+  });
+
+  await test("rótulo de posição fechada: sempre estimado (preço sem custos) e sempre excluído", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const pos = {
+      id: "p1", token: "T", mint: "m", sizeSol: 0.01, entryPrice: 1, currentPrice: 1.2, pnlPercent: 20,
+      status: "closed", stopLossPercent: -20, takeProfitPercent: 20, trailingStopActive: false,
+      trailingStopOffsetPercent: 3, highestPrice: 1.2, timeOpened: new Date(Date.now() - 60_000).toISOString(),
+      timeClosed: new Date().toISOString(), mode: "live", slippageBps: 300,
+    };
+    const rotulo = ol.labelPosition(pos as any);
+    assert.equal(rotulo.label, "estimated_win");
+    assert.equal(rotulo.basis, "price_estimated");
+    assert.equal(rotulo.excluded, true);
+    assert.ok(rotulo.pnlNetSol === null, "posição não tem PnL líquido: o campo fica null em vez de reaproveitar o percentual");
+    assert.ok(rotulo.pnlPercent === 20);
+    assert.ok(/NÃO inclui tip, priority fee, base fee nem rent/.test(rotulo.reason));
+
+    const abertas = ol.labelAll([], [{ ...pos, status: "open" } as any]);
+    assert.equal(abertas.length, 0, "posição aberta não é desfecho: não se rotula resultado que ainda não existe");
+  });
+
+  await test("cobertura: relatório avisa quando a amostra válida é pequena demais ou enviesada", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const agora = new Date().toISOString();
+    const mk = (i: number, extra: any) => ({
+      id: `t${i}`, token: "T", mint: `m${i}`, amount: "a", outAmount: "b", block: i, tipSol: 0,
+      time: agora, latencyMs: 100, ...extra,
+    });
+
+    const rotulados = ol.labelAll(
+      [
+        mk(1, { status: "success", mode: "live", pnlNetSol: 0.01, measuredOnChain: true }),
+        mk(2, { status: "confirmed", mode: "live", route: "Jupiter → Jito bundle [entrada]" }),
+        mk(3, { status: "unknown", mode: "live" }),
+        mk(4, { status: "unknown", mode: "live" }),
+        mk(5, { status: "unknown", mode: "live" }),
+      ] as any,
+      []
+    );
+    const cov = ol.summarizeCoverage(rotulados);
+    assert.equal(cov.total, 5);
+    assert.equal(cov.measured, 1);
+    // 4 dos 5 registros não têm número: a perna de entrada e os três sem status conhecido.
+    assert.equal(cov.withoutNumber, 4);
+    assert.ok(Math.abs(cov.missingShare - 0.8) < 1e-9);
+    assert.ok(cov.notes.some((n) => /não têm número de resultado/.test(n)), JSON.stringify(cov.notes));
+
+    const vazio = ol.summarizeCoverage([]);
+    assert.ok(vazio.notes.some((n) => /sem dado não há conclusão/.test(n)));
+  });
+
+  await test("Wilson: o intervalo cobre os extremos sem sair de [0,1] (ao contrário da normal)", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    assert.equal(sv.wilsonInterval(0, 0), null);
+
+    const extremo = sv.wilsonInterval(0, 10)!;
+    assert.equal(extremo.low, 0);
+    assert.ok(extremo.high > 0 && extremo.high < 0.35, `high=${extremo.high}`);
+
+    const metade = sv.wilsonInterval(50, 100)!;
+    assert.ok(Math.abs(metade.low - 0.404) < 0.01, `low=${metade.low}`);
+    assert.ok(Math.abs(metade.high - 0.596) < 0.01, `high=${metade.high}`);
+
+    const vinte = sv.wilsonInterval(1, 5)!;
+    assert.ok(vinte.low >= 0 && vinte.high <= 1);
+  });
+
+  await test("intervalo da média: n=1 devolve null (não se inventa desvio-padrão de uma amostra)", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    const um = sv.meanConfidenceInterval([0.5]);
+    assert.equal(um.mean, 0.5);
+    assert.equal(um.standardError, null);
+    assert.equal(um.low, null, "sem n>=2, o intervalo é null — melhor 'não calculável' que número falso");
+
+    const simetrico = sv.meanConfidenceInterval([1, -1, 1, -1]);
+    assert.equal(simetrico.mean, 0);
+    assert.ok(simetrico.low !== null && simetrico.low < 0 && simetrico.high! > 0);
+
+    const positivo = sv.meanConfidenceInterval([0.001, 0.0012, 0.0009, 0.0011]);
+    assert.ok(positivo.low! > 0, "média positiva com dispersão pequena → IC acima de zero");
+  });
+
+  await test("veredito: os 5 estados, com o que mudaria a conclusão em cada um", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    const ol = await import("../src/outcomeLabels.js");
+    const ctx = (trades: any[]) =>
+      sv.buildValidationReport({
+        labeled: ol.labelAll(trades as any, []),
+        source: { name: "teste", tradesRead: trades.length, positionsRead: 0, truncated: false, note: "" },
+      });
+
+    const medido = (i: number, pnl: number, at: number) => ({
+      id: `t${i}`, token: "T", mint: `m${i}`, amount: "a", outAmount: "b", block: i, tipSol: 1e-6,
+      time: new Date(at).toISOString(), latencyMs: 500, status: "success", mode: "live",
+      pnlNetSol: pnl, measuredOnChain: true, feesSol: 5e-6,
+    });
+
+    // 1. sem dados
+    const vazio = ctx([]);
+    assert.equal(vazio.verdict.state, "sem_dados");
+    assert.ok(vazio.verdict.caveats.length > 0);
+
+    // 2. amostra insuficiente (5 operações medidas)
+    const poucas = ctx([1, 2, 3, 4, 5].map((i) => medido(i, 0.01, i * 1000)));
+    assert.equal(poucas.verdict.state, "amostra_insuficiente");
+    assert.ok(/piso declarado/.test(poucas.verdict.why), poucas.verdict.why);
+    assert.ok(/mais 95 operação/.test(poucas.verdict.whatWouldChangeIt), poucas.verdict.whatWouldChangeIt);
+    assert.equal(poucas.metrics.trades, 5, "as métricas continuam sendo reportadas — é o veredito que qualifica");
+
+    // 3. indistinguível de zero (100 operações alternando +0,001/-0,001)
+    const zero = ctx(Array.from({ length: 100 }, (_, i) => medido(i, i % 2 === 0 ? 0.001 : -0.001, i * 1000)));
+    assert.equal(zero.verdict.state, "indistinguivel_de_zero");
+    assert.ok(/CONTÉM o zero/.test(zero.verdict.why));
+
+    // 4. edge negativo (100 operações perdendo ~0,001 com dispersão pequena)
+    const negativo = ctx(Array.from({ length: 100 }, (_, i) => medido(i, -0.001 - (i % 5) * 0.00001, i * 1000)));
+    assert.equal(negativo.verdict.state, "edge_negativo");
+    assert.ok(/não aumentar tamanho de posição/.test(negativo.verdict.whatWouldChangeIt));
+
+    // 5. candidato a edge (100 operações ganhando ~0,001 com dispersão pequena)
+    const positivo = ctx(Array.from({ length: 100 }, (_, i) => medido(i, 0.001 + (i % 5) * 0.00001, i * 1000)));
+    assert.equal(positivo.verdict.state, "candidato_a_edge");
+    assert.ok(/candidato ≠ lucrativo/.test(positivo.verdict.caveats.join(" ")));
+    assert.ok(positivo.winRateInterval !== null && positivo.winRateInterval.low > 0.5);
+  });
+
+  await test("relatório: métricas saem do conjunto MEDIDO, com cobertura e custos declarados", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    const ol = await import("../src/outcomeLabels.js");
+    const agora = Date.now();
+    const trades: any[] = [
+      { id: "a", token: "T", mint: "m1", amount: "a", outAmount: "b", block: 1, tipSol: 2e-6, time: new Date(agora - 3000).toISOString(), latencyMs: 500, status: "success", mode: "live", pnlNetSol: 0.002, measuredOnChain: true, feesSol: 5e-6 },
+      { id: "b", token: "T", mint: "m2", amount: "a", outAmount: "b", block: 2, tipSol: 2e-6, time: new Date(agora - 2000).toISOString(), latencyMs: 500, status: "success", mode: "live", pnlNetSol: -0.001, measuredOnChain: true, feesSol: 7e-6 },
+      { id: "c", token: "T", mint: "m3", amount: "a", outAmount: "b", block: 3, tipSol: 2e-6, time: new Date(agora - 1000).toISOString(), latencyMs: 500, status: "confirmed", mode: "live", route: "entrada" },
+    ];
+    const rep = sv.buildValidationReport({
+      labeled: ol.labelAll(trades, [{ id: "p", token: "T", mint: "m1", sizeSol: 0.01, entryPrice: 1, currentPrice: 1.5, pnlPercent: 50, status: "closed", stopLossPercent: -20, takeProfitPercent: 20, trailingStopActive: false, trailingStopOffsetPercent: 3, highestPrice: 1.5, timeOpened: new Date(agora - 5000).toISOString(), timeClosed: new Date(agora).toISOString(), mode: "live" } as any]),
+      source: { name: "teste", tradesRead: trades.length, positionsRead: 1, truncated: false, note: "fonte de teste" },
+    });
+
+    assert.equal(rep.metrics.trades, 2, "só os 2 desfechos MEDIDOS entram nas métricas");
+    assert.ok(Math.abs(rep.metrics.expectancySol - 0.0005) < 1e-12, `expectancy=${rep.metrics.expectancySol}`);
+    assert.equal(rep.metrics.wins, 1);
+    assert.equal(rep.metrics.losses, 1);
+    assert.equal(rep.coverage.measured, 2);
+    assert.equal(rep.coverage.estimated, 1, "a posição fechada entra como ESTIMADO (diagnóstico)");
+    assert.ok(rep.measuredCosts.feesSol !== null && Math.abs(rep.measuredCosts.feesSol - 12e-6) < 1e-15);
+    assert.ok(rep.measuredCosts.tipsSol !== null && Math.abs(rep.measuredCosts.tipsSol - 4e-6) < 1e-15);
+    assert.ok(rep.exclusionsByReason.some((e) => /perna de entrada/.test(e.reason)));
+    assert.equal(rep.source.name, "teste", "a fonte precisa ser declarada no relatório");
+    assert.equal(rep.byLabel.entry_leg, 1);
+  });
+
+  await test("S9: fiação no servidor — o endpoint declara a fonte e o truncamento", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/app\.get\("\/api\/performance"/.test(src), "o relatório precisa de um endpoint");
+    assert.ok(/labelAll\(/.test(src) && /buildValidationReport\(/.test(src));
+    assert.ok(/histórico truncado por construção/.test(src), "o teto de 50 trades do JSON precisa ser declarado ao operador");
+    assert.ok(/fonte: banco/.test(src), "quando lê do banco, a fonte precisa ser declarada");
+  });
+
+  // [29] S10 — POSTGRES: schema, voo único ENTRE PROCESSOS e guarda fail-closed
+  console.log("\n[29] Postgres (S10): claim atômico entre processos, espelho de escrita e fail-closed");
+
+  /**
+   * POSTGRES DE VERDADE, EM MEMÓRIA. `@electric-sql/pglite` é PostgreSQL compilado para WASM
+   * (v18): o SQL, o índice único parcial e as expressões de intervalo são os do Postgres real. Um
+   * dublê em JavaScript não pegaria a diferença entre "meu código acha que o índice funciona" e
+   * "o banco garante o índice" — e é justamente essa diferença que sustenta o voo único.
+   */
+  const abrirPglite = async (): Promise<{ db: any; client: any }> => {
+    const { PGlite } = await import("@electric-sql/pglite");
+    const db = new PGlite();
+    const client = {
+      query: async (sql: string, params?: unknown[]) => {
+        const res = await db.query(sql, params as any[]);
+        return { rows: res.rows, rowCount: res.affectedRows ?? null };
+      },
+      end: async () => {
+        await db.close();
+      },
+    };
+    return { db, client };
+  };
+
+  const policyPostgres = async (over: Record<string, string> = {}) => {
+    const st = await import("../src/storage/postgresStorage.js");
+    return st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "postgres://x", ...over } as any);
+  };
+
+  await test("política de armazenamento: default JSON, Postgres exige DATABASE_URL, AUSÊNCIA ≠ ZERO", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+
+    const padrao = st.resolveStoragePolicy({} as any);
+    assert.equal(padrao.mode, "json", "o default preserva o comportamento anterior");
+    assert.equal(padrao.claimTtlMs, 300_000);
+    assert.deepEqual(padrao.blockers, []);
+
+    const semUrl = st.resolveStoragePolicy({ HFT_STORAGE: "postgres" } as any);
+    assert.equal(semUrl.mode, "json");
+    assert.ok(semUrl.blockers.some((b) => /exige DATABASE_URL/.test(b)));
+
+    // URL definida mas modo JSON: o banco NÃO está sendo usado — e isso precisa ser dito, não inferido.
+    const urlSobrando = st.resolveStoragePolicy({ DATABASE_URL: "postgres://x" } as any);
+    assert.equal(urlSobrando.mode, "json");
+    assert.ok(urlSobrando.blockers.some((b) => /NÃO está sendo usado/.test(b)));
+
+    const modoErrado = st.resolveStoragePolicy({ HFT_STORAGE: "mysql" } as any);
+    assert.ok(modoErrado.blockers.some((b) => /não é um modo conhecido/.test(b)), "não adivinhar modo desconhecido");
+
+    // Ausência de variável cai no default; valor fora do intervalo é limitado (não vira 0).
+    const semTtl = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u" } as any);
+    assert.equal(semTtl.claimTtlMs, 300_000);
+    const ttlMinimo = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u", HFT_STORAGE_CLAIM_TTL_MS: "10" } as any);
+    assert.equal(ttlMinimo.claimTtlMs, 5_000, "piso de 5s: TTL curto demais faria dois processos entrarem em sequência");
+    const hist = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u", HFT_STORAGE_HISTORY_LIMIT: "999999999" } as any);
+    assert.equal(hist.historyLimit, 1_000_000, "teto: carregar histórico ilimitado na memória é DoS de si mesmo");
+
+    const logInvalido = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u", HFT_STORAGE_MIRROR_LOGS: "tudo" } as any);
+    assert.equal(logInvalido.mirrorLogs, "critical", "valor inválido cai no default declarado");
+  });
+
+  await test("guarda fail-closed: Postgres pedido e fora do ar BLOQUEIA a assinatura", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const json = st.resolveStoragePolicy({} as any);
+    const pg = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u" } as any);
+
+    // Modo JSON: permite, declarando o limite (voo único por processo).
+    const emJson = st.decideEntryStorageGuard(json, { configured: false, connected: false, migrated: false, schemaVersion: null, lastError: null });
+    assert.equal(emJson.allowSign, true);
+    assert.ok(/POR PROCESSO|por processo/.test(emJson.detail!));
+
+    const fora = st.decideEntryStorageGuard(pg, { configured: true, connected: false, migrated: false, schemaVersion: null, lastError: "ECONNREFUSED" });
+    assert.equal(fora.allowSign, false);
+    assert.equal(fora.code, "STORAGE_UNAVAILABLE");
+    assert.ok(/não está respondendo/.test(fora.detail!));
+
+    const semMigrar = st.decideEntryStorageGuard(pg, { configured: true, connected: true, migrated: false, schemaVersion: 0, lastError: null });
+    assert.equal(semMigrar.allowSign, false);
+    assert.equal(semMigrar.code, "STORAGE_SCHEMA_OUTDATED");
+    assert.ok(/storage:migrate/.test(semMigrar.detail!), "a recusa precisa dizer o comando que resolve");
+
+    const ok = st.decideEntryStorageGuard(pg, { configured: true, connected: true, migrated: true, schemaVersion: 1, lastError: null });
+    assert.equal(ok.allowSign, true);
+  });
+
+  await test("migração: aplica a v1 e é IDEMPOTENTE (rodar de novo não aplica nada)", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const storage = new st.PostgresStorage(client, await policyPostgres(), "proc#1");
+
+    const primeira = await storage.migrate();
+    assert.deepEqual(primeira.applied, [1]);
+    assert.equal(primeira.alreadyAt, null);
+
+    const segunda = await storage.migrate();
+    assert.deepEqual(segunda.applied, [], "a segunda execução não pode reaplicar a mesma migração");
+    assert.equal(segunda.alreadyAt, 1);
+
+    const health = await storage.initialize();
+    assert.equal(health.connected, true);
+    assert.equal(health.migrated, true, `schema v${health.schemaVersion}`);
+
+    // As 5 tabelas do S10 existem de fato.
+    const tabelas = await client.query(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+    );
+    const nomes = tabelas.rows.map((r: any) => r.table_name);
+    for (const esperada of ["schema_migrations", "positions", "trades", "intents", "entry_claims", "decision_logs"]) {
+      assert.ok(nomes.includes(esperada), `${esperada} ausente (tabelas: ${nomes.join(", ")})`);
+    }
+    await storage.close();
+  });
+
+  await test("banco NOVO: conectado mas sem schema (não é o mesmo que banco fora do ar)", async () => {
+    /**
+     * A diferença importa para o boot: `connected=false` → aborta sem tentar migrar (fail-closed);
+     * `connected=true, migrated=false` → tenta migrar e sobe. Se um banco limpo fosse reportado
+     * como "sem conexão", o operador nunca conseguiria apontar o bot para uma base nova.
+     */
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const storage = new st.PostgresStorage(client, await policyPostgres(), "host#novo");
+
+    const health = await storage.initialize();
+    assert.equal(health.connected, true, "o banco respondeu: está conectado");
+    assert.equal(health.migrated, false, "…mas o schema ainda não existe");
+    assert.equal(health.schemaVersion, null);
+    assert.equal(health.lastError, null, "banco limpo não é erro de conexão");
+
+    // Depois de migrar, o mesmo objeto passa a reportar pronto — sem reconectar.
+    await storage.migrate();
+    const depois = await storage.initialize();
+    assert.equal(depois.migrated, true);
+    assert.equal(depois.schemaVersion, 1);
+    await storage.close();
+  });
+
+  await test("voo único ENTRE PROCESSOS: dois processos, o mesmo mint, exatamente UM ganha", async () => {
+    /**
+     * O TESTE CENTRAL DO S10. Dois adaptadores distintos sobre o MESMO banco representam duas
+     * instâncias do bot na mesma carteira — o cenário que o guarda em memória (`InFlightMints`) não
+     * cobre, porque memória de um processo não é visível para o outro.
+     */
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const policy = await policyPostgres();
+    const processoA = new st.PostgresStorage(client, policy, "hostA#100");
+    const processoB = new st.PostgresStorage(client, policy, "hostB#200");
+    await processoA.migrate();
+
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const a = await processoA.claimEntry({ mint, side: "entry", payload: { sizeSol: 0.01 } });
+    const b = await processoB.claimEntry({ mint, side: "entry", payload: { sizeSol: 0.01 } });
+
+    assert.equal(a.acquired, true);
+    assert.equal(a.reason, "novo");
+    assert.equal(b.acquired, false, "o segundo processo NÃO pode entrar no mesmo mint");
+    assert.equal(b.reason, "ocupado");
+    assert.equal(b.heldBy, "hostA#100", "o perdedor recebe QUEM detém o claim — não um erro genérico");
+    assert.ok(b.expiresAt !== null, "…e até quando o mint está reservado");
+    assert.ok(/hostA#100/.test(b.detail));
+
+    // Mints diferentes não competem: o voo único é por (mint, side).
+    const outroMint = await processoB.claimEntry({ mint: "OutroMint1111111111111111111111111111111111", side: "entry" });
+    assert.equal(outroMint.acquired, true);
+
+    // LIBERAÇÃO SÓ PELO DONO: com o claimId do A, o B consegue liberar? Não — o id é a credencial.
+    const liberadoPeloB = await processoB.releaseEntryClaim(a.claimId!);
+    assert.equal(liberadoPeloB, true, "o UPDATE é por claim_id: quem tem o id libera (é a mesma linha)");
+
+    await processoA.close();
+  });
+
+  await test("claim expirado: retomada atômica; o antigo dono NÃO consegue mais liberar", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const policy = await policyPostgres();
+    const processoA = new st.PostgresStorage(client, policy, "hostA#100");
+    const processoB = new st.PostgresStorage(client, policy, "hostB#200");
+    await processoA.migrate();
+
+    const mint = "ExpiradoMint11111111111111111111111111111111";
+    // TTL de 1s (mínimo do adaptador): esperamos ele vencer para simular um processo que morreu.
+    const a = await processoA.claimEntry({ mint, side: "entry", ttlMs: 1_000 });
+    assert.equal(a.acquired, true);
+
+    // Ainda dentro do TTL: B não consegue.
+    const cedo = await processoB.claimEntry({ mint, side: "entry" });
+    assert.equal(cedo.acquired, false);
+    assert.equal(cedo.reason, "ocupado");
+
+    await new Promise((r) => setTimeout(r, 1_100));
+
+    const tarde = await processoB.claimEntry({ mint, side: "entry" });
+    assert.equal(tarde.acquired, true, "claim vencido precisa ser retomável — senão um crash bloqueia o mint para sempre");
+    assert.equal(tarde.reason, "retomado-expirado");
+    assert.ok(/não liberou/.test(tarde.detail));
+
+    /**
+     * SEGURANÇA: o dono ANTIGO (A) não pode liberar o claim do B. O claim_id mudou na retomada, e a
+     * liberação é por claim_id — se fosse por (mint, side), A liberaria o claim de B e DOIS
+     * processos poderiam entrar no mesmo mint.
+     */
+    const liberacaoDoAntigo = await processoA.releaseEntryClaim(a.claimId!);
+    assert.equal(liberacaoDoAntigo, false, "liberação pelo id antigo NÃO pode afetar o claim novo");
+
+    const aindaAtivo = await processoB.listActiveClaims();
+    assert.equal(aindaAtivo.filter((c) => c.mint === mint).length, 1, "o claim novo segue ativo após a tentativa do dono antigo");
+
+    const liberacaoCerta = await processoB.releaseEntryClaim(tarde.claimId!);
+    assert.equal(liberacaoCerta, true);
+    assert.equal((await processoB.listActiveClaims()).filter((c) => c.mint === mint).length, 0);
+
+    // Depois de liberar, o mint volta a estar disponível para QUALQUER processo.
+    const depois = await processoA.claimEntry({ mint, side: "entry" });
+    assert.equal(depois.acquired, true);
+    assert.equal(depois.reason, "novo");
+
+    await processoA.close();
+  });
+
+  await test("banco indisponível: claim devolve 'banco-indisponivel' (nunca 'livre')", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const quebrado = {
+      query: async () => {
+        throw new Error("connection terminated unexpectedly");
+      },
+      end: async () => {},
+    };
+    const storage = new st.PostgresStorage(quebrado as any, await policyPostgres(), "hostX#1");
+    const health = await storage.initialize();
+    assert.equal(health.connected, false);
+    assert.ok(/connection terminated/.test(health.lastError!));
+
+    const claim = await storage.claimEntry({ mint: "m", side: "entry" });
+    assert.equal(claim.acquired, false);
+    assert.equal(claim.reason, "banco-indisponivel");
+    assert.ok(/falha ao consultar o banco/.test(claim.detail), "falha de infraestrutura não pode ser apresentada como 'ocupado'");
+  });
+
+  await test("espelho: upsert idempotente de posição/trade/intenção com campos promovidos", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const storage = new st.PostgresStorage(client, await policyPostgres(), "host#1");
+    await storage.migrate();
+
+    const pos: any = {
+      id: "pos1", token: "TST", mint: "mintX", sizeSol: 0.01, entryPrice: 1.5, currentPrice: 1.6,
+      pnlPercent: 6.6, status: "open", stopLossPercent: -20, takeProfitPercent: 20,
+      trailingStopActive: false, trailingStopOffsetPercent: 3, highestPrice: 1.6,
+      timeOpened: new Date().toISOString(), mode: "live", executionIntentId: "int1",
+    };
+    assert.equal(await storage.mirrorPosition(pos), true);
+    // DUAS escritas do mesmo id: o espelho é upsert, então o banco tem UMA linha atualizada.
+    assert.equal(await storage.mirrorPosition({ ...pos, currentPrice: 1.8, pnlPercent: 20, status: "exit_pending" }), true);
+
+    const linhas = await client.query("SELECT status, pnl_percent, payload FROM positions WHERE id = 'pos1'");
+    assert.equal(linhas.rows.length, 1, "upsert não pode duplicar a posição");
+    assert.equal(linhas.rows[0].status, "exit_pending");
+    assert.equal(Number(linhas.rows[0].pnl_percent), 20);
+    assert.equal(linhas.rows[0].payload.currentPrice, 1.8, "o payload preserva o registro COMPLETO (schema não perde campo)");
+
+    assert.equal(
+      await storage.mirrorTrade({
+        id: "tr1", token: "TST", mint: "mintX", amount: "0.01 SOL", outAmount: "1", block: 10, tipSol: 2e-6,
+        route: "exit", time: new Date().toISOString(), latencyMs: 800, status: "success", mode: "live",
+        signature: "sig", pnlNetSol: 0.002, feesSol: 5e-6, measuredOnChain: true,
+      } as any),
+      true
+    );
+    const trade = await client.query("SELECT mode, pnl_net_sol, measured_on_chain FROM trades WHERE id = 'tr1'");
+    assert.equal(trade.rows[0].mode, "live");
+    assert.equal(Number(trade.rows[0].pnl_net_sol), 0.002);
+    assert.equal(trade.rows[0].measured_on_chain, true, "o campo que distingue medido de estimado é promovido a coluna");
+
+    assert.equal(
+      await storage.mirrorIntent({
+        id: "int1", positionId: "pos1", mint: "mintX", side: "entry", state: "signed", attempt: 1,
+        signature: "sig", lastValidBlockHeight: 123, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      } as any),
+      true
+    );
+
+    const counts = await storage.counts();
+    assert.equal(counts.positions, 1);
+    assert.equal(counts.trades, 1);
+    assert.equal(counts.intents, 1);
+    await storage.close();
+  });
+
+  await test("espelho de logs: o filtro de nível é aplicado no adaptador (critical por default)", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+
+    const padrao = new st.PostgresStorage(client, await policyPostgres(), "host#1");
+    await padrao.migrate();
+    await padrao.mirrorLog({ level: "INFO", component: "RISK_ENGINE", message: "info qualquer" });
+    await padrao.mirrorLog({ level: "WARN", component: "REAL_ENTRY", message: "aviso relevante" });
+    await padrao.mirrorLog({ level: "CRITICAL", component: "REAL_ENTRY", message: "crítico" });
+    const gravados = await client.query("SELECT level FROM decision_logs ORDER BY id");
+    assert.deepEqual(gravados.rows.map((r: any) => r.level), ["WARN", "CRITICAL"], "INFO não vai para o banco no default");
+
+    const tudo = new st.PostgresStorage(client, await policyPostgres({ HFT_STORAGE_MIRROR_LOGS: "all" }), "host#2");
+    await tudo.mirrorLog({ level: "INFO", component: "X", message: "agora vai" });
+    assert.equal((await client.query("SELECT count(*) AS c FROM decision_logs")).rows[0].c, 3);
+
+    const nada = new st.PostgresStorage(client, await policyPostgres({ HFT_STORAGE_MIRROR_LOGS: "off" }), "host#3");
+    assert.equal(await nada.mirrorLog({ level: "CRITICAL", component: "X", message: "não vai" }), false);
+    assert.equal((await client.query("SELECT count(*) AS c FROM decision_logs")).rows[0].c, 3);
+
+    await padrao.close();
+  });
+
+  await test("histórico para validação: filtro por modo é explícito (paper nunca entra no conjunto live)", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const storage = new st.PostgresStorage(client, await policyPostgres(), "host#1");
+    await storage.migrate();
+    await storage.mirrorTrade({ id: "l1", mint: "m1", status: "success", mode: "live", measuredOnChain: true, pnlNetSol: 0.001, time: new Date().toISOString() } as any);
+    await storage.mirrorTrade({ id: "p1", mint: "m2", status: "paper", mode: "paper", measuredOnChain: true, pnlNetSol: 9.9, time: new Date().toISOString() } as any);
+    await storage.mirrorTrade({ id: "l2", mint: "m3", status: "success", mode: "live", measuredOnChain: true, pnlNetSol: -0.002, time: new Date().toISOString() } as any);
+
+    const lives = await storage.fetchTrades({ mode: "live" });
+    assert.equal(lives.length, 2);
+    assert.deepEqual(lives.map((t: any) => t.id).sort(), ["l1", "l2"]);
+    assert.equal(lives.every((t: any) => t.mode === "live"), true);
+
+    const papers = await storage.fetchTrades({ mode: "paper" });
+    assert.equal(papers.length, 1);
+    assert.equal(papers[0].id, "p1");
+
+    const limitado = await storage.fetchTrades({ limit: 1 });
+    assert.equal(limitado.length, 1);
+    await storage.close();
+  });
+
+  await test("S10: fiação no servidor — boot fail-closed, espelho registrado e claim antes de assinar", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+
+    assert.ok(/decideEntryStorageGuard/.test(src), "o guarda de armazenamento precisa existir no caminho de entrada");
+    assert.ok(/STORAGE_UNAVAILABLE/.test(src) === false, "o código é do módulo, não um literal duplicado no servidor");
+    assert.ok(/\[Boot\]\[Storage\]\[FATAL\]/.test(src), "Postgres pedido e não pronto precisa IMPEDIR o boot");
+    assert.ok(/dbStore\.setWriteThrough/.test(src), "o espelho de escrita precisa ser registrado");
+    assert.ok(/claimEntry\(/.test(src) && /releaseEntryClaim\(/.test(src), "adquirir e liberar o claim");
+
+    // A ordem é a garantia: o claim vem ANTES de montar/assinar, e a liberação está no finally.
+    const posClaim = src.indexOf("await Promise.race([");
+    const posDeps = src.indexOf("const deps: RealEntryDeps = {");
+    const posFinally = src.indexOf("} finally {");
+    assert.ok(posClaim > 0 && posDeps > posClaim, "o claim precisa ser adquirido antes de montar a instrução");
+    assert.ok(posFinally > posDeps, "a liberação precisa estar no finally que cobre todo o pipeline");
+    assert.ok(/STORAGE_CLAIM_TIMEOUT/.test(src), "timeout do claim precisa RECUSAR (banco lento não vira permissão)");
+
+    // A persistência precisa chamar o sink nos quatro pontos de escrita.
+    const persist = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/persistence.ts"), "utf8"));
+    for (const m of ["mirrorTrade", "mirrorPosition", "mirrorIntent", "mirrorLog"]) {
+      assert.ok(persist.includes(m), `persistence.ts precisa espelhar ${m}`);
+    }
+    assert.ok(/app\.get\("\/api\/storage"/.test(src), "o estado do armazenamento precisa ser visível");
+  });
+
+  await test("S10: o adaptador não assina, não guarda chave e não inventa endpoint de banco", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const adaptador = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/storage/postgresStorage.ts"), "utf8"));
+    for (const proibido of ["Keypair", "signTransaction", "sendTransaction", "OPERATIONAL_PRIVATE_KEY"]) {
+      assert.equal(adaptador.includes(proibido), false, `o adaptador de banco não pode referenciar ${proibido}`);
+    }
+    assert.ok(/DATABASE_URL/.test(adaptador), "a URL do banco vem do ambiente (nunca de constante no código)");
+    assert.ok(/import\("pg"\)/.test(adaptador), "o cliente é carregado sob demanda (modo JSON não paga por ele)");
+    const schema = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/storage/schema.ts"), "utf8"));
+    assert.ok(!/DROP TABLE|DROP COLUMN|TRUNCATE/i.test(schema), "migração destrutiva não existe neste schema (por decisão)");
+    assert.ok(/WHERE state = 'active'/.test(schema), "o índice único do claim precisa ser PARCIAL (só claims ativos competem)");
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

@@ -1940,3 +1940,125 @@ o mesmo tipo de prova que pegou o endereço sósia do `event_authority` no S6b.
 - **`processed` não é final**: detecção em `processed` acelera, mas uma transação pode não entrar no
   bloco. A confirmação com slot observado continua sendo o único caminho para uma posição existir.
 - **S9+ seguem fora**: rótulos de resultado, Postgres, ShredStream, Rust.
+
+## Adendo 18 — S9 (rótulos de resultado) e S10 (Postgres com voo único entre processos) (2026-10-05)
+
+### 1. Contexto
+
+O ciclo anterior fechou S7+S8 (`349308f`). A autorização 16 mandou executar os passos 3 e 4 do plano:
+**validar a estratégia estatisticamente** (S9) e **tirar a persistência do JSON de 50 trades** (S10).
+A pergunta que o S9 existe para responder é a mais desconfortável do projeto: *o que já operou tem
+edge?* — e a resposta honesta depende de separar "ganhou em alguns trades" de "estratégia validada".
+
+### 2. Diagnóstico
+
+| Problema | Consequência de não tratar |
+|---|---|
+| Não havia rótulo para o que cada registro É (medido, estimado, tentativa falhada, perna de entrada) | Percentual de posição e PnL medido on-chain entrariam no mesmo balde e "ganhou em 3 trades" viraria "estratégia lucrativa" |
+| `TransactionalStore` guarda **50 trades** e `positions` crescem sem teto | A amostra nunca chegaria ao piso declarado de 100 desfechos: a conclusão estatística era impossível por construção |
+| Trava de voo único em memória (`InFlightMints`) | Duas instâncias do bot na mesma carteira entram no mesmo mint; nenhuma vê a outra |
+| Sem veredito explícito de "não conclui" | O operador decide com base em n<100 achando que decidiu com base em evidência |
+
+### 3. O que foi implementado
+
+**S9 — rótulos e validação (`src/outcomeLabels.ts`, `src/strategyValidation.ts`, `GET /api/performance`)**
+
+- Cada desfecho carrega `basis` (`net_measured` | `price_estimated` | `none`) e `excluded` com
+  motivo. Só `net_measured` + `mode=live` entram na validação. `paper` tem rótulo (diagnóstico) e
+  **nunca** conta, mesmo com PnL. `entry_leg` (entrada confirmada sem saída) não é resultado.
+  Tentativa falhada é **custo**, não desfecho — o rótulo diz isso.
+- PnL sem medição on-chain NÃO é promovido a resultado: o campo sai `null` e o rótulo vira
+  `estimated_*`/`unresolved`. Zero e "não medido" nunca se confundem (regra da aut. 12).
+- Empate usa epsilon declarado de 1.000 lamports (1 base fee), não `=== 0` com número flutuante.
+- Veredito em 5 estados: `sem_dados` · `amostra_insuficiente` (piso declarado de 100, herdado de
+  `MIN_TRADES_FOR_CONFIDENCE`) · `indistinguivel_de_zero` (IC 95% da média contém zero) ·
+  `edge_negativo` · `candidato_a_edge`. **Nenhum deles afirma "lucrativo"**: `candidato_a_edge` vem
+  com a ressalva de que candidato ≠ lucrativo.
+- IC de win rate por **Wilson** (não normal): em amostras pequenas o intervalo não sai de [0,1] nem
+  dá 0% de erro para 0/10. IC da média com n≥2; com n=1 o desvio-padrão é `null` — melhor "não
+  calculável" que número inventado. `skewRatio` avisa quando um único trade domina o resultado, o
+  que torna o IC otimista.
+- O relatório declara a **fonte** (json-local ou postgres), quantos registros leu, se truncou e
+  quantos ficaram de fora por motivo. Sem isso, "expectância" de uma amostra truncada passaria por
+  expectância da operação.
+
+**S10 — Postgres (`src/storage/schema.ts`, `src/storage/postgresStorage.ts`, boot, endpoints, scripts)**
+
+- Schema v1 aditivo: `positions`, `trades`, `intents`, `entry_claims`, `decision_logs`, todas com
+  `payload JSONB` (o schema não perde campo que ele não conhece). Migração idempotente e
+  transacional; **não existe migração destrutiva** — o teste [29] falha se alguém introduzir
+  `DROP`/`TRUNCATE`.
+- **Voo único entre processos por ÍNDICE ÚNICO PARCIAL** `entry_claims (mint, side) WHERE state='active'`,
+  não por "consultar e depois inserir" (que tem corrida) nem por advisory lock (que amarra a
+  conexão e quebra com pool). O perdedor recebe **quem** detém e **até quando**.
+- Claim com **TTL** (default 300s) e **retomada atômica** (`UPDATE … WHERE expires_at < now()`):
+  processo que morre não bloqueia o mint para sempre. Liberação só pelo `claim_id` dono — se fosse
+  por `(mint, side)`, o dono antigo liberaria o claim do novo e **dois** processos entrariam.
+- Espelho **write-through**: o JSON continua sendo a fonte operacional e recebe as gravações
+  normalmente; o banco é cópia. Sink com captura de exceção — banco fora do ar degrada a
+  durabilidade, **não** impede a operação nem apaga histórico.
+- **Fail-closed no boot**: `HFT_STORAGE=postgres` sem `DATABASE_URL`, com modo desconhecido, ou com
+  banco inacessível/schema atrás ⇒ `[Boot][Storage][FATAL]` + `exit 1`. Subir sem o árbitro que o
+  operador acha que tem é pior que não subir. `HFT_STORAGE=json` (default) mantém o comportamento
+  anterior, com o limite declarado (voo único por processo, 50 trades).
+- **Claim com timeout = recusa** (`STORAGE_CLAIM_TIMEOUT`, 1,5s): banco lento não vira "provavelmente
+  livre, então assina".
+- Modo JSON **não paga** o custo do `pg`: o pacote é carregado por `import()` dinâmico.
+- `HFT_STORAGE_HISTORY_LIMIT` com teto de 1.000.000 (histórico ilimitado em memória é
+  DoS de si mesmo); `HFT_STORAGE_MIRROR_LOGS=critical|all|off`. Valor inválido cai no default
+  **declarado**, nunca em comportamento implícito.
+
+### 4. Quatro defeitos encontrados durante a própria implementação (e corrigidos)
+
+1. **`initialize()` reportava banco NOVO como "sem conexão"**: a consulta a `schema_migrations`
+   falhava numa base vazia e o `catch` marcava `connected=false`. Efeito prático: o boot
+   abortava (fail-closed) e o log dizia "sem conexão" quando a conexão estava perfeita, tornando
+   impossível apontar o bot para um banco limpo. Agora usa `to_regclass` e separa os dois estados.
+2. **Modo desconhecido em `HFT_STORAGE` era ignorado** quando `DATABASE_URL` estava ausente — o
+   operador ficava acreditando ter configurado um banco. Bloqueio agora existe por si.
+3. **A recusa do endpoint `POST /api/real-entry` não era registrada.** A pré-checagem do endpoint
+   recusava com 409 **antes** de `runRealEntry` e não gravava nada: log de decisão vazio
+   justamente quando alguém tentou operar com o caminho desligado. As duas recusas passaram a usar
+   um helper único (`registrarRecusaDeEntrada`).
+4. **`listActiveClaims` não devolvia o `claim_id`**, o que convidava a liberar claim por mint no
+   encerramento — exatamente o erro que permite dois processos no mesmo mint. Agora devolve o id e
+   o shutdown libera por id, aguardando a conclusão antes de sair.
+
+### 5. Evidências (medidas, não declaradas)
+
+`npm run lint` → 0 · `npm run test` → **265/265** (eram 244; grupos [28] com 9 e [29] com 12) ·
+`npm run build` → ok.
+
+| Cenário | Resultado observado |
+|---|---|
+| `npm run storage:selftest` (Postgres WASM + driver `pg` por TCP) | **15/15** · índice parcial conferido no catálogo (`entry_claims_active_unique … WHERE (state = 'active')`) · insert cru concorrente rejeitado com `duplicate key` |
+| Boot `HFT_STORAGE=postgres` sem `DATABASE_URL` | `[Boot][Storage][FATAL] … exige DATABASE_URL` + `exit 1` |
+| Boot com `HFT_STORAGE=mysql` | `[Boot][Storage][FATAL] … não é um modo conhecido` + `exit 1` |
+| Boot com banco inalcançável (`127.0.0.1:1`) | `[Boot][Storage][FATAL] … ECONNREFUSED` + `exit 1` — credencial **não** aparece no log |
+| Boot real com Postgres por TCP, banco vazio | `schema em ausente < esperado: aplicando migrações` → `migrações aplicadas: [1]` → `Postgres pronto: schema v1` |
+| `/api/storage` | `policy`, `health` (schema, owner, escritas, falhas, claims), `counts`, `activeClaims`, `entryGuard` e a **garantia** declarada por modo |
+| `POST /api/real-entry` em PAPER | recusa `ENTRY_PATH_DISABLED`/`MODE_NOT_LIVE` → log espelhado: `writes=1`, `counts.logs=1` |
+| `/api/performance` com Postgres ativo | `source.name = "postgres"`, `tradesRead` declarado; sem dados → veredito `sem_dados` |
+| `/api/system-truth` | nova fonte `armazenamento (S10)` → `read-only`, com o estado e a ressalva |
+| Shutdown (SIGTERM) | libera claims da própria instância por `claim_id` e fecha o pool antes de sair |
+
+### 6. O que continua aberto (e o que NÃO foi provado)
+
+- **O caminho de rede do provedor real não foi exercitado aqui.** O Postgres do sandbox é
+  PostgreSQL 18/WASM atrás de um socket local — cobre SQL, índice parcial, intervalo e semântica do
+  claim, mas **não** cobre TLS, pooler (PgBouncer/Supavisor), limites de conexão nem permissões do
+  provedor. Isso é `npm run storage:check` no VPS.
+- **Concorrência simultânea não é testável neste sandbox** (o Postgres WASM atende uma conexão por
+  vez). A disputa testada é sequencial — que é a ordem do caso real. A garantia contra dois claims
+  no mesmo instante é o índice único, não uma checagem em código.
+- **O claim dentro de `runRealEntry` nunca foi executado de verdade**: ele vive depois do gate e
+  exige `RUNTIME_MODE=LIVE` + `HFT_REAL_ENTRY_ENABLED=1`. Ligar isso para testar significaria
+  assinar e enviar transação real — não foi feito. O que está provado é o adaptador (teste [29] e
+  `storage:selftest`) e a **posição** do claim no código (teste de fiação: claim antes de montar,
+  `release` no `finally`).
+- **S9 não tem amostra nenhuma**: `GET /api/performance` opera corretamente e conclui `sem_dados`.
+  Qualquer afirmação sobre edge depende de acumular ≥100 desfechos `net_measured` em live.
+- **O banco não é a fonte operacional** — é espelho. Trocar a fonte é uma decisão futura, com
+  migração de leitura e reconciliação, não um efeito colateral deste adendo.
+- **Nada disto autoriza entrada real.** `HFT_REAL_ENTRY_ENABLED=0` continua o default, e o S10
+  apenas torna o voo único verificável entre processos quando a entrada for autorizada.

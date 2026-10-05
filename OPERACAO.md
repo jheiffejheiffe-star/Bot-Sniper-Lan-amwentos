@@ -22,12 +22,18 @@ declara quais são quais (banner no topo, fonte: `GET /api/system-truth`).
 | Idempotência de execução (intenções, trava de voo único) | ✅ implementada | `GET /api/execution-intents` |
 | Reconciliação posição × carteira (`POSITION_DESYNC`) | ✅ implementada | `GET /api/positions/desync` |
 | Status de landing Jito + tip floor real | ✅ leitura implementada | `GET /api/jito/bundle-status`, `GET /api/jito-tips` |
-| **Entrada REAL on-chain (compra)** | ❌ **não implementada** (`LaunchSwapper` desabilitado) | `GET /api/system-truth` → `liveExecutionPath` |
+| **Entrada REAL on-chain (compra, S6)** | ✅ implementada e **DESLIGADA por default** (exige `RUNTIME_MODE=LIVE` + `LIVE_TRADING_ENABLED=true` + `HFT_REAL_ENTRY_ENABLED=1`, com teto canário) | `GET /api/real-entry` → `readiness` |
+| Ingestão gRPC/yellowstone (S7, aditiva) | ✅ implementada e opt-in (`HFT_INGEST=grpc` + `GEYSER_GRPC_URL`) | `GET /api/health` → `detection.grpcFastPath` |
+| Envio paralelo Jito/staked/RPC (S8, aditiva) | ✅ implementada e opt-in (`HFT_PARALLEL_SEND=1`) | `GET /api/real-entry` → `parallelSend` |
+| **Validação estatística da estratégia (S9)** | ✅ implementada — com regra de exclusão explícita; **sem amostra** até acumular desfechos | `GET /api/performance` → `verdict`, `coverage` |
+| **Persistência (S10)** | ✅ JSON local (default) ou **Postgres espelhado** opt-in, com voo único entre processos | `GET /api/storage` → `guarantee`, `entryGuard` |
 | Painéis de telemetria/score/geyser do dashboard | ⚠️ **simulados (RNG no servidor)** | `GET /api/system-truth` → `simulatedEndpoints` |
 
-Consequência prática: **hoje o bot detecta, analisa, simula, registra e gerencia posições de
-papel — mas não compra.** Qualquer número de "PnL realizado" sem o caminho de entrada real é
-simulação. O que existe de real é: detecção, cotação, simulação, telemetria e auditoria.
+Consequência prática: o bot **detecta, analisa, simula, registra, gerencia posições e — quando as
+três declarações estão ligadas — compra de verdade** (com canário e travas). No default, ele NÃO
+compra e todo "PnL realizado" é de papel. E existe uma diferença que o painel faz questão de
+mostrar: há desfecho **medido on-chain** e há **estimativa de preço**; os dois nunca entram na mesma
+conta (`GET /api/performance` → `coverage`, `exclusionsByReason`).
 
 ---
 
@@ -173,6 +179,95 @@ não derruba o boot — a rota não usa o layout.
 
 ---
 
+### 5.2 Validação estatística (S9) — a única resposta honesta para "está funcionando?"
+
+`GET /api/performance` não responde "sim" ou "não": ele monta o conjunto de desfechos com **PnL
+líquido medido on-chain**, conta o que ficou de fora com o motivo, e só então dá um veredito
+qualificado.
+
+```bash
+curl -s localhost:3000/api/performance | python3 -m json.tool | head -40
+curl -s "localhost:3000/api/performance?limit=2000"   # amostra maior (exige Postgres ligado)
+```
+
+Como ler a resposta, na ordem:
+
+1. **`source`** — de onde vieram os dados (`json local` ou `postgres`), quantos registros foram
+   lidos e se houve truncamento. Se a fonte é o JSON local, o teto de 50 trades está na resposta:
+   métrica sobre histórico truncado não é métrica da operação.
+2. **`coverage`** — quantos desfechos têm número medido, quantos são estimativa de preço e quantos
+   não têm número. `missingShare` alto significa que a conclusão é sobre uma minoria.
+3. **`exclusionsByReason`** — por que cada registro ficou de fora (perna de entrada, modo paper,
+   sem medição on-chain, tentativa falhada). Um motivo que cresce muito é um sinal de processo.
+4. **`metrics`** — expectância, win rate, profit factor, drawdown, custos medidos (fees, tips).
+5. **`verdict`** — `sem_dados` · `amostra_insuficiente` (piso de 100 desfechos) ·
+   `indistinguivel_de_zero` (o IC 95% da média contém zero) · `edge_negativo` · `candidato_a_edge`.
+   `candidato_a_edge` **não** é "lucrativo": é "a amostra atual não permite descartar edge positivo".
+   `whatWouldChangeIt` diz, em português, o que mudaria a conclusão.
+
+Regras que o endpoint aplica e que você pode conferir no código (`src/outcomeLabels.ts`):
+
+- percentual de posição é **estimativa de preço** (não inclui tip, priority fee, base fee nem
+  rent) → rótulo `estimated_*`, excluído da conclusão, mantido para diagnóstico;
+- PnL sem assinatura/medição on-chain vira `unresolved`, nunca zero;
+- `mode=paper` não entra, mesmo com PnL positivo;
+- empate só com |PnL| ≤ 0,000001 SOL (1 base fee).
+
+### 5.3 Postgres (S10) — voo único entre processos e histórico durável
+
+**Por que ligar.** Em JSON o arquivo guarda **50 trades** e a trava de voo único vale **por
+processo**: duas instâncias do bot na mesma carteira não se enxergam. Com Postgres, o claim é um
+**índice único parcial** no banco — exatamente um processo entra por `(mint, side)` por vez, e o
+histórico deixa de ser truncado.
+
+**Ligar, na ordem (custo zero para testar):**
+
+```bash
+# 1. teste local, sem nuvem e sem daemon: Postgres em WASM + migração + disputa de claim
+npm run storage:selftest
+
+# 2. prepare o banco de verdade (Neon/Supabase free). DATABASE_URL no ambiente:
+export DATABASE_URL="postgres://...?sslmode=require"
+npm run storage:migrate     # aplica a v1 (idempotente, só aditiva)
+npm run storage:check       # somente leitura: versão, contagens, claims, guarda de entrada
+
+# 3. ligue o bot para o banco
+HFT_STORAGE=postgres npm run dev
+```
+
+**O que você vai ver no boot:**
+
+```
+[Boot][Storage] espelho em Postgres ATIVO: voo único entre processos via entry_claims (TTL 300s)…
+[Boot][Storage] só WARN/CRITICAL vão para o banco (HFT_STORAGE_MIRROR_LOGS=critical, default)
+[Boot][Storage] Postgres pronto: schema v1, 12 trade(s), 3 posição(ões), 1 intenção(ões), 0 claim(s) ativo(s)
+```
+
+**Fail-closed (por decisão, não por bug).** Com `HFT_STORAGE=postgres`, o boot **aborta** (`exit 1`)
+se: faltar `DATABASE_URL`; o valor do modo não for conhecido; o banco não responder; ou o schema
+estiver atrás do esperado. Subir sem o árbitro que você acha que tem é pior do que não subir.
+
+**Quando o banco cai com o bot no ar:** a operação continua (o JSON é sempre escrito; o espelho
+apenas registra falhas em `writeFailures`), mas a **entrada real recusa** com
+`STORAGE_UNAVAILABLE` enquanto o banco não voltar — porque o voo único entre processos não estar
+disponível é uma proteção ausente, e o bot não assina confiando numa proteção ausente. Se o claim
+não responder dentro de `HFT_STORAGE_CLAIM_TIMEOUT_MS` (1,5s), a entrada também recusa
+(`STORAGE_CLAIM_TIMEOUT`).
+
+**Estados possíveis da entrada, por storage** (visíveis em `GET /api/storage → entryGuard`):
+
+| Situação | `allowSign` | Efeito |
+|---|---|---|
+| `HFT_STORAGE=json` | `true` | Segue como antes; a resposta declara "voo único POR PROCESSO" |
+| Postgres conectado, schema v1 | `true` | Claim atômico antes de assinar; liberado no `finally` |
+| Postgres fora do ar | `false` | `STORAGE_UNAVAILABLE` — recusa explicada, não erro genérico |
+| Postgres com schema atrás | `false` | `STORAGE_SCHEMA_OUTDATED` + comando que resolve |
+
+**Operação do dia a dia:** `GET /api/storage` mostra modo, saúde, contagens, claims ativos (mint,
+dono, expiração) e a garantia vigente. Um claim com `expired: true` é normal depois de um crash: o
+próximo processo o retoma automaticamente. **Nunca** libere claim de outro dono — a liberação é por
+`claim_id`, e é isso que impede dois processos no mesmo mint.
+
 ## 6. Problemas comuns e o que eles NÃO significam
 
 | Sintoma | Provável causa | NÃO conclua |
@@ -196,6 +291,13 @@ não derruba o boot — a rota não usa o layout.
   **Não versionado** (gitignored): dado de runtime pertence ao ambiente, não ao repositório.
 - `hft_operational_db.quarantine.*.json` — inventário da quarentena (não destrutiva).
 - `GET /api/system-truth` — o que é medição e o que é simulação, agora.
+- `GET /api/performance` — validação estatística com `source` (json local × postgres), `coverage`
+  (medido × estimado × sem número) e `verdict` qualificado. Um veredito sem cobertura declarada não
+  é evidência.
+- `GET /api/storage` — modo de persistência, garantia vigente do voo único, contagens e claims
+  ativos, mais o `entryGuard` (se o armazenamento permite assinar).
+- Evidência executável: `npm run storage:selftest` (Postgres WASM + driver `pg`),
+  `npm run storage:check` (banco real, somente leitura) e `AUDIT.md` Adendo 18.
 
 ---
 
@@ -211,9 +313,15 @@ não derruba o boot — a rota não usa o layout.
 2. **gRPC Yellowstone (S7)** — IMPLEMENTADO e **desligado por default**: sem `GEYSER_GRPC_URL` o
    runtime usa WebSocket (mais lento, com `getTransaction`). O fast path é aditivo, não substitui o
    WSS. Provedor gRPC de produção costuma ser pago — a ausência dele não impede operar.
-3. **Idempotência entre processos** — a trava de voo único vale por processo; duas instâncias
-   na mesma carteira não se enxergam (a solução é guarda NA CADEIA, que não existe aqui).
-4. **Postgres** — persistência é JSON atômico com backup; suficiente para single-writer, não
-   para múltiplos processos.
+3. **Idempotência entre processos** — RESOLVIDA em Postgres (S10): o claim é um índice único
+   parcial no banco e vale ENTRE processos. Em `HFT_STORAGE=json` (default) continua valendo só
+   POR PROCESSO, e `/api/storage` declara qual dos dois está em vigor. O que ainda NÃO existe é
+   guarda NA CADEIA (uma entrada feita por outra ferramenta, fora do bot, é invisível).
+4. **Postgres (S10)** — IMPLEMENTADO e opt-in: espelho write-through (o JSON nunca deixa de ser
+   escrito), histórico durável, voo único entre processos e boot fail-closed. Não é a fonte
+   operacional e não substitui backup do arquivo JSON.
 5. **Painéis do dashboard** — 9 endpoints listados em `/api/system-truth` continuam gerando
    números com RNG. Eles estão DECLARADOS, não corrigidos.
+6. **Validação estatística (S9)** — o cálculo existe e é honesto, mas **não há amostra**: sem ≥100
+   desfechos com PnL líquido medido on-chain, `/api/performance` conclui `sem_dados` ou
+   `amostra_insuficiente`. Nenhum resultado deste projeto foi validado estatisticamente ainda.

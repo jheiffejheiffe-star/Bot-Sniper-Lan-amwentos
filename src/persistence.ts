@@ -364,6 +364,30 @@ class TransactionalStore {
     }
   }
 
+  /** Sink de espelho (S10). Opcional: sem ele, o comportamento é exatamente o anterior. */
+  private writeThrough: WriteThroughSink | null = null;
+
+  public setWriteThrough(sink: WriteThroughSink): void {
+    this.writeThrough = sink;
+  }
+
+  public hasWriteThrough(): boolean {
+    return this.writeThrough !== null;
+  }
+
+  /**
+   * Chama o sink sem deixar exceção subir. Um espelho com defeito não pode impedir a gravação local
+   * — a operação não pode depender do banco de terceiro para registrar o que fez.
+   */
+  private mirror(fn: (sink: WriteThroughSink) => void): void {
+    if (!this.writeThrough) return;
+    try {
+      fn(this.writeThrough);
+    } catch (err: any) {
+      console.error("[Database Engine] Falha ao espelhar registro (a gravação local foi mantida):", err?.message ?? err);
+    }
+  }
+
   // Trades Repository
   public getTrades(): DBTrade[] {
     return this.data.trades;
@@ -380,6 +404,7 @@ class TransactionalStore {
       }
     }
     this.commit(this.data);
+    this.mirror((sink) => sink.mirrorTrade?.(trade));
   }
 
   // Positions Repository
@@ -395,6 +420,7 @@ class TransactionalStore {
       this.data.positions.unshift(pos);
     }
     this.commit(this.data);
+    this.mirror((sink) => sink.mirrorPosition?.(pos));
   }
 
   public deletePosition(id: string): void {
@@ -456,6 +482,8 @@ class TransactionalStore {
       }
     }
     this.commit(this.data);
+    // Intenção espelhada é o que permite a auditoria pós-restart cruzar estado local × banco.
+    this.mirror((sink) => sink.mirrorIntent?.(intent));
   }
 
   /** Intenções não terminais (as que impedem uma segunda ação na mesma posição/lado). */
@@ -483,6 +511,7 @@ class TransactionalStore {
       this.data.logs.pop();
     }
     this.commit(this.data);
+    this.mirror((sink) => sink.mirrorLog?.(newLog));
     return newLog;
   }
 
@@ -558,4 +587,19 @@ class TransactionalStore {
 }
 
 // Instantiate Singleton Database client
+/**
+ * ESPELHO DE ESCRITA (S10). O JSON continua sendo a fonte operacional (decisões não mudam), e o
+ * Postgres recebe os MESMOS registros por este sink — o adaptador decide o que fazer e nunca lança.
+ *
+ * Por que um sink em vez de trocar a implementação: trocar o armazenamento operacional de uma vez
+ * colocaria em risco o caminho de decisão que já está funcionando. Com o sink, o banco é ADITIVO:
+ * se ele não responde, o bot continua operando com o JSON e o health declara a degradação.
+ */
+export interface WriteThroughSink {
+  mirrorTrade?(trade: DBTrade): void;
+  mirrorPosition?(position: DBPosition): void;
+  mirrorIntent?(intent: ExecutionIntentRecord): void;
+  mirrorLog?(log: DBLog): void;
+}
+
 export const dbStore = new TransactionalStore();

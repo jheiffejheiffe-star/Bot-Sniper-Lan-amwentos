@@ -219,3 +219,63 @@ lançamento visto pelas duas fontes vire **uma** decisão — a duplicata é con
   continua sendo as checagens on-chain feitas pelo próprio bot.
 - Nada neste documento autoriza execução real. O caminho de entrada on-chain (S6) continua
   pendente e depende de autorização explícita + capital.
+
+---
+
+## S10 — Postgres de graça: dá para validar o voo único entre processos sem pagar nada?
+
+**Resposta curta:** sim, e em dois níveis. Um deles não precisa nem de internet.
+
+### Nível 0 — Postgres local em WASM, custo zero e sem instalar nada (para TESTAR)
+
+```bash
+npm run storage:selftest
+```
+
+Sobe um **PostgreSQL 18 compilado para WASM** (`@electric-sql/pglite`, devDependency) atrás de um
+servidor de socket que fala o protocolo nativo, e executa pelo driver `pg` — o mesmo do runtime —
+migração idempotente, disputa pelo mesmo mint, retomada de claim expirado, liberação só pelo dono,
+espelho com upsert e o comportamento com o banco caído. **15/15 verificações** nesta máquina.
+
+O que esse caminho **não** cobre: TLS, pooler do provedor, limites de conexão, permissões e a rede
+real. Isso é o nível 1.
+
+### Nível 1 — Postgres gerenciado no tier gratuito (para OPERAR)
+
+Qualquer Postgres gerenciado serve, porque o adaptador usa **SQL padrão** (índice único parcial,
+`JSONB`, `TIMESTAMPTZ`): não há dependência de extensão paga nem de recurso específico de provedor.
+
+| Provedor | Tier gratuito (verificar vigência — muda) | Observação prática |
+|---|---|---|
+| Neon | projeto grátis com limite mensal de armazenamento/compute, escala a zero | `?sslmode=require`; conexão direta para o bot (não precisa de pooler para 1 processo) |
+| Supabase | projeto grátis com banco incluído | use a **connection string direta** do banco, não a do pooler, para o bot |
+| Railway / Render | créditos/camadas gratuitas limitadas | aceitam Postgres padrão |
+
+**Regra de custo:** o bot usa **uma** conexão (`pg.Client`, sem pool) e escreve por espelho. O
+volume é de dezenas de registros por operação, não de milhares por segundo — o tier gratuito é
+suficiente para testar e para operar em escala de canário.
+
+**Antes de confiar, valide contra o banco real** (o que o Nível 0 não prova):
+
+```bash
+export DATABASE_URL="postgres://...?sslmode=require"
+npm run storage:migrate   # idempotente; só aditivo (não existe DROP/TRUNCATE neste schema)
+npm run storage:check     # versão do schema, contagens, claims ativos, guarda de entrada
+```
+
+Se `storage:check` disser `OK` e `entryGuard.allowSign=true`, o bot pode ser ligado com
+`HFT_STORAGE=postgres`. Se o provedor dormir (escala a zero) e a conexão cair, o bot **não** perde
+nada: o JSON continua sendo escrito, o espelho registra a falha em `writeFailures` e a entrada real
+recusa enquanto o banco não voltar (`STORAGE_UNAVAILABLE`). Nenhum resquício de "caiu o banco,
+então ignoramos a trava".
+
+**Aviso de segurança:** a `DATABASE_URL` carrega usuário e senha. Ela vive em variável de ambiente
+(nunca em código, nunca comitada, nunca impressa — o log mostra só host/porta/base), e o banco
+guarda decisões de operação, então trate a credencial como chave de operação: rotacione se vazar.
+
+### O que o S10 NÃO é
+
+- não é a fonte operacional (o JSON continua sendo; o banco é espelho);
+- não substitui backup do arquivo JSON;
+- não é guarda NA CADEIA: uma entrada feita por outra ferramenta, fora do bot, continua invisível;
+- não autoriza entrada real. `HFT_REAL_ENTRY_ENABLED=0` segue sendo o default.

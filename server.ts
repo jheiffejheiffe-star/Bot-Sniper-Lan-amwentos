@@ -60,6 +60,16 @@ import {
   type RealEntryDeps,
   type RealEntryResult,
 } from "./src/realEntry.js";
+import { labelAll } from "./src/outcomeLabels.js";
+import { buildValidationReport } from "./src/strategyValidation.js";
+import {
+  PostgresStorage,
+  decideEntryStorageGuard,
+  describeStoragePolicy,
+  loadPgClient,
+  resolveStoragePolicy,
+  type StoragePolicy,
+} from "./src/storage/postgresStorage.js";
 import {
   GrpcIngestClient,
   assessGrpcEndpoint,
@@ -323,6 +333,13 @@ function firstSightAcrossSources(signature: string): boolean {
  */
 const PARALLEL_SEND = resolveParallelSendPolicy();
 console.log(`[Boot][Env] ${describeParallelSendPolicy(PARALLEL_SEND).join(" | ")}`);
+/**
+ * ARMAZENAMENTO (S10): política resolvida uma vez no boot + adaptador quando em modo Postgres.
+ * `storageRef` nulo em modo JSON — e o modo JSON é o default, com o comportamento anterior.
+ */
+const STORAGE_POLICY: StoragePolicy = resolveStoragePolicy();
+let storageRef: PostgresStorage | null = null;
+
 /** Último resultado de corrida de envio, para diagnóstico (memória: some no restart). */
 let lastParallelSend: {
   at: string;
@@ -1691,6 +1708,19 @@ app.get("/api/system-truth", (_req, res) => {
         "filtro profundo continua verificando no RPC. Prova de vida = eventos > 0.",
     },
     {
+      source: "armazenamento (S10)",
+      status: "read-only" as const,
+      detail:
+        STORAGE_POLICY.mode === "postgres"
+          ? `Postgres (${STORAGE_POLICY.claimTtlMs / 1000}s de TTL do claim): ` +
+            `conectado=${storageRef?.health().connected ?? false}, schema v${storageRef?.health().schemaVersion ?? "?"}, ` +
+            `${storageRef?.health().writes ?? 0} escrita(s) espelhada(s), ${storageRef?.health().writeFailures ?? 0} falha(s)`
+          : "JSON local: voo único POR PROCESSO e histórico limitado a 50 trades",
+      caveat:
+        "o JSON continua sendo escrito em paralelo — banco indisponível degrada a durabilidade e o " +
+        "voo único entre processos, mas NÃO apaga o histórico local.",
+    },
+    {
       source: "banco operacional",
       status: "real",
       detail:
@@ -1736,7 +1766,9 @@ app.get("/api/system-truth", (_req, res) => {
       "(RUNTIME_MODE=LIVE + LIVE_TRADING_ENABLED=true + HFT_REAL_ENTRY_ENABLED=1) e teto canário; " +
       "sem elas, nenhuma compra real é possível. O bloco `realEntry` abaixo diz o estado AGORA. " +
       "DETECÇÃO: o fast path gRPC (S7) é aditivo ao WebSocket e vive em `GET /api/real-entry → ingest`. " +
-      "ENVIO: a corrida Jito/staked/RPC (S8) é opt-in e vive em `GET /api/real-entry → parallelSend`.",
+      "ENVIO: a corrida Jito/staked/RPC (S8) é opt-in e vive em `GET /api/real-entry → parallelSend`. " +
+      "VALIDAÇÃO: as métricas e o veredito honesto vivem em `GET /api/performance` (S9); a persistência " +
+      "e o voo único entre processos, em `GET /api/storage` (S10).",
     realSources,
     simulatedEndpoints,
     /**
@@ -5011,6 +5043,28 @@ function buildEntryGateInput(params: {
 }
 
 /**
+ * REGISTRA UMA RECUSA DE ENTRADA (gate, rota, carteira, armazenamento ou claim).
+ *
+ * Existe para que os DOIS pontos de recusa (a pré-checagem do endpoint `POST /api/real-entry` e o
+ * interior de `runRealEntry`) gravem exatamente o mesmo: log de decisão no armazenamento + entrada
+ * no histórico em memória. Antes disso o endpoint recusava e não registrava nada — o operador que
+ * tentava entrar com o caminho desligado via um 409 limpo e um log de decisão VAZIO, e podia
+ * concluir que ninguém havia tentado. Recusa não registrada é decisão invisível.
+ */
+function registrarRecusaDeEntrada(refused: RealEntryResult, correlationId: string | null): RealEntryResult {
+  dbStore.saveLog({
+    timestamp: new Date().toISOString(),
+    level: "WARN",
+    component: "REAL_ENTRY",
+    message: `[S6] Entrada real RECUSADA: ${refused.reason}`,
+    correlationId: correlationId ?? undefined,
+  });
+  realEntryHistory.unshift(refused);
+  if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
+  return refused;
+}
+
+/**
  * Executa UMA entrada real, ponta a ponta. Devolve o resultado tipado — nunca lança por
  * falha de execução (o chamador decide o que fazer com o status).
  */
@@ -5025,17 +5079,7 @@ async function runRealEntry(params: {
   const gate = assessEntryGate(gateInput);
 
   if (!gate.allowed) {
-    const refused = refusedRealEntry(params.mint, params.sizeSol, gate);
-    dbStore.saveLog({
-      timestamp: new Date().toISOString(),
-      level: "WARN",
-      component: "REAL_ENTRY",
-      message: `[S6] Entrada real RECUSADA pelo gate: ${refused.reason}`,
-      correlationId: params.correlationId,
-    });
-    realEntryHistory.unshift(refused);
-    if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
-    return refused;
+    return registrarRecusaDeEntrada(refusedRealEntry(params.mint, params.sizeSol, gate), params.correlationId);
   }
 
   const sizeSol = params.sizeSol;
@@ -5137,424 +5181,534 @@ async function runRealEntry(params: {
   /** Preenchido quando a rota é nativa: estado da curva/global lido no instante da montagem. */
   let nativeContext: { curve: BoundingCurveState; feeRecipient: string; minTokensOut: bigint; spendableSolIn: bigint } | null = null;
 
-  const deps: RealEntryDeps = {
-    assertCanSign: () => assertCanSign("entry"),
-    getQuote: async (mint, sizeLamports, slippageBps, timeoutMs) => {
-      if (entryRoute === "native") {
-        const conn = globalConnection;
-        if (!conn) throw new Error("RPC indisponível (globalConnection nulo): rota nativa exige leitura de conta");
-        const infos = await conn.getMultipleAccountsInfo([
-          new PublicKey(deriveGlobalPda()),
-          new PublicKey(deriveBondingCurvePda(mint)),
-        ]);
-        const [globalInfo, curveInfo] = infos;
-        if (!globalInfo) throw new Error("conta Global do pump não encontrada no RPC configurado");
-        if (!curveInfo) throw new Error("bonding curve não encontrada: mint sem curva ativa (migrado ou inexistente)");
-
-        const global = parseGlobalAccount(globalInfo.data);
-        const curve = parseBondingCurveAccount(curveInfo.data);
-        if (!global.value) throw new Error(`Global ilegível: ${global.problems.map((p) => p.message).join(" | ")}`);
-        if (!curve.value) throw new Error(`BondingCurve ilegível: ${curve.problems.map((p) => p.message).join(" | ")}`);
-        if (curve.value.complete) throw new Error("curva COMPLETA (token migrado): não se compra na curva neste estado");
-        const solGuard = assertSolQuotedCurve(curve.value.quoteMint);
-        if (!solGuard.ok) throw new Error(solGuard.reason);
-
-        const spendableSolIn = BigInt(sizeLamports);
-        const q = quoteTokensOutExactSolIn({
-          spendableSolIn,
-          virtualTokenReserves: curve.value.virtualTokenReserves,
-          virtualQuoteReserves: curve.value.virtualQuoteReserves,
-          protocolFeeBps: global.value.feeBasisPoints,
-          creatorFeeBps: curve.value.creatorFeeBps,
-        });
-        if (!q) throw new Error("cotação nativa não calculável (reservas/taxas): dado insuficiente para entrar");
-        const minTokensOut = minTokensOutFromSlippage(q.tokensOut, slippageBps);
-        if (minTokensOut <= 0n) throw new Error("min_tokens_out calculado é zero: slippage/taxa anulam a compra");
-
-        nativeContext = { curve: curve.value, feeRecipient: global.value.feeRecipient, minTokensOut, spendableSolIn };
-
-        /**
-         * Impacto MEDIDO da própria curva: preço de execução (net_sol/tokens) contra o preço
-         * spot (reservas virtuais). Não é estimativa de terceiro — é aritmética das reservas
-         * lidas um instante antes. O gate de impacto do realEntry consome este número.
-         */
-        const spot = Number(curve.value.virtualQuoteReserves) / Number(curve.value.virtualTokenReserves);
-        const exec = Number(q.netSol) / Number(q.tokensOut);
-        const impactFraction = spot > 0 ? exec / spot - 1 : 0;
-
-        return {
-          outAmount: q.tokensOut.toString(),
-          priceImpactPct: String(impactFraction),
-          routeLabels: [`pump.fun curva (nativa, ${q.totalFeeBps}bps)`],
-        };
-      }
-
-      const call = await withBudget(
-        budgets.jupiter,
-        // ENTRADA = gastar SOL para receber o mint. Inverter os lados aqui cotaria uma
-        // VENDA do mint com valor lido em lamports — erro que o pré-flight não pegaria
-        // (a simulação de uma venda seria bem-sucedida se houvesse saldo).
-        () => JupiterIntegration.getQuote(SOL_MINT, mint, sizeLamports, slippageBps, timeoutMs ?? 6000),
-        { priority: "normal" }
-      );
-      if (!call.ok) throw new Error(call.skippedReason ?? "cotação bloqueada por orçamento de cota");
-      return call.value as any;
-    },
-    buildSwapTransaction: async (quote, userPk, timeoutMs) => {
-      if (entryRoute === "native") {
-        const ctx = nativeContext;
-        if (!ctx) throw new Error("estado da curva ausente: a cotação nativa precisa rodar antes da montagem");
-        const built = buildPumpBuyExactSolInInstruction({
-          mint: params.mint,
-          user: userPk,
-          feeRecipient: ctx.feeRecipient,
-          creator: ctx.curve.creator,
-          spendableSolIn: ctx.spendableSolIn,
-          minTokensOut: ctx.minTokensOut,
-        });
-        const cuLimit = Number(process.env.HFT_ENTRY_CU_LIMIT ?? 200_000);
-        const cuPrice = Number(process.env.HFT_ENTRY_CU_PRICE_MICROLAMPORTS ?? 0);
-        const ixs = [
-          ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }),
-          ...(cuPrice > 0 ? [ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Math.floor(cuPrice) })] : []),
-          new TransactionInstruction({
-            programId: new PublicKey(built.programId),
-            // `name` é metadado nosso para auditoria; NÃO vai como AccountMeta.
-            keys: built.keys.map((k) => ({
-              pubkey: new PublicKey(k.pubkey),
-              isSigner: k.isSigner,
-              isWritable: k.isWritable,
-            })),
-            data: built.data,
-          }),
-        ];
-        /**
-         * O blockhash de espaço reservado é substituído por um MONITORADO em `signAndSubmit`
-         * (que também assina). Nada é assinado com o valor de espaço reservado: a ordem é
-         * montar → simular (substitui na simulação) → trocar por blockhash fresco → assinar.
-         */
-        const message = new TransactionMessage({
-          payerKey: new PublicKey(userPk),
-          recentBlockhash: SYSTEM_PROGRAM_ID,
-          instructions: ixs,
-        }).compileToV0Message();
-        return new VersionedTransaction(message);
-      }
-      return JupiterIntegration.buildSwapTransaction(quote, userPk, timeoutMs ?? 6000);
-    },
-    simulateTransaction: async (tx) => {
-      const conn = globalConnection;
-      if (!conn) throw new Error("RPC indisponível (globalConnection nulo)");
-      const sim = await conn.simulateTransaction(tx as VersionedTransaction, {
-        commitment: "processed",
-        sigVerify: false,
-        // O blockhash do agregador é substituído por um monitorado na assinatura; simular
-        // contra ele mediria expiração, não programa/compute.
-        replaceRecentBlockhash: true,
-      });
-      return {
-        ok: sim.value.err === null || sim.value.err === undefined,
-        err: sim.value.err,
-        unitsConsumed: sim.value.unitsConsumed ?? null,
-        logsTail: (sim.value.logs ?? []).slice(-5).map((l) => String(l).slice(0, 200)),
-      };
-    },
-    getFreshBlockhash: async () => {
-      const cache = blockhashCacheRef;
-      if (!cache) throw new Error("cache de blockhash não inicializado neste processo");
-      return cache.getFresh();
-    },
-    signAndSubmit: async ({ transaction, blockhash, sizeSol: cap, maxTipBps }) =>
-      executeWithDecryptedKeypair(async (keypair) => {
-        const tx = transaction as VersionedTransaction;
-        /**
-         * `VersionedTransaction` não tem `recentBlockhash`/`feePayer` no objeto raiz: o
-         * blockhash vive em `message.recentBlockhash` e o fee payer já está na mensagem
-         * (o agregador monta a transação com `userPublicKey` como pagador). Trocar o
-         * blockhash aqui é seguro porque a transação do agregador NÃO vem assinada —
-         * se um dia vier (co-assinatura), o campo `signatures[0]` estaria preenchido e
-         * este ponto precisa ser revisto: alterar a mensagem invalidaria a assinatura
-         * anterior.
-         */
-        if (tx.signatures.length > 0 && tx.signatures.some((sig) => sig.some((b) => b !== 0))) {
-          throw new Error(
-            "transação do agregador já vem assinada: substituir o blockhash invalidaria a assinatura existente"
-          );
-        }
-        tx.message.recentBlockhash = blockhash;
-        tx.sign([keypair]);
-        const signature = bs58.encode(tx.signatures[0]);
-
-        // PERSISTIR ANTES DE TRANSMITIR: se o processo morrer entre assinar e enviar, a
-        // assinatura fica registrada e o próximo boot CONSULTA o status (nunca reconstrói às cegas).
-        entryIntent = advanceIntentOrKeep(
-          entryIntent,
-          "signed",
-          {
-            signature,
-            blockhash,
-            // O orquestrador já recusou antes de chegar aqui se `lastValidBlockHeight <= 0`;
-            // `?? 0` existe só para satisfazer o tipo, e 0 é interpretado como "desconhecido"
-            // pela política de retry (nunca autoriza reconstruir sem prova de expiração).
-            lastValidBlockHeight: depsBlockhashHeight ?? 0,
-          },
-          "entrada real: transação assinada (ainda não transmitida)"
-        );
-
-        const jitoSender = new JitoBundleSender(globalConnection as Connection);
-
-        /**
-         * ENVIO (S8). Com `HFT_PARALLEL_SEND=1`, os MESMOS bytes assinados saem por vários
-         * caminhos ao mesmo tempo: bundle Jito, sender com stake (se configurado) e envio direto
-         * ao RPC (se ligado). O primeiro aceite vence e os perdedores NÃO são cancelados — abortar
-         * um envio que poderia entrar no próximo bloco destruiria o motivo de existir da corrida.
-         *
-         * O que NÃO muda: `ok` continua significando ACEITO, nunca EXECUTADO. A execução só existe
-         * com confirmação e slot observados (`confirm`/`observeFill` abaixo). E assinar continua
-         * sendo UMA vez: paralelizar entrega não duplica ordem — duplicar exige assinar duas vezes,
-         * que o sistema de intenções bloqueia.
-         */
-        const submitJito = () =>
-          jitoSender.submitBundle([tx], keypair, measuredTipSol ?? 0.000_001, blockhash, {
-            capitalCommittedSol: cap,
-            maxTipBps,
-            region: (process.env.JITO_REGION as any) || undefined,
-            purpose: "entry",
-          });
-
-        if (!PARALLEL_SEND.enabled) {
-          const sent = await submitJito();
-          return { ok: sent.success, signature, bundleId: sent.bundleId, tipSol: sent.tipSol, error: sent.error };
-        }
-
-        const transports = [
-          buildJitoTransport(async () => {
-            const res = await submitJito();
-            return { success: res.success, bundleId: res.bundleId, error: res.error };
-          }),
-        ];
-
-        if (PARALLEL_SEND.stakedSenderUrl !== "") {
-          transports.push(
-            buildStakedSenderTransport({
-              url: PARALLEL_SEND.stakedSenderUrl,
-              swqosOnly: PARALLEL_SEND.swqosOnly,
-              rawTransactionBase64: Buffer.from(tx.serialize()).toString("base64"),
-              timeoutMs: PARALLEL_SEND.transportTimeoutMs,
-            })
-          );
-        }
-
-        if (PARALLEL_SEND.rpcDirect) {
-          transports.push(
-            buildRpcDirectTransport(async () => {
-              const conn = globalConnection as Connection | null;
-              if (!conn) throw new Error("RPC indisponível para envio direto");
-              /**
-               * DEFESA EM PROFUNDIDADE: este caminho transmite os mesmos bytes assinados; passar
-               * pelo choke point aqui impede que um chamador futuro construa um envio paralelo
-               * sem a avaliação de kill switch/read-only/cofre.
-               */
-              assertCanSign("entry");
-              const raw = Buffer.from(tx.serialize());
-              await conn.sendRawTransaction(raw, {
-                // Pré-flight já foi feito na simulação do caminho real: repetir custa RTT e pode
-                // falhar por estado local do nó. Repetição é decisão do sistema de intenções.
-                skipPreflight: true,
-                maxRetries: 0,
-                preflightCommitment: "processed",
-              });
-              return "rpc aceitou";
-            })
-          );
-        }
-
-        const race = await sendInParallel({
-          signature,
-          transports,
-          timeoutMs: PARALLEL_SEND.transportTimeoutMs,
-          now: monotonicNow,
-          onAttempt: (attempt) => {
-            /**
-             * Toda tentativa fica registrada — inclusive as que perdem a corrida e chegam depois.
-             * É isto que permite, mais tarde, medir taxa de aceite POR CAMINHO com dado real em vez
-             * de repetir número publicado por terceiro.
-             */
-            dbStore.saveLog({
-              timestamp: new Date().toISOString(),
-              level: attempt.ok ? "INFO" : "WARN",
-              component: "REAL_ENTRY",
-              message:
-                `[S8] transporte ${attempt.transport}: ${attempt.ok ? "ACEITOU" : "recusou/falhou"} ` +
-                `em ${attempt.latencyMs}ms${attempt.error ? ` — ${attempt.error}` : ""}`,
-              correlationId: params.correlationId,
-            });
-          },
-        });
-
-        lastParallelSend = {
-          at: new Date().toISOString(),
-          signature,
-          winner: race.winner,
-          acceptedBy: race.acceptedBy,
-          attempts: race.attempts,
-          ok: race.ok,
-        };
-
-        const jitoAttempt = race.attempts.find((a) => a.transport === "jito");
-        const jitoWon = race.winner === "jito";
-        return {
-          ok: race.ok,
-          signature,
-          // `bundleId` só existe no caminho Jito; quando outro transporte vence, isso é declarado
-          // em vez de reaproveitar um id de bundle que não foi o responsável pelo aceite.
-          bundleId: jitoWon ? "jito" : "",
-          tipSol: jitoAttempt?.ok ? (measuredTipSol ?? 0.000_001) : 0,
-          error: race.ok ? undefined : race.note,
-        };
-      }, "entry"),
-    confirm: async (signature, lastValidBlockHeight, timeoutMs) => {
-      const conn = globalConnection;
-      if (!conn) return { outcome: "unknown" as const, error: "RPC indisponível para confirmar" };
-      const monitor = new ConfirmationMonitor(conn);
-      const res = await monitor.confirmWithRetry(signature, lastValidBlockHeight, timeoutMs, 800);
-      return { outcome: res.outcome, slot: res.slot, error: res.error };
-    },
-    observeFill: async (signature) => {
-      const conn = globalConnection;
-      if (!conn) return { measured: false, tokensReceived: null, feeLamports: null, slot: null, error: "sem conexão RPC" };
-      const tx = await conn.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
-      if (!tx) return { measured: false, tokensReceived: null, feeLamports: null, slot: null, error: "transação não disponível (RPC não a retornou)" };
-      return parseEntryFill({
-        owner: userPublicKey,
-        mint: params.mint,
-        meta: tx.meta as any,
-        slot: tx.slot ?? null,
-      });
-    },
-    now: monotonicNow,
-  };
-
   /**
-   * `depsBlockhashHeight` é lido DENTRO do signAndSubmit — o closure precisa do valor que
-   * veio do `getFreshBlockhash` do orquestrador. Como `RealEntryDeps.signAndSubmit` recebe
-   * `blockhash` mas não `lastValidBlockHeight`, guardamos o par aqui para a intenção.
+   * GUARDA DE ARMAZENAMENTO + VOO ÚNICO ENTRE PROCESSOS (S10) — a última barreira antes de montar
+   * e assinar. Duas perguntas, nesta ordem:
+   *
+   * 1. O armazenamento permite assinar? Com Postgres pedido e banco fora do ar, NÃO: o operador
+   *    acredita ter um árbitro de voo único entre instâncias, e assinar sem ele é assinar
+   *    confiando numa proteção ausente (fail-closed, mesma doutrina do resto do caminho).
+   * 2. Outra instância já está entrando NESTE mint? O claim é atômico (índice único parcial do
+   *    Postgres): exatamente um processo ganha. O perdedor recebe o dono e a expiração — e recusa
+   *    com nome e motivo, não com "erro genérico".
+   *
+   * O claim é liberado no `finally` abaixo (e, em caso de crash, expira pelo TTL).
    */
-  let depsBlockhashHeight: number | null = null;
-  const originalGetFresh = deps.getFreshBlockhash;
-  deps.getFreshBlockhash = async () => {
-    const bh = await originalGetFresh();
-    depsBlockhashHeight = bh.lastValidBlockHeight;
-    return bh;
-  };
-
-  const result = await executeRealEntry(deps, {
-    mint: params.mint,
-    sizeSol,
-    userPublicKey,
-    policy,
-    gate,
-    confirmTimeoutMs: Number(process.env.HFT_ENTRY_CONFIRM_TIMEOUT_MS ?? 30_000),
-  });
-
-  // ── Intenção: estado final coerente com o desfecho ─────────────────────────
-  const intentPatch = { signature: result.signature, blockhash: result.blockhash, lastValidBlockHeight: result.lastValidBlockHeight };
-  if (result.status === "confirmed") {
-    entryIntent = advanceIntentOrKeep(entryIntent, "confirmed", { ...intentPatch, confirmationLevel: "confirmed" }, "entrada real confirmada com slot observado");
-  } else if (result.status === "failed_on_chain" || result.status === "expired" || result.status === "submit_failed" || result.status === "simulation_failed") {
-    entryIntent = advanceIntentOrKeep(entryIntent, "failed", { ...intentPatch, lastError: result.reason }, `entrada real não executou: ${result.status}`);
-  } else if (result.signature) {
-    // unconfirmed/refused-após-assinar: NÃO terminal. A reconciliação por status decide.
-    entryIntent = advanceIntentOrKeep(entryIntent, "submitted", { ...intentPatch, lastError: result.reason }, `entrada real enviada, aguardando reconciliação (${result.status})`);
-  } else {
-    entryIntent = advanceIntentOrKeep(entryIntent, "failed", { lastError: result.reason }, "entrada real não chegou a assinar");
+  const storageHealth = storageRef
+    ? storageRef.health()
+    : { configured: false, connected: false, migrated: false, schemaVersion: null, lastError: null };
+  const storageGuard = decideEntryStorageGuard(STORAGE_POLICY, storageHealth);
+  if (!storageGuard.allowSign) {
+    const refused = refusedRealEntry(params.mint, sizeSol, gate, `${storageGuard.code}: ${storageGuard.detail}`);
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "CRITICAL",
+      component: "REAL_ENTRY",
+      message: `[S10] Entrada recusada pelo armazenamento: ${refused.reason}`,
+      correlationId: params.correlationId,
+    });
+    realEntryHistory.unshift(refused);
+    if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
+    return refused;
   }
 
-  // ── Registro do resultado (trade sempre; posição SÓ com execução observada) ─
-  const tradeStatus = result.confirmedOnChain ? "confirmed" : result.signature ? result.status : "rejected";
-  dbStore.saveTrade({
-    id: result.signature ? `live_${result.signature.slice(0, 16)}` : `live_refused_${Date.now()}`,
-    token: params.tokenName.toUpperCase(),
-    mint: params.mint,
-    amount: `${sizeSol} SOL (REAL)`,
-    outAmount: result.tokensReceived ? `${result.tokensReceived} unidades do mint (medido on-chain)` : "não medido",
-    time: new Date().toTimeString().split(" ")[0] + "." + String(Date.now() % 1000).padStart(3, "0"),
-    latencyMs: Math.round(result.timingsMs.total),
-    status: tradeStatus,
-    block: result.slot ?? 0,
-    tipSol: result.tipSol ?? 0,
-    route: `Jupiter → Jito bundle [${result.routeLabels.join(">") || "rota?"}]${result.confirmedOnChain ? "" : " (SEM confirmação on-chain)"}`,
-    mode: "live" as const,
-    signature: result.signature,
-  } as any);
-
-  if (result.confirmedOnChain && result.slot !== null) {
-    const observedTokens = result.tokensReceived;
-    const entryPrice = observedTokens && Number(observedTokens) > 0 ? sizeSol / (Number(observedTokens) / 1e9) : 0;
-    dbStore.savePosition({
-      id: positionId,
-      token: params.tokenName.toUpperCase(),
-      mint: params.mint,
-      sizeSol,
-      entryPrice,
-      currentPrice: entryPrice,
-      pnlPercent: 0,
-      status: "open",
-      stopLossPercent: -5.0,
-      takeProfitPercent: 15.0,
-      trailingStopActive: true,
-      trailingStopOffsetPercent: 2.5,
-      highestPrice: entryPrice,
-      timeOpened: new Date().toLocaleTimeString(),
-      mode: "live",
-      priceSource: "fill on-chain (pre/postTokenBalances)",
-      signature: result.signature,
-      slot: result.slot,
-      // Honestidade registrada: quando o fill não pôde ser lido, o preço de entrada é 0 e
-      // está declarado — nunca um número plausível inventado.
-      entryPriceMeasured: result.fillMeasured && !!observedTokens,
-      entryPriceNote: result.fillMeasured
-        ? null
-        : `fill não medido (${result.reason ?? "motivo não informado"}) — entryPrice 0 até reconciliar`,
-    } as any);
-
-    recorder.recordPositionLifecycle({
-      positionId,
-      mint: params.mint,
-      token: params.tokenName.toUpperCase(),
-      event: "opened",
-      mode: "live",
-      sizeSol,
-      entryPriceSol: entryPrice,
-      exitPriceSol: null,
-      pnlPercent: null,
-      reason: `entrada real confirmada (slot ${result.slot})`,
-      pnlMeasuredOnChain: result.fillMeasured,
+  let entryClaimId: string | null = null;
+  let entryClaimNote: string | null = null;
+  if (STORAGE_POLICY.mode === "postgres" && storageRef) {
+    const claim = await Promise.race([
+      storageRef.claimEntry({
+        mint: params.mint,
+        side: "entry",
+        payload: { sizeSol, correlationId: params.correlationId, route: (process.env.HFT_ENTRY_ROUTE ?? "aggregator") },
+      }),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), STORAGE_POLICY.claimTimeoutMs)),
+    ]);
+    if (claim === null) {
+      /**
+       * TIMEOUT é recusa, não permissão: um banco lento não pode virar "provavelmente livre, então
+       * assina". Este é o caminho mais tentador de todos para degradar em silêncio.
+       */
+      const refused = refusedRealEntry(
+        params.mint,
+        sizeSol,
+        gate,
+        `STORAGE_CLAIM_TIMEOUT: o claim de voo único não respondeu em ${STORAGE_POLICY.claimTimeoutMs}ms — ` +
+          `entrada recusada para não assinar sem o árbitro entre processos`
+      );
+      realEntryHistory.unshift(refused);
+      if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
+      return refused;
+    }
+    if (!claim.acquired) {
+      const refused = refusedRealEntry(
+        params.mint,
+        sizeSol,
+        gate,
+        `ENTRY_CLAIM_HELD (${claim.reason}): ${claim.detail}`
+      );
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "WARN",
+        component: "REAL_ENTRY",
+        message: `[S10] Voo único NEGADO: ${refused.reason}`,
+        correlationId: params.correlationId,
+      });
+      realEntryHistory.unshift(refused);
+      if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
+      return refused;
+    }
+    entryClaimId = claim.claimId;
+    entryClaimNote = claim.reason;
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "INFO",
+      component: "REAL_ENTRY",
+      message:
+        `[S10] Claim de voo único ADQUIRIDO (${claim.reason}) para ${params.mint.slice(0, 8)}… ` +
+        `expira em ${claim.expiresAt ?? "n/d"} — nenhuma outra instância pode entrar neste mint agora.`,
+      correlationId: params.correlationId,
     });
   }
 
-  dbStore.saveLog({
-    timestamp: new Date().toISOString(),
-    level: result.confirmedOnChain ? "CRITICAL" : result.signature ? "WARN" : "INFO",
-    component: "REAL_ENTRY",
-    message:
-      `[S6] Entrada real ${params.tokenName.toUpperCase()} → status=${result.status}` +
-      (result.signature ? `, assinatura ${result.signature.slice(0, 16)}...` : "") +
-      (result.slot !== null ? `, slot ${result.slot}` : "") +
-      (result.tipSol !== null ? `, tip ${result.tipSol} SOL` : "") +
-      (result.tokensReceived !== null ? `, recebido ${result.tokensReceived}` : "") +
-      `, latência total ${result.timingsMs.total}ms ` +
-      `(quote ${result.timingsMs.quote}/build ${result.timingsMs.build}/sim ${result.timingsMs.simulate}/submit ${result.timingsMs.submit}/confirm ${result.timingsMs.confirm}ms)` +
-      (result.reason ? `. Motivo: ${result.reason}` : "") +
-      (result.status === "submitted_unconfirmed"
-        ? ". ATENÇÃO: aceito pelo block engine e NÃO observado na janela — reconciliar por status antes de assumir posição."
-        : ""),
-    correlationId: params.correlationId,
-  });
+  try {
+    const deps: RealEntryDeps = {
+      assertCanSign: () => assertCanSign("entry"),
+      getQuote: async (mint, sizeLamports, slippageBps, timeoutMs) => {
+        if (entryRoute === "native") {
+          const conn = globalConnection;
+          if (!conn) throw new Error("RPC indisponível (globalConnection nulo): rota nativa exige leitura de conta");
+          const infos = await conn.getMultipleAccountsInfo([
+            new PublicKey(deriveGlobalPda()),
+            new PublicKey(deriveBondingCurvePda(mint)),
+          ]);
+          const [globalInfo, curveInfo] = infos;
+          if (!globalInfo) throw new Error("conta Global do pump não encontrada no RPC configurado");
+          if (!curveInfo) throw new Error("bonding curve não encontrada: mint sem curva ativa (migrado ou inexistente)");
 
-  realEntryHistory.unshift(result);
-  if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
-  return result;
+          const global = parseGlobalAccount(globalInfo.data);
+          const curve = parseBondingCurveAccount(curveInfo.data);
+          if (!global.value) throw new Error(`Global ilegível: ${global.problems.map((p) => p.message).join(" | ")}`);
+          if (!curve.value) throw new Error(`BondingCurve ilegível: ${curve.problems.map((p) => p.message).join(" | ")}`);
+          if (curve.value.complete) throw new Error("curva COMPLETA (token migrado): não se compra na curva neste estado");
+          const solGuard = assertSolQuotedCurve(curve.value.quoteMint);
+          if (!solGuard.ok) throw new Error(solGuard.reason);
+
+          const spendableSolIn = BigInt(sizeLamports);
+          const q = quoteTokensOutExactSolIn({
+            spendableSolIn,
+            virtualTokenReserves: curve.value.virtualTokenReserves,
+            virtualQuoteReserves: curve.value.virtualQuoteReserves,
+            protocolFeeBps: global.value.feeBasisPoints,
+            creatorFeeBps: curve.value.creatorFeeBps,
+          });
+          if (!q) throw new Error("cotação nativa não calculável (reservas/taxas): dado insuficiente para entrar");
+          const minTokensOut = minTokensOutFromSlippage(q.tokensOut, slippageBps);
+          if (minTokensOut <= 0n) throw new Error("min_tokens_out calculado é zero: slippage/taxa anulam a compra");
+
+          nativeContext = { curve: curve.value, feeRecipient: global.value.feeRecipient, minTokensOut, spendableSolIn };
+
+          /**
+           * Impacto MEDIDO da própria curva: preço de execução (net_sol/tokens) contra o preço
+           * spot (reservas virtuais). Não é estimativa de terceiro — é aritmética das reservas
+           * lidas um instante antes. O gate de impacto do realEntry consome este número.
+           */
+          const spot = Number(curve.value.virtualQuoteReserves) / Number(curve.value.virtualTokenReserves);
+          const exec = Number(q.netSol) / Number(q.tokensOut);
+          const impactFraction = spot > 0 ? exec / spot - 1 : 0;
+
+          return {
+            outAmount: q.tokensOut.toString(),
+            priceImpactPct: String(impactFraction),
+            routeLabels: [`pump.fun curva (nativa, ${q.totalFeeBps}bps)`],
+          };
+        }
+
+        const call = await withBudget(
+          budgets.jupiter,
+          // ENTRADA = gastar SOL para receber o mint. Inverter os lados aqui cotaria uma
+          // VENDA do mint com valor lido em lamports — erro que o pré-flight não pegaria
+          // (a simulação de uma venda seria bem-sucedida se houvesse saldo).
+          () => JupiterIntegration.getQuote(SOL_MINT, mint, sizeLamports, slippageBps, timeoutMs ?? 6000),
+          { priority: "normal" }
+        );
+        if (!call.ok) throw new Error(call.skippedReason ?? "cotação bloqueada por orçamento de cota");
+        return call.value as any;
+      },
+      buildSwapTransaction: async (quote, userPk, timeoutMs) => {
+        if (entryRoute === "native") {
+          const ctx = nativeContext;
+          if (!ctx) throw new Error("estado da curva ausente: a cotação nativa precisa rodar antes da montagem");
+          const built = buildPumpBuyExactSolInInstruction({
+            mint: params.mint,
+            user: userPk,
+            feeRecipient: ctx.feeRecipient,
+            creator: ctx.curve.creator,
+            spendableSolIn: ctx.spendableSolIn,
+            minTokensOut: ctx.minTokensOut,
+          });
+          const cuLimit = Number(process.env.HFT_ENTRY_CU_LIMIT ?? 200_000);
+          const cuPrice = Number(process.env.HFT_ENTRY_CU_PRICE_MICROLAMPORTS ?? 0);
+          const ixs = [
+            ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }),
+            ...(cuPrice > 0 ? [ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Math.floor(cuPrice) })] : []),
+            new TransactionInstruction({
+              programId: new PublicKey(built.programId),
+              // `name` é metadado nosso para auditoria; NÃO vai como AccountMeta.
+              keys: built.keys.map((k) => ({
+                pubkey: new PublicKey(k.pubkey),
+                isSigner: k.isSigner,
+                isWritable: k.isWritable,
+              })),
+              data: built.data,
+            }),
+          ];
+          /**
+           * O blockhash de espaço reservado é substituído por um MONITORADO em `signAndSubmit`
+           * (que também assina). Nada é assinado com o valor de espaço reservado: a ordem é
+           * montar → simular (substitui na simulação) → trocar por blockhash fresco → assinar.
+           */
+          const message = new TransactionMessage({
+            payerKey: new PublicKey(userPk),
+            recentBlockhash: SYSTEM_PROGRAM_ID,
+            instructions: ixs,
+          }).compileToV0Message();
+          return new VersionedTransaction(message);
+        }
+        return JupiterIntegration.buildSwapTransaction(quote, userPk, timeoutMs ?? 6000);
+      },
+      simulateTransaction: async (tx) => {
+        const conn = globalConnection;
+        if (!conn) throw new Error("RPC indisponível (globalConnection nulo)");
+        const sim = await conn.simulateTransaction(tx as VersionedTransaction, {
+          commitment: "processed",
+          sigVerify: false,
+          // O blockhash do agregador é substituído por um monitorado na assinatura; simular
+          // contra ele mediria expiração, não programa/compute.
+          replaceRecentBlockhash: true,
+        });
+        return {
+          ok: sim.value.err === null || sim.value.err === undefined,
+          err: sim.value.err,
+          unitsConsumed: sim.value.unitsConsumed ?? null,
+          logsTail: (sim.value.logs ?? []).slice(-5).map((l) => String(l).slice(0, 200)),
+        };
+      },
+      getFreshBlockhash: async () => {
+        const cache = blockhashCacheRef;
+        if (!cache) throw new Error("cache de blockhash não inicializado neste processo");
+        return cache.getFresh();
+      },
+      signAndSubmit: async ({ transaction, blockhash, sizeSol: cap, maxTipBps }) =>
+        executeWithDecryptedKeypair(async (keypair) => {
+          const tx = transaction as VersionedTransaction;
+          /**
+           * `VersionedTransaction` não tem `recentBlockhash`/`feePayer` no objeto raiz: o
+           * blockhash vive em `message.recentBlockhash` e o fee payer já está na mensagem
+           * (o agregador monta a transação com `userPublicKey` como pagador). Trocar o
+           * blockhash aqui é seguro porque a transação do agregador NÃO vem assinada —
+           * se um dia vier (co-assinatura), o campo `signatures[0]` estaria preenchido e
+           * este ponto precisa ser revisto: alterar a mensagem invalidaria a assinatura
+           * anterior.
+           */
+          if (tx.signatures.length > 0 && tx.signatures.some((sig) => sig.some((b) => b !== 0))) {
+            throw new Error(
+              "transação do agregador já vem assinada: substituir o blockhash invalidaria a assinatura existente"
+            );
+          }
+          tx.message.recentBlockhash = blockhash;
+          tx.sign([keypair]);
+          const signature = bs58.encode(tx.signatures[0]);
+
+          // PERSISTIR ANTES DE TRANSMITIR: se o processo morrer entre assinar e enviar, a
+          // assinatura fica registrada e o próximo boot CONSULTA o status (nunca reconstrói às cegas).
+          entryIntent = advanceIntentOrKeep(
+            entryIntent,
+            "signed",
+            {
+              signature,
+              blockhash,
+              // O orquestrador já recusou antes de chegar aqui se `lastValidBlockHeight <= 0`;
+              // `?? 0` existe só para satisfazer o tipo, e 0 é interpretado como "desconhecido"
+              // pela política de retry (nunca autoriza reconstruir sem prova de expiração).
+              lastValidBlockHeight: depsBlockhashHeight ?? 0,
+            },
+            "entrada real: transação assinada (ainda não transmitida)"
+          );
+
+          const jitoSender = new JitoBundleSender(globalConnection as Connection);
+
+          /**
+           * ENVIO (S8). Com `HFT_PARALLEL_SEND=1`, os MESMOS bytes assinados saem por vários
+           * caminhos ao mesmo tempo: bundle Jito, sender com stake (se configurado) e envio direto
+           * ao RPC (se ligado). O primeiro aceite vence e os perdedores NÃO são cancelados — abortar
+           * um envio que poderia entrar no próximo bloco destruiria o motivo de existir da corrida.
+           *
+           * O que NÃO muda: `ok` continua significando ACEITO, nunca EXECUTADO. A execução só existe
+           * com confirmação e slot observados (`confirm`/`observeFill` abaixo). E assinar continua
+           * sendo UMA vez: paralelizar entrega não duplica ordem — duplicar exige assinar duas vezes,
+           * que o sistema de intenções bloqueia.
+           */
+          const submitJito = () =>
+            jitoSender.submitBundle([tx], keypair, measuredTipSol ?? 0.000_001, blockhash, {
+              capitalCommittedSol: cap,
+              maxTipBps,
+              region: (process.env.JITO_REGION as any) || undefined,
+              purpose: "entry",
+            });
+
+          if (!PARALLEL_SEND.enabled) {
+            const sent = await submitJito();
+            return { ok: sent.success, signature, bundleId: sent.bundleId, tipSol: sent.tipSol, error: sent.error };
+          }
+
+          const transports = [
+            buildJitoTransport(async () => {
+              const res = await submitJito();
+              return { success: res.success, bundleId: res.bundleId, error: res.error };
+            }),
+          ];
+
+          if (PARALLEL_SEND.stakedSenderUrl !== "") {
+            transports.push(
+              buildStakedSenderTransport({
+                url: PARALLEL_SEND.stakedSenderUrl,
+                swqosOnly: PARALLEL_SEND.swqosOnly,
+                rawTransactionBase64: Buffer.from(tx.serialize()).toString("base64"),
+                timeoutMs: PARALLEL_SEND.transportTimeoutMs,
+              })
+            );
+          }
+
+          if (PARALLEL_SEND.rpcDirect) {
+            transports.push(
+              buildRpcDirectTransport(async () => {
+                const conn = globalConnection as Connection | null;
+                if (!conn) throw new Error("RPC indisponível para envio direto");
+                /**
+                 * DEFESA EM PROFUNDIDADE: este caminho transmite os mesmos bytes assinados; passar
+                 * pelo choke point aqui impede que um chamador futuro construa um envio paralelo
+                 * sem a avaliação de kill switch/read-only/cofre.
+                 */
+                assertCanSign("entry");
+                const raw = Buffer.from(tx.serialize());
+                await conn.sendRawTransaction(raw, {
+                  // Pré-flight já foi feito na simulação do caminho real: repetir custa RTT e pode
+                  // falhar por estado local do nó. Repetição é decisão do sistema de intenções.
+                  skipPreflight: true,
+                  maxRetries: 0,
+                  preflightCommitment: "processed",
+                });
+                return "rpc aceitou";
+              })
+            );
+          }
+
+          const race = await sendInParallel({
+            signature,
+            transports,
+            timeoutMs: PARALLEL_SEND.transportTimeoutMs,
+            now: monotonicNow,
+            onAttempt: (attempt) => {
+              /**
+               * Toda tentativa fica registrada — inclusive as que perdem a corrida e chegam depois.
+               * É isto que permite, mais tarde, medir taxa de aceite POR CAMINHO com dado real em vez
+               * de repetir número publicado por terceiro.
+               */
+              dbStore.saveLog({
+                timestamp: new Date().toISOString(),
+                level: attempt.ok ? "INFO" : "WARN",
+                component: "REAL_ENTRY",
+                message:
+                  `[S8] transporte ${attempt.transport}: ${attempt.ok ? "ACEITOU" : "recusou/falhou"} ` +
+                  `em ${attempt.latencyMs}ms${attempt.error ? ` — ${attempt.error}` : ""}`,
+                correlationId: params.correlationId,
+              });
+            },
+          });
+
+          lastParallelSend = {
+            at: new Date().toISOString(),
+            signature,
+            winner: race.winner,
+            acceptedBy: race.acceptedBy,
+            attempts: race.attempts,
+            ok: race.ok,
+          };
+
+          const jitoAttempt = race.attempts.find((a) => a.transport === "jito");
+          const jitoWon = race.winner === "jito";
+          return {
+            ok: race.ok,
+            signature,
+            // `bundleId` só existe no caminho Jito; quando outro transporte vence, isso é declarado
+            // em vez de reaproveitar um id de bundle que não foi o responsável pelo aceite.
+            bundleId: jitoWon ? "jito" : "",
+            tipSol: jitoAttempt?.ok ? (measuredTipSol ?? 0.000_001) : 0,
+            error: race.ok ? undefined : race.note,
+          };
+        }, "entry"),
+      confirm: async (signature, lastValidBlockHeight, timeoutMs) => {
+        const conn = globalConnection;
+        if (!conn) return { outcome: "unknown" as const, error: "RPC indisponível para confirmar" };
+        const monitor = new ConfirmationMonitor(conn);
+        const res = await monitor.confirmWithRetry(signature, lastValidBlockHeight, timeoutMs, 800);
+        return { outcome: res.outcome, slot: res.slot, error: res.error };
+      },
+      observeFill: async (signature) => {
+        const conn = globalConnection;
+        if (!conn) return { measured: false, tokensReceived: null, feeLamports: null, slot: null, error: "sem conexão RPC" };
+        const tx = await conn.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+        if (!tx) return { measured: false, tokensReceived: null, feeLamports: null, slot: null, error: "transação não disponível (RPC não a retornou)" };
+        return parseEntryFill({
+          owner: userPublicKey,
+          mint: params.mint,
+          meta: tx.meta as any,
+          slot: tx.slot ?? null,
+        });
+      },
+      now: monotonicNow,
+    };
+
+    /**
+     * `depsBlockhashHeight` é lido DENTRO do signAndSubmit — o closure precisa do valor que
+     * veio do `getFreshBlockhash` do orquestrador. Como `RealEntryDeps.signAndSubmit` recebe
+     * `blockhash` mas não `lastValidBlockHeight`, guardamos o par aqui para a intenção.
+     */
+    let depsBlockhashHeight: number | null = null;
+    const originalGetFresh = deps.getFreshBlockhash;
+    deps.getFreshBlockhash = async () => {
+      const bh = await originalGetFresh();
+      depsBlockhashHeight = bh.lastValidBlockHeight;
+      return bh;
+    };
+
+    const result = await executeRealEntry(deps, {
+      mint: params.mint,
+      sizeSol,
+      userPublicKey,
+      policy,
+      gate,
+      confirmTimeoutMs: Number(process.env.HFT_ENTRY_CONFIRM_TIMEOUT_MS ?? 30_000),
+    });
+
+    // ── Intenção: estado final coerente com o desfecho ─────────────────────────
+    const intentPatch = { signature: result.signature, blockhash: result.blockhash, lastValidBlockHeight: result.lastValidBlockHeight };
+    if (result.status === "confirmed") {
+      entryIntent = advanceIntentOrKeep(entryIntent, "confirmed", { ...intentPatch, confirmationLevel: "confirmed" }, "entrada real confirmada com slot observado");
+    } else if (result.status === "failed_on_chain" || result.status === "expired" || result.status === "submit_failed" || result.status === "simulation_failed") {
+      entryIntent = advanceIntentOrKeep(entryIntent, "failed", { ...intentPatch, lastError: result.reason }, `entrada real não executou: ${result.status}`);
+    } else if (result.signature) {
+      // unconfirmed/refused-após-assinar: NÃO terminal. A reconciliação por status decide.
+      entryIntent = advanceIntentOrKeep(entryIntent, "submitted", { ...intentPatch, lastError: result.reason }, `entrada real enviada, aguardando reconciliação (${result.status})`);
+    } else {
+      entryIntent = advanceIntentOrKeep(entryIntent, "failed", { lastError: result.reason }, "entrada real não chegou a assinar");
+    }
+
+    // ── Registro do resultado (trade sempre; posição SÓ com execução observada) ─
+    const tradeStatus = result.confirmedOnChain ? "confirmed" : result.signature ? result.status : "rejected";
+    dbStore.saveTrade({
+      id: result.signature ? `live_${result.signature.slice(0, 16)}` : `live_refused_${Date.now()}`,
+      token: params.tokenName.toUpperCase(),
+      mint: params.mint,
+      amount: `${sizeSol} SOL (REAL)`,
+      outAmount: result.tokensReceived ? `${result.tokensReceived} unidades do mint (medido on-chain)` : "não medido",
+      time: new Date().toTimeString().split(" ")[0] + "." + String(Date.now() % 1000).padStart(3, "0"),
+      latencyMs: Math.round(result.timingsMs.total),
+      status: tradeStatus,
+      block: result.slot ?? 0,
+      tipSol: result.tipSol ?? 0,
+      route: `Jupiter → Jito bundle [${result.routeLabels.join(">") || "rota?"}]${result.confirmedOnChain ? "" : " (SEM confirmação on-chain)"}`,
+      mode: "live" as const,
+      signature: result.signature,
+    } as any);
+
+    if (result.confirmedOnChain && result.slot !== null) {
+      const observedTokens = result.tokensReceived;
+      const entryPrice = observedTokens && Number(observedTokens) > 0 ? sizeSol / (Number(observedTokens) / 1e9) : 0;
+      dbStore.savePosition({
+        id: positionId,
+        token: params.tokenName.toUpperCase(),
+        mint: params.mint,
+        sizeSol,
+        entryPrice,
+        currentPrice: entryPrice,
+        pnlPercent: 0,
+        status: "open",
+        stopLossPercent: -5.0,
+        takeProfitPercent: 15.0,
+        trailingStopActive: true,
+        trailingStopOffsetPercent: 2.5,
+        highestPrice: entryPrice,
+        timeOpened: new Date().toLocaleTimeString(),
+        mode: "live",
+        priceSource: "fill on-chain (pre/postTokenBalances)",
+        signature: result.signature,
+        slot: result.slot,
+        // Honestidade registrada: quando o fill não pôde ser lido, o preço de entrada é 0 e
+        // está declarado — nunca um número plausível inventado.
+        entryPriceMeasured: result.fillMeasured && !!observedTokens,
+        entryPriceNote: result.fillMeasured
+          ? null
+          : `fill não medido (${result.reason ?? "motivo não informado"}) — entryPrice 0 até reconciliar`,
+      } as any);
+
+      recorder.recordPositionLifecycle({
+        positionId,
+        mint: params.mint,
+        token: params.tokenName.toUpperCase(),
+        event: "opened",
+        mode: "live",
+        sizeSol,
+        entryPriceSol: entryPrice,
+        exitPriceSol: null,
+        pnlPercent: null,
+        reason: `entrada real confirmada (slot ${result.slot})`,
+        pnlMeasuredOnChain: result.fillMeasured,
+      });
+    }
+
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: result.confirmedOnChain ? "CRITICAL" : result.signature ? "WARN" : "INFO",
+      component: "REAL_ENTRY",
+      message:
+        `[S6] Entrada real ${params.tokenName.toUpperCase()} → status=${result.status}` +
+        (result.signature ? `, assinatura ${result.signature.slice(0, 16)}...` : "") +
+        (result.slot !== null ? `, slot ${result.slot}` : "") +
+        (result.tipSol !== null ? `, tip ${result.tipSol} SOL` : "") +
+        (result.tokensReceived !== null ? `, recebido ${result.tokensReceived}` : "") +
+        `, latência total ${result.timingsMs.total}ms ` +
+        `(quote ${result.timingsMs.quote}/build ${result.timingsMs.build}/sim ${result.timingsMs.simulate}/submit ${result.timingsMs.submit}/confirm ${result.timingsMs.confirm}ms)` +
+        (result.reason ? `. Motivo: ${result.reason}` : "") +
+        (result.status === "submitted_unconfirmed"
+          ? ". ATENÇÃO: aceito pelo block engine e NÃO observado na janela — reconciliar por status antes de assumir posição."
+          : ""),
+      correlationId: params.correlationId,
+    });
+
+    realEntryHistory.unshift(result);
+    if (realEntryHistory.length > MAX_REAL_ENTRY_HISTORY) realEntryHistory.pop();
+    return result;
+  } finally {
+    /**
+     * LIBERAÇÃO DO CLAIM. Fica no `finally` de propósito: qualquer saída (confirmado, não
+     * confirmado, recusado, exceção) libera o voo único imediatamente — o TTL existe para CRASH,
+     * não para segurar o mint enquanto o processo está vivo e ocioso.
+     */
+    if (entryClaimId && storageRef) {
+      const liberado = await storageRef.releaseEntryClaim(entryClaimId, {
+        sizeSol,
+        correlationId: params.correlationId,
+        note: entryClaimNote,
+      });
+      if (!liberado) {
+        console.warn(
+          `[S10] Claim ${entryClaimId.slice(0, 8)}… NÃO foi liberado (expirado ou já liberado). ` +
+            `Ele expira pelo TTL e outro processo o retoma — nenhuma ação necessária.`
+        );
+      }
+    }
+  }
 }
 
 /**
@@ -5571,7 +5725,10 @@ app.post("/api/real-entry", async (req, res) => {
   const gate = assessEntryGate(gateInput);
 
   if (!gate.allowed) {
-    return res.status(409).json({ refused: true, gate, reason: refusedRealEntry(mint, sizeSol, gate).reason });
+    // A pré-checagem evita trabalho, mas a recusa precisa deixar rastro: sem isso o log de decisão
+    // ficaria vazio justamente quando alguém tentou operar com o caminho desligado.
+    const refused = registrarRecusaDeEntrada(refusedRealEntry(mint, sizeSol, gate), null);
+    return res.status(409).json({ refused: true, gate, reason: refused.reason });
   }
 
   const correlationId = `corr_realentry_${mint.slice(0, 8)}_${Date.now()}`;
@@ -5635,6 +5792,100 @@ app.get("/api/real-entry", (_req, res) => {
       costs: "o fill real é lido de pre/postTokenBalances da transação confirmada (parseEntryFill)",
       landing: "getBundleStatuses/getInflightBundleStatuses reconciliam 'aceito' × 'executado'",
     },
+  });
+});
+
+/**
+ * GET /api/performance (S9) — VALIDAÇÃO ESTATÍSTICA do que foi operado.
+ *
+ * Responde à pergunta que o operador realmente faz ("isso está funcionando?") sem permitir a
+ * resposta fácil: o veredito sai do conjunto de desfechos com **PnL líquido medido on-chain**, e
+ * tudo o que ficou de fora é contado com o motivo. Nada aqui é estimado: os campos que não foram
+ * medidos vêm `null` e o texto diz por quê.
+ *
+ * Fonte de dados: Postgres quando ativo (histórico completo até `HFT_STORAGE_HISTORY_LIMIT`), senão
+ * o JSON local — que guarda no máximo 50 trades. A resposta DECLARA a fonte e se houve truncamento,
+ * porque uma métrica sobre 50 trades truncados não é a métrica da operação inteira.
+ */
+app.get("/api/performance", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit ?? 1000) || 1000, 10_000);
+  const tradesJson = dbStore.getTrades();
+  const positionsJson = dbStore.getPositions();
+
+  let trades: any[] = tradesJson;
+  let sourceName = "json local";
+  let truncated = false;
+  let note =
+    "fonte local: o arquivo JSON mantém no MÁXIMO 50 trades — histórico truncado por construção. " +
+    "Ligue HFT_STORAGE=postgres para o histórico completo.";
+  if (STORAGE_POLICY.mode === "postgres" && storageRef && storageRef.health().connected) {
+    try {
+      const doBanco = await storageRef.fetchTrades({ limit });
+      trades = doBanco;
+      sourceName = "postgres";
+      truncated = doBanco.length >= limit;
+      note =
+        "fonte: banco (espelho de escrita). trades lidos: " + doBanco.length +
+        (truncated ? ` (LIMITE de ${limit} atingido — refine com ?limit=)` : "");
+    } catch (err: any) {
+      note = `banco configurado mas a leitura falhou (${err?.message ?? err}): caindo para o JSON local`;
+    }
+  }
+
+  const labeled = labelAll(trades as any, positionsJson as any);
+  const report = buildValidationReport({
+    labeled,
+    source: {
+      name: sourceName,
+      tradesRead: trades.length,
+      positionsRead: positionsJson.length,
+      truncated,
+      note,
+    },
+  });
+  return res.json(report);
+});
+
+/**
+ * GET /api/storage (S10) — qual modo de persistência está ativo, e o que ele garante.
+ *
+ * `guarantee` é a parte que interessa: em JSON o voo único vale POR PROCESSO (duas instâncias na
+ * mesma carteira não se enxergam); em Postgres vale ENTRE processos, por claim com expiração.
+ */
+app.get("/api/storage", async (_req, res) => {
+  const health = storageRef ? storageRef.health() : null;
+  let counts: any = null;
+  let claims: any[] = [];
+  if (storageRef && health?.connected) {
+    try {
+      counts = await storageRef.counts();
+      claims = await storageRef.listActiveClaims();
+    } catch (err: any) {
+      counts = { error: err?.message ?? String(err) };
+    }
+  }
+  const guard = decideEntryStorageGuard(STORAGE_POLICY, {
+    configured: health?.configured ?? false,
+    connected: health?.connected ?? false,
+    migrated: health?.migrated ?? false,
+    schemaVersion: health?.schemaVersion ?? null,
+    lastError: health?.lastError ?? null,
+  });
+  return res.json({
+    policy: STORAGE_POLICY,
+    notes: describeStoragePolicy(STORAGE_POLICY),
+    health,
+    counts,
+    activeClaims: claims,
+    entryGuard: guard,
+    guarantee:
+      STORAGE_POLICY.mode === "postgres"
+        ? "voo único ENTRE PROCESSOS (claim atômico com TTL) + histórico durável espelhado"
+        : "voo único POR PROCESSO (memória) — duas instâncias na mesma carteira NÃO se enxergam; " +
+          "histórico local limitado a 50 trades",
+    jsonRemains: dbStore.hasWriteThrough()
+      ? "o JSON local continua sendo escrito em paralelo (um banco fora do ar degrada, não apaga)"
+      : "sem espelho ativo: somente o JSON local é escrito",
   });
 });
 
@@ -7354,6 +7605,73 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
 async function startServer() {
   // Start High-Performance trading systems asynchronously to prevent blocking server port binding
   (async () => {
+    /**
+     * ARMAZENAMENTO (S10) — antes de qualquer coisa que possa assinar. Política:
+     *  - JSON (default): nada a fazer, comportamento idêntico ao anterior;
+     *  - Postgres pedido e mal configurado (sem DATABASE_URL) → FATAL, porque o operador acredita
+     *    num guarda de voo único entre processos que não existe;
+     *  - Postgres inacessível ou schema atrás → tenta migrar; se ainda assim não estiver pronto,
+     *    FATAL. Subir sem o árbitro que o operador acha que tem é pior do que não subir.
+     */
+    for (const note of describeStoragePolicy(STORAGE_POLICY)) {
+      const fatal = note.startsWith("ATENÇÃO:") && STORAGE_POLICY.requestedPostgres;
+      if (fatal) console.error(`[Boot][Storage] ${note}`);
+      else console.log(`[Boot][Storage] ${note}`);
+    }
+    if (STORAGE_POLICY.requestedPostgres && STORAGE_POLICY.blockers.length > 0) {
+      console.error(
+        "[Boot][Storage][FATAL] HFT_STORAGE=postgres está PEDIDO mas não está operacional: " +
+          STORAGE_POLICY.blockers.join(" | ") +
+          ". Corrija a configuração ou volte para HFT_STORAGE=json (o JSON não precisa de banco)."
+      );
+      process.exit(1);
+    }
+    if (STORAGE_POLICY.mode === "postgres") {
+      try {
+        const client = await loadPgClient((process.env.DATABASE_URL ?? "").trim());
+        const storage = new PostgresStorage(client, STORAGE_POLICY);
+        storageRef = storage;
+        let health = await storage.initialize();
+        if (health.connected && !health.migrated) {
+          console.warn(
+            `[Boot][Storage] schema em ${health.schemaVersion ?? "ausente"} < ${"esperado"}: ` +
+              `aplicando migrações (idempotentes, somente aditivas)...`
+          );
+          const res = await storage.migrate();
+          health = storage.health();
+          console.log(`[Boot][Storage] migrações aplicadas: [${res.applied.join(", ") || "nenhuma"}]`);
+        }
+        if (!health.connected || !health.migrated) {
+          console.error(
+            `[Boot][Storage][FATAL] Postgres pedido e NÃO pronto (connected=${health.connected}, ` +
+              `migrated=${health.migrated}, erro=${health.lastError ?? "n/a"}). ` +
+              `Sem o banco, o voo único entre processos não existe — e assinar sem ele é assinar ` +
+              `confiando numa proteção ausente.`
+          );
+          process.exit(1);
+        }
+        const counts = await storage.counts();
+        console.log(
+          `[Boot][Storage] Postgres pronto: schema v${health.schemaVersion}, ` +
+            `${counts.trades} trade(s), ${counts.positions} posição(ões), ` +
+            `${counts.intents} intenção(ões), ${counts.activeClaims} claim(s) ativo(s).`
+        );
+        // ESPELHO: cada gravação local vai também para o banco (o JSON continua sendo escrito).
+        dbStore.setWriteThrough({
+          mirrorTrade: (trade) => void storage.mirrorTrade(trade as any),
+          mirrorPosition: (pos) => void storage.mirrorPosition(pos as any),
+          mirrorIntent: (intent) => void storage.mirrorIntent(intent as any),
+          mirrorLog: (log) => void storage.mirrorLog(log as any),
+        });
+      } catch (err: any) {
+        console.error(
+          `[Boot][Storage][FATAL] Falha ao inicializar o Postgres: ${err?.message ?? err}. ` +
+            `HFT_STORAGE=postgres exige banco operacional; use HFT_STORAGE=json para operar sem banco.`
+        );
+        process.exit(1);
+      }
+    }
+
     // Inicialização do cofre de chaves. Erro de CONFIGURAÇÃO de custódia é FATAL:
     // subir com carteira aleatória (ou sem carteira) significa exibir um endereço que não
     // é o do operador — e fundos enviados a ele são irrecuperáveis.
@@ -7714,9 +8032,34 @@ async function startServer() {
     } catch (err: any) {
       console.warn("[Shutdown] Falha ao encerrar o fast path gRPC:", err?.message ?? err);
     }
+    /**
+     * ARMAZENAMENTO: libera os claims DESTA instância e fecha o pool. O encerramento espera isto
+     * antes de sair (com o teto de 5s logo abaixo como rede de segurança): sem liberar, um restart
+     * deixaria o voo único preso até o TTL — e o TTL existe para CRASH, não para desligamento normal.
+     *
+     * A liberação usa o `claimId` (não o mint): só quem detém o claim pode liberá-lo, senão um
+     * processo que perdeu o claim por expiração liberaria o claim de OUTRO e abriria a porta para
+     * duas entradas simultâneas.
+     */
+    const encerrarArmazenamento = async (): Promise<void> => {
+      const storage = storageRef;
+      if (!storage) return;
+      try {
+        const owner = storage.health().owner;
+        for (const claim of await storage.listActiveClaims()) {
+          if (claim.owner !== owner) continue;
+          await storage.releaseEntryClaim(claim.claimId, { note: `liberado no encerramento (${signal})` });
+        }
+      } catch (err: any) {
+        console.warn("[Shutdown] Falha ao liberar claims:", err?.message ?? err);
+      }
+      await storage.close();
+    };
     httpServer.close(() => {
-      console.log("[Shutdown] HTTP encerrado. Nada ficou pendente.");
-      process.exit(0);
+      void encerrarArmazenamento().finally(() => {
+        console.log("[Shutdown] HTTP encerrado e armazenamento liberado. Nada ficou pendente.");
+        process.exit(0);
+      });
     });
     // Rede de segurança: se algum socket pendurar o fechamento, não ficamos presos.
     setTimeout(() => process.exit(0), 5_000).unref?.();
