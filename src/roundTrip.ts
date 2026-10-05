@@ -28,6 +28,10 @@
  * — diferente de comparar o saldo da carteira antes e depois, que é exato apenas se a carteira
  * estiver dedicada a esta operação durante a janela.
  *
+ * O RENT da conta de token entra nessa conta pela via natural: é debitado na transação de entrada
+ * (criação da ATA) e devolvido na de saída, se a conta for fechada. Se sobrar conta vazia aberta, o
+ * custo aparece no PnL do ciclo — que é exatamente onde ele deve aparecer.
+ *
  * ## Como funciona
  *
  * 1. `parseTransactionLeg` — função PURA: recebe a resposta de `getTransaction` e devolve a
