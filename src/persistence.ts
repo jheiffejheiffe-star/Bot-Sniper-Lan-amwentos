@@ -32,11 +32,50 @@ export interface DBTrade {
   /** Assinatura on-chain real. `null` em paper trades (nunca preenchida com texto). */
   signature?: string | null;
   /** PnL líquido medido por delta de saldo (SOL). Ausente quando não medido. */
+  /**
+   * PROCEDÊNCIA DO PnL (S11). `pnlNetSol` sozinho não diz se o número é o lucro do CICLO (entrada +
+   * saída) ou apenas a receita da venda — e a diferença é o tamanho da posição em toda operação.
+   * Este campo viaja com o resultado para que o rótulo (S9) possa exigir as duas pernas.
+   */
+  pnlBasis?: "round_trip_legs" | "round_trip_legs_window_conflict" | "exit_leg_only" | "incomplete";
+  /**
+   * RECEITA DA VENDA em SOL (só a perna de saída medida). Não é PnL e nunca entra na validação:
+   * existe para diagnóstico e para fechar o laço quando a perna de entrada for recuperada depois.
+   */
+  saleProceedsSol?: number;
+  /** Divergência entre a janela de saldos e a soma das pernas, em SOL (auditoria). */
+  windowConflictSol?: number;
+  /** Ver a observação em `pnlBasis`: procedência viaja junto com o número. */
   pnlNetSol?: number;
   /** Fee de rede paga (SOL). */
   feesSol?: number;
   /** true somente quando o resultado foi derivado de saldos on-chain confirmados. */
   measuredOnChain?: boolean;
+}
+
+/**
+ * Economia de UMA transação (perna do ciclo), medida nos saldos da própria transação.
+ *
+ * Fica gravada na POSIÇÃO (campo `entryLeg`) no momento da confirmação da compra: sem isso, a saída
+ * não teria como saber quanto custou a entrada e todo "PnL" voltaria a ser a receita da venda.
+ * Campo opcional porque posições abertas antes desta versão não têm a perna gravada — nesse caso o
+ * ciclo é declarado NÃO MEDIDO em vez de estimado.
+ */
+export interface LegRecord {
+  signature: string | null;
+  measured: boolean;
+  /** Δ SOL da carteira nesta transação, em lamports. */
+  solDeltaLamports: number | null;
+  /** Saldo da carteira antes/depois desta transação (lamports) — permitem a conferência de janela. */
+  preLamports: number | null;
+  postLamports: number | null;
+  feeLamports: number | null;
+  tokenDeltaRaw: string | null;
+  slot: number | null;
+  onChainError: string | null;
+  error: string | null;
+  /** Quando a medição foi feita (ISO). */
+  measuredAt: string;
 }
 
 export interface DBPosition {
@@ -123,6 +162,11 @@ export interface DBPosition {
   phantomConfirmations?: number;
   /** Intenção de execução que originou/gerencia esta posição (rastreabilidade). */
   executionIntentId?: string | null;
+  /**
+   * PERNA DE ENTRADA medida on-chain (S11). É o que permite calcular o PnL do CICLO na saída.
+   * Ausente em posições abertas antes desta versão: nelas o ciclo é declarado não medido.
+   */
+  entryLeg?: LegRecord | null;
 }
 
 export interface DBOperationalState {

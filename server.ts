@@ -224,7 +224,8 @@ import {
   getActiveWalletPublicKey,
   executeWithDecryptedKeypair
 } from "./src/security.js";
-import { dbStore } from "./src/persistence.js";
+import { dbStore, type LegRecord } from "./src/persistence.js";
+import { computeRoundTrip, parseTransactionLeg, unmeasuredLeg } from "./src/roundTrip.js";
 
 const app = express();
 const PORT = 3000;
@@ -2163,10 +2164,12 @@ app.post("/api/positions/close", async (req, res) => {
     const outSol = parseFloat(quoteData.outAmount) / 1e9;
     const latencyMs = Date.now() - triggerTime;
 
-    // PnL MEDIDO, não estimado: lê o delta real de SOL da carteira na transação
-    // confirmada (inclui tip, priority fee e base fee). O valor da cotação serve
-    // apenas como referência de "sem atrito".
-    const economics = await measureExitEconomics(signature, walletPublicKey);
+    /**
+     * PnL DO CICLO (S11): combina a perna de ENTRADA (gravada na posição na confirmação da compra)
+     * com a perna de SAÍDA (esta transação). O valor da cotação serve apenas como referência de
+     * "sem atrito"; o número que vale é o ΔSOL medido nas duas transações.
+     */
+    const { economics: pernaSaida, ciclo } = await measureRoundTrip(pos, signature, null);
 
     const realCloseTx = {
       id: `txn_manual_exit_${Date.now()}`,
@@ -2179,11 +2182,16 @@ app.post("/api/positions/close", async (req, res) => {
       status: "success" as const,
       block: finalSlot,
       tipSol: jitoTip,
-      route: `KMS Manual Jito Exit${economics.measured ? "" : " (PnL não medido on-chain)"}`,
+      route: `KMS Manual Jito Exit${ciclo.measured ? "" : ` (PnL do ciclo NÃO apurado: ${ciclo.basis})`}`,
       signature,
-      pnlNetSol: economics.measured ? economics.solDeltaSol : undefined,
-      feesSol: economics.measured ? economics.feeSol : undefined,
-      measuredOnChain: economics.measured,
+      // PnL só quando as DUAS pernas foram medidas. Valor parcial vai em `saleProceedsSol`,
+      // com nome próprio, para nunca ser lido como lucro.
+      pnlNetSol: ciclo.measured ? (ciclo.pnlNetSol as number) : undefined,
+      saleProceedsSol: pernaSaida.measured && pernaSaida.solDeltaLamports !== null ? pernaSaida.solDeltaLamports / 1e9 : undefined,
+      feesSol: pernaSaida.measured && pernaSaida.feeLamports !== null ? pernaSaida.feeLamports / 1e9 : undefined,
+      measuredOnChain: pernaSaida.measured,
+      pnlBasis: ciclo.basis,
+      windowConflictSol: ciclo.windowConflict ? (ciclo.discrepancySol as number) : undefined,
       mode: "live" as const,
     };
 
@@ -2208,16 +2216,23 @@ app.post("/api/positions/close", async (req, res) => {
       sizeSol: pos.sizeSol,
       entryPriceSol: pos.entryPrice ?? null,
       exitPriceSol: outSol,
-      pnlPercent: economics.measured && pos.sizeSol > 0 ? (economics.solDeltaSol / pos.sizeSol) * 100 : null,
+      pnlPercent: ciclo.measured && pos.sizeSol > 0 ? ((ciclo.pnlNetSol as number) / pos.sizeSol) * 100 : null,
       reason: "manual-exit",
-      pnlMeasuredOnChain: economics.measured,
+      pnlMeasuredOnChain: ciclo.measured,
     });
 
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
       level: "SUCCESS",
       component: "RISK_ENGINE",
-      message: `[MANUAL EXIT CONFIRMADO REAL] Posição de $${pos.token} encerrada on-chain com sucesso no bloco #${finalSlot}! Retornado: ${outSol.toFixed(4)} SOL.`,
+      message:
+        `[MANUAL EXIT CONFIRMADO REAL] Posição de $${pos.token} encerrada on-chain no bloco #${finalSlot}! ` +
+        `Bruto cotado: ${outSol.toFixed(4)} SOL. ` +
+        (ciclo.measured
+          ? `PnL LÍQUIDO DO CICLO (entrada + saída, medido): ${(ciclo.pnlNetSol as number) >= 0 ? "+" : ""}${(ciclo.pnlNetSol as number).toFixed(6)} SOL ` +
+            `(custo de entrada: ${(ciclo.entryCostSol as number).toFixed(6)} SOL; receita da venda: ${(ciclo.exitProceedsSol as number).toFixed(6)} SOL). ` +
+            ciclo.notes.join(" ")
+          : `PnL do ciclo NÃO APURADO (${ciclo.basis}): ${ciclo.reasons.join("; ")}.`),
       correlationId
     });
 
@@ -5625,6 +5640,34 @@ async function runRealEntry(params: {
     if (result.confirmedOnChain && result.slot !== null) {
       const observedTokens = result.tokensReceived;
       const entryPrice = observedTokens && Number(observedTokens) > 0 ? sizeSol / (Number(observedTokens) / 1e9) : 0;
+
+      /**
+       * PERNA DE ENTRADA MEDIDA (S11) — o elo que faltava para existir PnL de ciclo.
+       *
+       * A compra já está CONFIRMADA neste ponto, então ler a transação com `getTransaction`
+       * (`confirmed`) não atrasa nenhuma decisão: não há transação pendente esperando por isto. O
+       * que não podia continuar era a saída descobrir o custo da entrada por adivinhação — sem esta
+       * medição, o "PnL" da venda é receita bruta e o ciclo inteiro fica sem número.
+       *
+       * Falha aqui NÃO impede a posição de existir: a perna sai `measured: false` com o motivo, e a
+       * saída declara o ciclo como não apurado em vez de estimar.
+       */
+      const pernaEntrada = result.signature
+        ? await measureLeg(result.signature, getActiveWalletPublicKey(), params.mint)
+        : null;
+      if (pernaEntrada) {
+        dbStore.saveLog({
+          timestamp: new Date().toISOString(),
+          level: pernaEntrada.measured ? "INFO" : "WARN",
+          component: "REAL_ENTRY",
+          message: pernaEntrada.measured
+            ? `[S11] perna de ENTRADA medida on-chain: Δ ${(pernaEntrada.solDeltaLamports as number) / 1e9 >= 0 ? "+" : ""}${((pernaEntrada.solDeltaLamports as number) / 1e9).toFixed(9)} SOL ` +
+              `(fee ${pernaEntrada.feeLamports ?? "n/d"} lamports). Com a perna de saída, o PnL do ciclo passa a ser apurado medido.`
+            : `[S11] perna de ENTRADA NÃO medida (${pernaEntrada.error}): o ciclo desta posição será declarado NÃO apurado na saída.`,
+          correlationId: params.correlationId,
+        });
+      }
+
       dbStore.savePosition({
         id: positionId,
         token: params.tokenName.toUpperCase(),
@@ -5647,6 +5690,7 @@ async function runRealEntry(params: {
         // Honestidade registrada: quando o fill não pôde ser lido, o preço de entrada é 0 e
         // está declarado — nunca um número plausível inventado.
         entryPriceMeasured: result.fillMeasured && !!observedTokens,
+        entryLeg: pernaEntrada,
         entryPriceNote: result.fillMeasured
           ? null
           : `fill não medido (${result.reason ?? "motivo não informado"}) — entryPrice 0 até reconciliar`,
@@ -6974,57 +7018,104 @@ async function fetchJupiterSwapWithRetry(quoteResponse: any, userPublicKeyStr: s
 }
 
 /**
- * Mede o resultado REAL de uma saída a partir da transação confirmada.
+ * MEDE UMA PERNA do ciclo (uma transação confirmada) — entrada ou saída (S11).
  *
- * Por que isto existe: o código anterior reportava "PnL Realizado" calculado sobre o
- * `outAmount` da COTAÇÃO da Jupiter. Cotação não é fill: ignora slippage efetivo,
- * Jito tip, priority fee, base fee e taxas da AMM. Em posições pequenas, esses custos
- * (tip fixo de 0.003 SOL = 300 bps em 0.1 SOL) dominam o resultado.
+ * Por que isto existe: o extrator anterior lia o ΔSOL da **transação de saída** e gravava esse
+ * número como `pnlNetSol` com `measuredOnChain: true`. Esse delta é a RECEITA DA VENDA — o crédito
+ * da venda menos fee/tip dela — e não contém o que foi pago na compra. O efeito é do TAMANHO DA
+ * POSIÇÃO em toda operação e sempre para cima: uma compra de 0,01 SOL que vende por 0,02 SOL era
+ * reportada como "+0,02 SOL de PnL líquido medido", quando o lucro do ciclo era +0,01 SOL. Como o
+ * número vinha marcado como medido, entrava na validação estatística como desfecho confiável.
  *
- * Aqui lemos `preBalances`/`postBalances` da carteira na transação confirmada. Isto é
- * o fluxo de caixa efetivo, incluindo TODOS os custos. É a única medida em que confiamos.
+ * A medição por PERNA é feita nos saldos da própria transação (`parseTransactionLeg`, puro) e a
+ * combinação das duas pernas é a conta do ciclo (`computeRoundTrip`). `getTransaction` exige
+ * commitment `confirmed` ou `finalized` (o RPC recusa `processed`), então isto roda DEPOIS da
+ * confirmação — nunca no caminho crítico da decisão de vender.
  */
-async function measureExitEconomics(
+async function measureLeg(
   signature: string,
-  wallet: PublicKey
-): Promise<{ measured: boolean; solDeltaSol: number; feeSol: number; error?: string }> {
+  wallet: PublicKey,
+  mint: string
+): Promise<ReturnType<typeof parseTransactionLeg>> {
   const conn = globalConnection;
-  if (!conn) return { measured: false, solDeltaSol: 0, feeSol: 0, error: "sem conexão RPC" };
+  if (!conn) return unmeasuredLeg(signature, "sem conexão RPC");
   try {
     const tx = await conn.getTransaction(signature, {
       commitment: "confirmed",
       maxSupportedTransactionVersion: 0,
     });
-    if (!tx || !tx.meta) {
-      return { measured: false, solDeltaSol: 0, feeSol: 0, error: "transação não retornada pelo RPC" };
-    }
-
-    let index = -1;
-    const message: any = tx.transaction.message;
-    if (typeof message.getAccountKeys === "function") {
-      const keys = message.getAccountKeys({ accountKeysFromLookups: tx.meta.loadedAddresses });
-      for (let i = 0; i < keys.length; i++) {
-        if (keys.get(i)?.equals(wallet)) {
-          index = i;
-          break;
-        }
-      }
-    } else {
-      index = message.staticAccountKeys.findIndex((k: PublicKey) => k.equals(wallet));
-    }
-
-    if (index < 0 || !tx.meta.preBalances || !tx.meta.postBalances) {
-      return { measured: false, solDeltaSol: 0, feeSol: 0, error: "carteira não localizada nos saldos da tx" };
-    }
-
-    return {
-      measured: true,
-      solDeltaSol: (tx.meta.postBalances[index] - tx.meta.preBalances[index]) / 1_000_000_000,
-      feeSol: (tx.meta.fee || 0) / 1_000_000_000,
-    };
+    if (!tx) return unmeasuredLeg(signature, "transação não retornada pelo RPC (histórico indisponível?)");
+    return parseTransactionLeg(wallet.toBase58(), mint, tx);
   } catch (err: any) {
-    return { measured: false, solDeltaSol: 0, feeSol: 0, error: err.message };
+    return unmeasuredLeg(signature, err?.message ?? String(err));
   }
+}
+
+/** Saldo da carteira em lamports (usado SÓ na conferência opcional por janela). */
+async function walletLamportsNow(): Promise<number | null> {
+  const conn = globalConnection;
+  if (!conn) return null;
+  try {
+    return await conn.getBalance(getActiveWalletPublicKey(), "confirmed");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * PnL DO CICLO COMPLETO de uma posição real (S11).
+ *
+ * Combina a perna de ENTRADA (gravada na posição no momento da confirmação da compra) com a perna
+ * de SAÍDA (a transação que acabou de confirmar). Sem as duas, `pnlNetSol` é `null` — nunca a
+ * receita da venda disfarçada de lucro.
+ *
+ * A conferência por janela de saldos é OPCIONAL (`HFT_PNL_WINDOW_CHECK=1`) porque custa duas
+ * chamadas `getBalance` (RTT) no caminho da saída; o PnL por perna é exato sem ela.
+ */
+async function measureRoundTrip(
+  pos: { entryLeg?: LegRecord | null; mint: string },
+  exitSignature: string,
+  exitWalletLamportsBefore: number | null
+): Promise<ReturnType<typeof parseTransactionLeg> extends never ? never : {
+  economics: ReturnType<typeof parseTransactionLeg>;
+  ciclo: ReturnType<typeof computeRoundTrip>;
+}> {
+  const wallet = getActiveWalletPublicKey();
+  const economics = await measureLeg(exitSignature, wallet, pos.mint);
+  const pernaEntrada = pos.entryLeg ?? null;
+
+  const querJanela = process.env.HFT_PNL_WINDOW_CHECK === "1";
+  const depois = querJanela && exitWalletLamportsBefore !== null ? await walletLamportsNow() : null;
+
+  const ciclo = computeRoundTrip({
+    entry: pernaEntrada
+      ? {
+          signature: pernaEntrada.signature,
+          measured: pernaEntrada.measured,
+          solDeltaLamports: pernaEntrada.solDeltaLamports,
+          preLamports: pernaEntrada.preLamports,
+          postLamports: pernaEntrada.postLamports,
+          feeLamports: pernaEntrada.feeLamports,
+          tokenDeltaRaw: pernaEntrada.tokenDeltaRaw,
+          slot: pernaEntrada.slot,
+          onChainError: pernaEntrada.onChainError,
+          error: pernaEntrada.error,
+        }
+      : null,
+    exit: economics,
+    /**
+     * Tamanho da posição = tokens RECEBIDOS na entrada (medidos on-chain, mesmo extrator da perna).
+     * Sem isso não há como distinguir venda parcial de venda total — e uma venda parcial tratada
+     * como total "fecha" uma posição que ainda tem exposição.
+     */
+    positionTokensRaw: pernaEntrada?.tokenDeltaRaw ?? null,
+    walletLamportsBefore: querJanela ? exitWalletLamportsBefore : null,
+    walletLamportsAfter: querJanela ? depois : null,
+  });
+  if (querJanela && exitWalletLamportsBefore === null) {
+    ciclo.notes.push("conferência por janela pedida, mas o saldo da carteira antes da saída não foi lido — janela não conferida.");
+  }
+  return { economics, ciclo };
 }
 
 async function executeAutonomousExit(pos: any, reason: string, pnlPercent: number, correlationId: string): Promise<void> {
@@ -7414,8 +7505,11 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     // Amostra de latência da SAÍDA bem-sucedida: recebimento do gatilho -> confirmação.
     telemetry.record(trace.toRecord("executed"));
 
-    // PnL MEDIDO a partir do delta real de SOL da carteira na tx confirmada.
-    const economics = await measureExitEconomics(signature, walletPublicKey);
+    /**
+     * PnL DO CICLO (S11): perna de entrada (gravada na posição) + perna de saída (esta transação).
+     * Substitui a leitura do ΔSOL da venda, que media RECEITA e era gravada como lucro.
+     */
+    const { economics: pernaSaida, ciclo } = await measureRoundTrip(pos, signature, null);
 
     const realCloseTx = {
       id: signature, // Assinatura real da transação na blockchain
@@ -7428,11 +7522,14 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       status: "success" as const,
       block: finalSlot,
       tipSol: jitoTip,
-      route: `KMS Real Exit Jito (${reason})${economics.measured ? "" : " (PnL não medido on-chain)"}`,
+      route: `KMS Real Exit Jito (${reason})${ciclo.measured ? "" : ` (PnL do ciclo NÃO apurado: ${ciclo.basis})`}`,
       signature,
-      pnlNetSol: economics.measured ? economics.solDeltaSol : undefined,
-      feesSol: economics.measured ? economics.feeSol : undefined,
-      measuredOnChain: economics.measured,
+      pnlNetSol: ciclo.measured ? (ciclo.pnlNetSol as number) : undefined,
+      saleProceedsSol: pernaSaida.measured && pernaSaida.solDeltaLamports !== null ? pernaSaida.solDeltaLamports / 1e9 : undefined,
+      feesSol: pernaSaida.measured && pernaSaida.feeLamports !== null ? pernaSaida.feeLamports / 1e9 : undefined,
+      measuredOnChain: pernaSaida.measured,
+      pnlBasis: ciclo.basis,
+      windowConflictSol: ciclo.windowConflict ? (ciclo.discrepancySol as number) : undefined,
       mode: "live" as const,
     };
 
@@ -7457,9 +7554,9 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       sizeSol: pos.sizeSol,
       entryPriceSol: pos.entryPrice ?? null,
       exitPriceSol: rawAmount > 0 ? outSol / (rawAmount / Math.pow(10, decimals)) : null,
-      pnlPercent: economics.measured && pos.sizeSol > 0 ? (economics.solDeltaSol / pos.sizeSol) * 100 : null,
+      pnlPercent: ciclo.measured && pos.sizeSol > 0 ? ((ciclo.pnlNetSol as number) / pos.sizeSol) * 100 : null,
       reason,
-      pnlMeasuredOnChain: economics.measured,
+      pnlMeasuredOnChain: ciclo.measured,
     });
 
     dbStore.saveLog({
@@ -7469,11 +7566,16 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       message:
         `[AUTO-EXIT CONFIRMADO] Posição de $${pos.token} liquidada on-chain no bloco #${finalSlot}. ` +
         `Bruto cotado: ${outSol.toFixed(4)} SOL. ` +
-        (economics.measured
-          ? `PnL LÍQUIDO MEDIDO on-chain (delta de saldo): ${economics.solDeltaSol >= 0 ? "+" : ""}${economics.solDeltaSol.toFixed(6)} SOL ` +
-            `(fees de rede: ${economics.feeSol.toFixed(6)} SOL; tip: ${jitoTip.toFixed(6)} SOL). ` +
-            `PnL de preço no momento do gatilho: ${pnlPercent.toFixed(2)}%.`
-          : `ATENÇÃO: não foi possível medir o PnL on-chain (${economics.error}). ` +
+        (ciclo.measured
+          ? `PnL LÍQUIDO DO CICLO MEDIDO on-chain (entrada + saída): ${(ciclo.pnlNetSol as number) >= 0 ? "+" : ""}${(ciclo.pnlNetSol as number).toFixed(6)} SOL ` +
+            `(custo de entrada: ${(ciclo.entryCostSol as number).toFixed(6)} SOL; receita da venda: ${(ciclo.exitProceedsSol as number).toFixed(6)} SOL; ` +
+            `fees de rede: ${(ciclo.feesSol ?? 0).toFixed(6)} SOL; tip: ${jitoTip.toFixed(6)} SOL). ` +
+            `PnL de preço no momento do gatilho: ${pnlPercent.toFixed(2)}%. ` +
+            ciclo.notes.join(" ")
+          : `ATENÇÃO: PnL do ciclo NÃO apurado (${ciclo.basis}): ${ciclo.reasons.join("; ")}. ` +
+            (ciclo.exitProceedsSol !== null
+              ? `O que foi medido é a RECEITA DA VENDA: ${ciclo.exitProceedsSol.toFixed(6)} SOL entraram na carteira nesta transação — isto NÃO é lucro. `
+              : "") +
             `O valor exibido NÃO é resultado realizado.`) +
         ` Latência: ${latencyMs}ms.`,
       correlationId

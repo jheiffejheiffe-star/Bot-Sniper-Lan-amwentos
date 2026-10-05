@@ -66,12 +66,30 @@ export type OutcomeLabel =
   | "estimated_win"
   | "estimated_loss"
   | "estimated_breakeven"
+  /**
+   * Medição de PERNA ÚNICA (só a saída). Nome próprio de propósito: chamar isto de "estimated_win"
+   * esconderia que houve medição on-chain — e chamar de "win" afirmaria um lucro que não foi apurado.
+   */
+  | "single_leg_win"
+  | "single_leg_loss"
+  | "single_leg_breakeven"
   | "failed_attempt"
   | "entry_leg"
   | "unresolved";
 
 /** De onde veio o número do resultado — a distinção que impede PnL fabricado. */
-export type OutcomeBasis = "net_measured" | "price_estimated" | "none";
+export type OutcomeBasis =
+  /** PnL LÍQUIDO com as DUAS pernas medidas on-chain (entrada + saída): o único número chamado de resultado. */
+  | "net_measured"
+  /**
+   * Medição de UMA perna só (tipicamente o ΔSOL da venda): é RECEITA, não lucro — falta o custo da
+   * entrada. Existe para diagnóstico e é EXCLUÍDO da validação. Nunca é promovido a "medido".
+   */
+  | "single_leg_measured"
+  /** Estimativa por preço de mercado (não inclui tip, priority fee, base fee nem rent). */
+  | "price_estimated"
+  /** Sem número de resultado: só o custo/estado é conhecido. */
+  | "none";
 
 export type AttemptKind = "entry" | "exit" | "unknown";
 
@@ -113,6 +131,12 @@ export interface LabelCoverage {
   measured: number;
   /** Registros com base `price_estimated`. */
   estimated: number;
+  /**
+   * Registros com MEDIÇÃO DE PERNA ÚNICA (S11): existe um número lido da cadeia, mas ele mede só um
+   * lado do ciclo — não é o PnL da operação. Contados à parte porque, se ficarem fora de todas as
+   * categorias, a soma da cobertura não fecha com o total e o operador não sabe onde foi parar.
+   */
+  singleLegMeasured: number;
   /** Registros sem número nenhum. */
   withoutNumber: number;
   /** Percentual de registros sem número sobre o total (0..1). */
@@ -153,8 +177,22 @@ export function labelTrade(trade: DBTrade): LabeledOutcome {
   const status = String(trade.status ?? "unknown");
   const pnl = typeof trade.pnlNetSol === "number" && Number.isFinite(trade.pnlNetSol) ? trade.pnlNetSol : null;
   const measured = trade.measuredOnChain === true;
-  if (measured) provenance.push("measuredOnChain=true");
+  /**
+   * PROCEDÊNCIA DA MEDIÇÃO (S11). `measuredOnChain=true` diz que ALGO foi lido da cadeia — não diz O
+   * QUE. O extrato anterior marcava como medido o ΔSOL da transação de venda, que é a receita do
+   * ciclo e não o lucro dele: todo trade parecia lucrar o valor da própria entrada. Aqui exigimos a
+   * procedência declarada: só `round_trip_legs*` (duas pernas) vira `net_measured`. Medição de
+   * perna única cai em `single_leg_measured`, EXCLUÍDA da validação — fail-closed: procedência
+   * desconhecida nunca é promovida.
+   */
+  const pnlBasis = typeof (trade as any).pnlBasis === "string" ? ((trade as any).pnlBasis as string) : null;
+  const duasPernas = pnlBasis === "round_trip_legs" || pnlBasis === "round_trip_legs_window_conflict";
+  const umaPerna = measured && !duasPernas;
+  if (measured) provenance.push(`measuredOnChain=true${pnlBasis ? ` (pnlBasis=${pnlBasis})` : " (procedência NÃO declarada)"}`);
   if (pnl !== null) provenance.push("pnlNetSol");
+  if ((trade as any).saleProceedsSol !== undefined && (trade as any).saleProceedsSol !== null) {
+    provenance.push("saleProceedsSol (receita da venda, não é PnL)");
+  }
 
   const base = {
     id: trade.id,
@@ -178,7 +216,7 @@ export function labelTrade(trade: DBTrade): LabeledOutcome {
    * entrada, e só então "sem número". Se a ordem fosse outra, um trade com PnL medido e rota de
    * saída mal classificada poderia cair em "entrada" — perdendo a melhor evidência que existe.
    */
-  if (pnl !== null && measured && mode === "live") {
+  if (pnl !== null && measured && duasPernas && mode === "live") {
     const label: OutcomeLabel = pnl > BREAKEVEN_EPSILON_SOL ? "win" : pnl < -BREAKEVEN_EPSILON_SOL ? "loss" : "breakeven";
     return {
       ...base,
@@ -187,7 +225,8 @@ export function labelTrade(trade: DBTrade): LabeledOutcome {
       pnlNetSol: pnl,
       pnlPercent: null,
       reason:
-        `PnL líquido MEDIDO on-chain (inclui tip, priority fee e base fee conforme o extrator): ` +
+        `PnL líquido do CICLO medido on-chain (ΔSOL da entrada + ΔSOL da saída, com tip/priority/base ` +
+        `fee embutidos${pnlBasis === "round_trip_legs_window_conflict" ? "; ATENÇÃO: a janela de saldos divergiu da soma das pernas — houve outra movimentação de SOL na carteira" : ""}): ` +
         `${pnl >= 0 ? "+" : ""}${pnl.toFixed(9)} SOL`,
       excluded: false,
       exclusionReason: null,
@@ -206,6 +245,34 @@ export function labelTrade(trade: DBTrade): LabeledOutcome {
       excluded: true,
       exclusionReason: "modo paper",
       provenance: [...provenance, "mode=paper"],
+    };
+  }
+
+  /**
+   * MEDIÇÃO DE PERNA ÚNICA (entra aqui, ANTES de "tentativa falhada"). O número existe e foi lido
+   * da cadeia, mas mede só um lado do ciclo — tipicamente a receita da venda. Dizer "win" aqui seria
+   * afirmar um lucro que ninguém apurou; dizer "estimated" esconderia que houve medição. Tem rótulo
+   * próprio e é EXCLUÍDO da validação, com o motivo escrito.
+   */
+  if (pnl !== null && umaPerna && mode !== "paper") {
+    const sinal = pnl > BREAKEVEN_EPSILON_SOL ? "win" : pnl < -BREAKEVEN_EPSILON_SOL ? "loss" : "breakeven";
+    const label = `single_leg_${sinal}` as OutcomeLabel;
+    const receita = (trade as any).saleProceedsSol;
+    return {
+      ...base,
+      label,
+      basis: "single_leg_measured",
+      pnlNetSol: null,
+      pnlPercent: null,
+      reason:
+        `MEDIÇÃO DE UMA PERNA SÓ: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(9)} SOL foram lidos on-chain em UMA ` +
+        `transação${receita !== undefined && receita !== null ? ` (receita de venda: ${receita} SOL)` : ""}` +
+        `${pnlBasis ? ` — pnlBasis="${pnlBasis}"` : " — procedência da medição não declarada"}, ` +
+        `mas o ciclo completo exige as DUAS pernas (entrada + saída). Este número NÃO é o lucro da ` +
+        `operação: uso apenas diagnóstico, fora da conclusão estatística.`,
+      excluded: true,
+      exclusionReason: "medição de perna única (não é o PnL do ciclo)",
+      provenance: [...provenance, `pnlBasis=${pnlBasis ?? "não declarado"}`],
     };
   }
 
@@ -251,6 +318,8 @@ export function labelTrade(trade: DBTrade): LabeledOutcome {
     pnlPercent: null,
     reason:
       `sem número de resultado: pnlNetSol ausente e measuredOnChain=${trade.measuredOnChain === true}. ` +
+      `Se houve medição de perna única, ela virou rótulo próprio (single_leg_*) — aqui é o caso de ` +
+      `NÃO MEDIDO. ` +
       `Não é "zero": é NÃO MEDIDO`,
     excluded: true,
     exclusionReason: "resultado não medido",
@@ -328,6 +397,7 @@ export function summarizeCoverage(labeled: LabeledOutcome[]): LabelCoverage {
   for (const l of labeled) byLabel[l.label] = (byLabel[l.label] ?? 0) + 1;
   const measured = labeled.filter((l) => l.basis === "net_measured" && !l.excluded).length;
   const estimated = labeled.filter((l) => l.basis === "price_estimated").length;
+  const singleLegMeasured = labeled.filter((l) => l.basis === "single_leg_measured").length;
   const withoutNumber = labeled.filter((l) => l.basis === "none").length;
   const total = labeled.length;
   const missingShare = total > 0 ? withoutNumber / total : 0;
@@ -353,7 +423,21 @@ export function summarizeCoverage(labeled: LabeledOutcome[]): LabelCoverage {
         `pode estar enviesada (os casos piores/melhores são justamente os que falham na medição)`
     );
   }
-  return { total, byLabel, measured, estimated, withoutNumber, missingShare, notes };
+  if (singleLegMeasured > 0) {
+    notes.push(
+      `${singleLegMeasured} registro(s) com medição de UMA PERNA (ex.: só o ΔSOL da venda): é RECEITA, ` +
+        `não o PnL do ciclo — ficam fora da validação. Fecham-se gravando a perna de entrada na posição ` +
+        `(campo entryLeg), o que as versões novas já fazem automaticamente.`
+    );
+  }
+  if (measured + estimated + singleLegMeasured + withoutNumber !== total) {
+    notes.push(
+      `ATENÇÃO: a soma das categorias de cobertura (${measured + estimated + singleLegMeasured + withoutNumber}) ` +
+        `não fecha com o total de registros (${total}) — há rótulo sem categoria declarada. Isto é bug de ` +
+        `classificação, não de medição.`
+    );
+  }
+  return { total, byLabel, measured, estimated, singleLegMeasured, withoutNumber, missingShare, notes };
 }
 
 /** Junta trades e posições em um conjunto rotulado, sem duplicar o mesmo desfecho. */

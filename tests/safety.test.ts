@@ -5208,21 +5208,75 @@ async function main(): Promise<void> {
   // [28] S9 — RÓTULOS DE RESULTADO E VALIDAÇÃO ESTATÍSTICA
   console.log("\n[28] Rótulos de resultado (S9): base de cálculo explícita e veredito honesto");
 
+  await test("rótulo: medição de PERNA ÚNICA não vira PnL (o defeito do ΔSOL da venda)", async () => {
+    /**
+     * REGRESSÃO DO DEFEITO CENTRAL CORRIGIDO NO S11. O extrator anterior lia o ΔSOL da transação de
+     * VENDA e gravava como `pnlNetSol` com `measuredOnChain: true`. Esse número é a RECEITA da venda:
+     * uma compra de 0,01 SOL vendida por 0,02 SOL aparecia como "+0,02 SOL de PnL líquido medido"
+     * (lucro real: +0,01 SOL), e entrava na validação como desfecho confiável.
+     *
+     * Regra nova: `measuredOnChain: true` NÃO basta. A procedência precisa ser declarada, e só
+     * `round_trip_legs*` (duas pernas) é `net_measured`. Medição de perna única tem rótulo próprio e
+     * fica FORA da conclusão; procedência ausente também.
+     */
+    const ol = await import("../src/outcomeLabels.js");
+    const pernaUnica = ol.labelTrade({
+      id: "venda1", token: "T", mint: "m", amount: "a", outAmount: "b", block: 10, tipSol: 0,
+      time: new Date().toISOString(), latencyMs: 500, status: "success", mode: "live",
+      signature: "sigVenda", pnlNetSol: 0.02, measuredOnChain: true, pnlBasis: "exit_leg_only",
+      saleProceedsSol: 0.02,
+    } as any);
+    assert.equal(pernaUnica.basis, "single_leg_measured");
+    assert.equal(pernaUnica.excluded, true, "medição de perna única NÃO entra na validação");
+    assert.ok(pernaUnica.pnlNetSol === null, "o campo PnL é null: o número parcial vive em saleProceedsSol");
+    assert.ok(/RECEITA DA VENDA|não é o lucro/i.test(pernaUnica.reason), pernaUnica.reason);
+    assert.ok(pernaUnica.provenance.some((p) => /pnlBasis=exit_leg_only/.test(p)));
+
+    // Procedência AUSENTE (registro antigo, de antes desta versão): fail-closed, também não promove.
+    const semProcedencia = ol.labelTrade({
+      id: "antigo", token: "T", mint: "m", amount: "a", outAmount: "b", block: 11, tipSol: 0,
+      time: new Date().toISOString(), latencyMs: 500, status: "success", mode: "live",
+      signature: "sigAntiga", pnlNetSol: 0.02, measuredOnChain: true,
+    } as any);
+    assert.equal(semProcedencia.basis, "single_leg_measured", "sem procedência declarada, NÃO promove a medido");
+    assert.equal(semProcedencia.excluded, true);
+    assert.ok(semProcedencia.provenance.some((p) => /procedência NÃO declarada/.test(p)));
+
+    // E o ciclo completo, com procedência, É promovido — a correção não pode virar bloqueio geral.
+    const ciclo = ol.labelTrade({
+      id: "ciclo", token: "T", mint: "m", amount: "a", outAmount: "b", block: 12, tipSol: 0,
+      time: new Date().toISOString(), latencyMs: 500, status: "success", mode: "live",
+      signature: "sigCiclo", pnlNetSol: 0.01, measuredOnChain: true, pnlBasis: "round_trip_legs",
+    } as any);
+    assert.equal(ciclo.basis, "net_measured");
+    assert.equal(ciclo.label, "win");
+    assert.equal(ciclo.excluded, false);
+
+    // Divergência de janela é medida e declarada, mas o número segue sendo do ciclo.
+    const comDivergencia = ol.labelTrade({
+      id: "div", token: "T", mint: "m", amount: "a", outAmount: "b", block: 13, tipSol: 0,
+      time: new Date().toISOString(), latencyMs: 500, status: "success", mode: "live",
+      signature: "sigDiv", pnlNetSol: -0.002, measuredOnChain: true, pnlBasis: "round_trip_legs_window_conflict",
+    } as any);
+    assert.equal(comDivergencia.basis, "net_measured");
+    assert.ok(/outra movimentação de SOL/.test(comDivergencia.reason), comDivergencia.reason);
+  });
+
   await test("rótulo: só PnL LÍQUIDO medido on-chain entra na validação (o resto é excluído com motivo)", async () => {
     const ol = await import("../src/outcomeLabels.js");
     const base = { id: "t1", token: "TST", mint: "mint1", amount: "0.01 SOL", outAmount: "1000", block: 10, tipSol: 0.000001, route: "Jupiter Manual Jito Exit", time: new Date().toISOString(), latencyMs: 900 };
 
-    const win = ol.labelTrade({ ...base, status: "success", mode: "live", signature: "sig", pnlNetSol: 0.01, measuredOnChain: true } as any);
+    const win = ol.labelTrade({ ...base, status: "success", mode: "live", signature: "sig", pnlNetSol: 0.01, measuredOnChain: true, pnlBasis: "round_trip_legs" } as any);
     assert.equal(win.label, "win");
     assert.equal(win.basis, "net_measured");
     assert.equal(win.excluded, false);
     assert.ok(win.pnlNetSol === 0.01 && win.pnlPercent === null, "o rótulo medido não carrega percentual de preço");
 
-    const loss = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: -0.004, measuredOnChain: true } as any);
+    const loss = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: -0.004, measuredOnChain: true, pnlBasis: "round_trip_legs" } as any);
     assert.equal(loss.label, "loss");
 
     // Empate com epsilon DECLARADO (1.000 lamports = 1 base fee).
-    const empate = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: 0.0000005, measuredOnChain: true } as any);
+    const empate = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: 0.0000005, measuredOnChain: true, pnlBasis: "round_trip_legs" } as any);
     assert.equal(empate.label, "breakeven");
     assert.equal(ol.BREAKEVEN_EPSILON_SOL, 0.000001);
 
@@ -5297,7 +5351,7 @@ async function main(): Promise<void> {
 
     const rotulados = ol.labelAll(
       [
-        mk(1, { status: "success", mode: "live", pnlNetSol: 0.01, measuredOnChain: true }),
+        mk(1, { status: "success", mode: "live", pnlNetSol: 0.01, measuredOnChain: true, pnlBasis: "round_trip_legs" }),
         mk(2, { status: "confirmed", mode: "live", route: "Jupiter → Jito bundle [entrada]" }),
         mk(3, { status: "unknown", mode: "live" }),
         mk(4, { status: "unknown", mode: "live" }),
@@ -5360,7 +5414,7 @@ async function main(): Promise<void> {
     const medido = (i: number, pnl: number, at: number) => ({
       id: `t${i}`, token: "T", mint: `m${i}`, amount: "a", outAmount: "b", block: i, tipSol: 1e-6,
       time: new Date(at).toISOString(), latencyMs: 500, status: "success", mode: "live",
-      pnlNetSol: pnl, measuredOnChain: true, feesSol: 5e-6,
+      pnlNetSol: pnl, measuredOnChain: true, pnlBasis: "round_trip_legs", feesSol: 5e-6,
     });
 
     // 1. sem dados
@@ -5397,8 +5451,8 @@ async function main(): Promise<void> {
     const ol = await import("../src/outcomeLabels.js");
     const agora = Date.now();
     const trades: any[] = [
-      { id: "a", token: "T", mint: "m1", amount: "a", outAmount: "b", block: 1, tipSol: 2e-6, time: new Date(agora - 3000).toISOString(), latencyMs: 500, status: "success", mode: "live", pnlNetSol: 0.002, measuredOnChain: true, feesSol: 5e-6 },
-      { id: "b", token: "T", mint: "m2", amount: "a", outAmount: "b", block: 2, tipSol: 2e-6, time: new Date(agora - 2000).toISOString(), latencyMs: 500, status: "success", mode: "live", pnlNetSol: -0.001, measuredOnChain: true, feesSol: 7e-6 },
+      { id: "a", token: "T", mint: "m1", amount: "a", outAmount: "b", block: 1, tipSol: 2e-6, time: new Date(agora - 3000).toISOString(), latencyMs: 500, status: "success", mode: "live", pnlNetSol: 0.002, measuredOnChain: true, pnlBasis: "round_trip_legs", feesSol: 5e-6 },
+      { id: "b", token: "T", mint: "m2", amount: "a", outAmount: "b", block: 2, tipSol: 2e-6, time: new Date(agora - 2000).toISOString(), latencyMs: 500, status: "success", mode: "live", pnlNetSol: -0.001, measuredOnChain: true, pnlBasis: "round_trip_legs", feesSol: 7e-6 },
       { id: "c", token: "T", mint: "m3", amount: "a", outAmount: "b", block: 3, tipSol: 2e-6, time: new Date(agora - 1000).toISOString(), latencyMs: 500, status: "confirmed", mode: "live", route: "entrada" },
     ];
     const rep = sv.buildValidationReport({
@@ -5801,6 +5855,267 @@ async function main(): Promise<void> {
     const schema = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/storage/schema.ts"), "utf8"));
     assert.ok(!/DROP TABLE|DROP COLUMN|TRUNCATE/i.test(schema), "migração destrutiva não existe neste schema (por decisão)");
     assert.ok(/WHERE state = 'active'/.test(schema), "o índice único do claim precisa ser PARCIAL (só claims ativos competem)");
+  });
+
+  // [30] S11 — PnL DO CICLO COMPLETO (o defeito do ΔSOL da venda)
+  console.log("\n[30] PnL do ciclo (S11): entrada + saída, ou nenhum número");
+
+  /**
+   * Trancar uma transação como se viesse do RPC, sem rede: a forma exata que `parseTransactionLeg`
+   * consome (`meta.preBalances/postBalances` indexados pela posição da carteira nas chaves).
+   */
+  const fakeTx = (opts: {
+    wallet: string;
+    mint: string;
+    pre: number;
+    post: number;
+    tokensAntes?: string;
+    tokensDepois?: string;
+    fee?: number;
+    slot?: number;
+    err?: any;
+    signature?: string;
+  }) => {
+    const keys = [opts.wallet, "OutraConta1111111111111111111111111111111111"];
+    const meta: any = {
+      preBalances: [opts.pre, 0],
+      postBalances: [opts.post, 0],
+      fee: opts.fee ?? 5000,
+      err: opts.err ?? null,
+      loadedAddresses: { writable: [], readonly: [] },
+    };
+    if (opts.tokensAntes !== undefined || opts.tokensDepois !== undefined) {
+      meta.preTokenBalances = [{ mint: opts.mint, owner: opts.wallet, uiTokenAmount: { amount: opts.tokensAntes ?? "0" } }];
+      meta.postTokenBalances = [{ mint: opts.mint, owner: opts.wallet, uiTokenAmount: { amount: opts.tokensDepois ?? "0" } }];
+    }
+    return {
+      slot: opts.slot ?? 100,
+      meta,
+      transaction: {
+        signatures: [opts.signature ?? "sigFake"],
+        message: {
+          staticAccountKeys: keys,
+          accountKeys: keys,
+        },
+      },
+    };
+  };
+
+  await test("o defeito corrigido: receita da venda NÃO é PnL do ciclo", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint1111111111111111111111111111111111111111";
+    const wallet = "Carteira111111111111111111111111111111111111";
+
+    // Compra de 0,01 SOL e venda devolvendo 0,02 SOL: o ciclo ganha 0,01 SOL, NÃO 0,02.
+    const entrada = rt.parseTransactionLeg(
+      wallet,
+      mint,
+      fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000, tokensAntes: "0", tokensDepois: "1000000000", fee: 5000 })
+    );
+    const saida = rt.parseTransactionLeg(
+      wallet,
+      mint,
+      fakeTx({ wallet, mint, pre: 990_000_000, post: 1_010_000_000, tokensAntes: "1000000000", tokensDepois: "0", fee: 5000 })
+    );
+
+    assert.equal(entrada.measured, true);
+    assert.equal(entrada.solDeltaLamports, -10_000_000);
+    assert.equal(saida.solDeltaLamports, 20_000_000);
+
+    const ciclo = rt.computeRoundTrip({ entry: entrada, exit: saida });
+    assert.equal(ciclo.basis, "round_trip_legs");
+    assert.equal(ciclo.measured, true);
+    // 0,01 SOL de lucro — e NÃO os 0,02 da venda.
+    assert.ok(Math.abs((ciclo.pnlNetSol as number) - 0.01) < 1e-12, `pnl=${ciclo.pnlNetSol}`);
+    assert.equal(ciclo.pnlNetLamports, 10_000_000);
+    assert.ok(Math.abs((ciclo.entryCostSol as number) - 0.01) < 1e-12);
+    assert.ok(Math.abs((ciclo.exitProceedsSol as number) - 0.02) < 1e-12);
+    assert.ok(Math.abs((ciclo.feesSol as number) - 0.00001) < 1e-15);
+    assert.ok(ciclo.notes.some((n) => /ΔSOL\(entrada\) \+ ΔSOL\(saída\)/.test(n)));
+    // A janela derivada confere: nada se moveu entre uma transação e a outra.
+    assert.equal(ciclo.windowConflict, false);
+  });
+
+  await test("prejuízo, empate e custo do fracasso: medidos, não estimados", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint2222222222222222222222222222222222222222";
+    const wallet = "Carteira222222222222222222222222222222222222";
+    const perna = (pre: number, post: number, err: any = null) =>
+      rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre, post, err }));
+
+    // Prejuízo: comprou por 0,01 e vendeu por 0,006.
+    const perda = rt.computeRoundTrip({ entry: perna(1_000_000_000, 990_000_000), exit: perna(990_000_000, 996_000_000) });
+    assert.ok(Math.abs((perda.pnlNetSol as number) + 0.004) < 1e-12, `pnl=${perda.pnlNetSol}`);
+    assert.equal(perda.measured, true);
+
+    // Empate: as duas pernas somam zero (fee já embutida nos deltas).
+    const empate = rt.computeRoundTrip({ entry: perna(1_000_000_000, 990_000_000), exit: perna(990_000_000, 1_000_000_000) });
+    assert.equal(empate.pnlNetLamports, 0);
+
+    // VENDA QUE FALHOU on-chain: o Δ é o custo do fracasso (fee), e a nota precisa dizer isto.
+    const falhou = rt.computeRoundTrip({
+      entry: perna(1_000_000_000, 990_000_000),
+      exit: perna(990_000_000, 989_995_000, { InstructionError: [0, "Custom"] }),
+    });
+    assert.equal(falhou.measured, true);
+    assert.ok(Math.abs((falhou.pnlNetSol as number) + 0.010005) < 1e-12);
+    assert.ok(falhou.notes.some((n) => /transação de SAÍDA falhou on-chain/.test(n)), falhou.notes.join(" | "));
+
+    // COMPRA que falhou: declara que o delta é o custo do fracasso, não uma compra.
+    const compraFalhou = rt.computeRoundTrip({
+      entry: perna(1_000_000_000, 999_995_000, { InstructionError: [0, "Custom"] }),
+      exit: perna(999_995_000, 1_000_000_000),
+    });
+    assert.ok(compraFalhou.notes.some((n) => /transação de ENTRADA falhou on-chain/.test(n)));
+  });
+
+  await test("perna faltante: NÃO existe PnL — o que sobra é declarado como receita da venda", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint3333333333333333333333333333333333333333";
+    const wallet = "Carteira333333333333333333333333333333333333";
+    const saida = rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_010_000_000 }));
+
+    // Sem perna de entrada (posição antiga, de antes desta versão).
+    const semEntrada = rt.computeRoundTrip({ entry: null, exit: saida });
+    assert.equal(semEntrada.basis, "exit_leg_only");
+    assert.equal(semEntrada.measured, false);
+    assert.equal(semEntrada.pnlNetSol, null, "NUNCA somar a saída com zero de entrada");
+    assert.equal(semEntrada.pnlNetLamports, null);
+    assert.ok(Math.abs((semEntrada.exitProceedsSol as number) - 0.02) < 1e-12, "a receita continua reportada, com nome próprio");
+    assert.ok(semEntrada.reasons.some((r) => /perna de ENTRADA ausente/.test(r)));
+    assert.ok(semEntrada.notes.some((n) => /RECEITA DA VENDA, não lucro/.test(n)));
+
+    // Entrada PRESENTE mas não medida (RPC sem histórico): mesma doutrina.
+    const entradaNaoMedida = rt.computeRoundTrip({ entry: rt.unmeasuredLeg("sigX", "transação não retornada pelo RPC"), exit: saida });
+    assert.equal(entradaNaoMedida.basis, "exit_leg_only");
+    assert.equal(entradaNaoMedida.pnlNetSol, null);
+    assert.ok(entradaNaoMedida.reasons.some((r) => /perna de ENTRADA não medida/.test(r)));
+
+    // Nenhuma perna: incompleto, sem número.
+    const nada = rt.computeRoundTrip({ entry: null, exit: null });
+    assert.equal(nada.basis, "incomplete");
+    assert.equal(nada.pnlNetSol, null);
+    assert.equal(nada.reasons.length, 2);
+  });
+
+  await test("venda PARCIAL não é fechamento: o PnL é da fração e a posição segue aberta", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint4444444444444444444444444444444444444444";
+    const wallet = "Carteira444444444444444444444444444444444444";
+    const entrada = rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000, tokensAntes: "0", tokensDepois: "1000000000" }));
+    // Vendeu metade.
+    const saida = rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_001_000_000, tokensAntes: "1000000000", tokensDepois: "500000000" }));
+
+    const ciclo = rt.computeRoundTrip({ entry: entrada, exit: saida, positionTokensRaw: "1000000000" });
+    assert.equal(ciclo.partialExit, true);
+    assert.ok(/50.00%/.test(ciclo.partialExitDetail as string), String(ciclo.partialExitDetail));
+    assert.ok(/NÃO está fechada/.test(ciclo.partialExitDetail as string));
+    assert.equal(ciclo.measured, true, "o PnL da fração vendida é medido…");
+    assert.ok(Math.abs((ciclo.pnlNetSol as number) - 0.001) < 1e-12);
+
+    // Venda do TOTAL não é parcial.
+    const total = rt.computeRoundTrip({
+      entry: entrada,
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_001_000_000, tokensAntes: "1000000000", tokensDepois: "0" })),
+      positionTokensRaw: "1000000000",
+    });
+    assert.equal(total.partialExit, false);
+
+    // Vendeu MAIS do que a posição registra: aviso, não silêncio.
+    const aMais = rt.computeRoundTrip({
+      entry: entrada,
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_001_000_000, tokensAntes: "2000000000", tokensDepois: "0" })),
+      positionTokensRaw: "1000000000",
+    });
+    assert.ok(aMais.notes.some((n) => /MAIS tokens do que a posição/.test(n)), aMais.notes.join(" | "));
+  });
+
+  await test("divergência de janela: detectada sem RPC extra, dos saldos das duas transações", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint5555555555555555555555555555555555555555";
+    const wallet = "Carteira555555555555555555555555555555555555";
+
+    // Carteira dedicada: entrada termina em 990M e a saída começa em 990M → sem divergência.
+    const limpo = rt.computeRoundTrip({
+      entry: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000 })),
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_010_000_000 })),
+    });
+    assert.equal(limpo.windowConflict, false);
+    assert.ok(limpo.notes.some((n) => /janela confere/.test(n)));
+
+    /**
+     * Carteira NÃO dedicada: entre a compra e a venda a carteira perdeu 0,05 SOL por outra operação.
+     * O PnL do ciclo continua exato (cada delta é da sua transação), mas o fato precisa aparecer.
+     */
+    const sujo = rt.computeRoundTrip({
+      entry: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000 })),
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 940_000_000, post: 960_000_000 })),
+    });
+    assert.equal(sujo.measured, true);
+    assert.ok(Math.abs((sujo.pnlNetSol as number) - 0.01) < 1e-12, "o PnL do ciclo não muda com o que aconteceu fora dele");
+    assert.equal(sujo.windowConflict, true);
+    assert.ok(Math.abs((sujo.discrepancySol as number) + 0.05) < 1e-12, `discrepância=${sujo.discrepancySol}`);
+    assert.equal(sujo.basis, "round_trip_legs_window_conflict");
+    assert.ok(sujo.notes.some((n) => /OUTRA movimentação de SOL/.test(n)), sujo.notes.join(" | "));
+
+    // Tolerância declarada: 5.000 lamports passam; mais que isso, alerta.
+    const quase = rt.computeRoundTrip({
+      entry: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000 })),
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 989_996_000, post: 1_009_996_000 })),
+    });
+    assert.equal(quase.windowConflict, false, `discrepância de 4.000 lamports deveria passar: ${quase.discrepancySol}`);
+    assert.equal(rt.WINDOW_CONFLICT_EPSILON_SOL, 0.000005);
+  });
+
+  await test("parseTransactionLeg: honestidade na extração (nunca valor por omissão)", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint6666666666666666666666666666666666666666";
+    const wallet = "Carteira666666666666666666666666666666666666";
+
+    const semMeta = rt.parseTransactionLeg(wallet, mint, { transaction: { signatures: ["sigS"] } });
+    assert.equal(semMeta.measured, false);
+    assert.equal(semMeta.solDeltaLamports, null, "sem meta não existe delta — e não é zero");
+    assert.ok(/sem meta/.test(semMeta.error as string));
+
+    const semCarteira = rt.parseTransactionLeg("OutraCarteira", mint, fakeTx({ wallet, mint, pre: 1, post: 2 }));
+    assert.equal(semCarteira.measured, false);
+    assert.ok(/não localizada/.test(semCarteira.error as string));
+
+    // Tokens: entradas de OUTRO dono não podem contar como posição nossa.
+    const tx = fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000, tokensAntes: "0", tokensDepois: "100" });
+    tx.meta.postTokenBalances = [
+      { mint, owner: wallet, uiTokenAmount: { amount: "100" } },
+      { mint, owner: "OutroDono", uiTokenAmount: { amount: "999999" } },
+      { mint: "OutroMint", owner: wallet, uiTokenAmount: { amount: "777" } },
+    ];
+    tx.meta.preTokenBalances = [{ mint, owner: wallet, uiTokenAmount: { amount: "0" } }];
+    const leg = rt.parseTransactionLeg(wallet, mint, tx);
+    assert.equal(leg.tokenDeltaRaw, "100", "só o mint certo, do dono certo");
+
+    // Erro on-chain é preservado (JSON), não engolido.
+    const comErro = rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1, post: 0, err: { InstructionError: [0, "Custom"] } }));
+    assert.ok(/InstructionError/.test(comErro.onChainError as string));
+  });
+
+  await test("S11: fiação — a perna de entrada é gravada, e a saída recusa chamar receita de lucro", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+
+    assert.ok(/measureRoundTrip\(/.test(src), "a saída precisa usar o ciclo, não a perna da venda");
+    assert.ok(!/measureExitEconomics/.test(src), "o extrator de perna única não pode sobreviver no servidor");
+    assert.ok(/parseTransactionLeg/.test(src) && /computeRoundTrip/.test(src));
+    assert.ok(/entryLeg: pernaEntrada/.test(src), "a perna de entrada precisa ser gravada na posição");
+    assert.ok(/pnlBasis: ciclo\.basis/.test(src), "a procedência do PnL precisa viajar com o registro");
+    // A medição da entrada acontece DEPOIS da confirmação e não pode atrasar assinatura:
+    const posMedida = src.indexOf("const pernaEntrada = result.signature");
+    const posTrade = src.indexOf("const tradeStatus = result.confirmedOnChain");
+    assert.ok(posMedida > 0 && posTrade > 0, "os dois blocos existem");
+    // Os dois caminhos de saída medem o ciclo.
+    const ciclos = src.match(/await measureRoundTrip\(/g) ?? [];
+    assert.equal(ciclos.length, 2, `esperado o ciclo nas DUAS saídas reais (manual e autônoma), achei ${ciclos.length}`);
+    // Nenhuma gravação de PnL pode ignorar a procedência.
+    const pnlSemBase = /pnlNetSol:\s*[^,\n]*solDeltaSol/.test(src);
+    assert.equal(pnlSemBase, false, "ainda existe gravação de pnlNetSol a partir do delta da venda");
   });
 
   console.log("\n=========================================");

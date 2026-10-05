@@ -2062,3 +2062,122 @@ edge?* — e a resposta honesta depende de separar "ganhou em alguns trades" de 
   migração de leitura e reconciliação, não um efeito colateral deste adendo.
 - **Nada disto autoriza entrada real.** `HFT_REAL_ENTRY_ENABLED=0` continua o default, e o S10
   apenas torna o voo único verificável entre processos quando a entrada for autorizada.
+
+## Adendo 19 — S11: o "PnL medido" era a RECEITA da venda (defeito de correção, 2026-10-05)
+
+### 1. Como o defeito foi encontrado
+
+Revisando o caminho que alimenta o S9 (`/api/performance`) com a pergunta "o que produz um desfecho
+`net_measured`?". A resposta levou a `measureExitEconomics`, e o corpo dela a uma conta de uma linha:
+
+```ts
+solDeltaSol: (tx.meta.postBalances[i] - tx.meta.preBalances[i]) / 1e9
+```
+
+Esse delta é da **transação de saída**. Gravado como `pnlNetSol` com `measuredOnChain: true`.
+
+### 2. Por que isto é grave (e não um arredondamento)
+
+O número medido é o crédito da venda menos os custos DA VENDA. Ele **não contém o custo da compra**.
+
+| Operação | O que o código reportava | PnL real do ciclo |
+|---|---|---|
+| Compra 0,01 SOL → venda rende 0,02 SOL | `+0,02 SOL` "medido on-chain" | `+0,01 SOL` |
+| Compra 0,01 SOL → venda rende 0,01 SOL (empate) | `+0,01 SOL` "medido on-chain" | `0,00 SOL` |
+| Compra 0,01 SOL → venda rende 0,005 SOL (perda) | `+0,005 SOL` "medido on-chain" | `−0,005 SOL` |
+
+Três consequências encadeadas:
+
+1. **Erro do tamanho da posição, sempre para cima.** Não há cenário em que a inflação seja pequena.
+2. **Perdas apareciam como ganhos.** Uma operação que perde 50% ainda reportava lucro positivo — o
+   "lucro" era a entrada de volta.
+3. **O S9 validaria a estratégia errada.** Como o número vinha marcado `measuredOnChain: true`, ele
+   era classificado `net_measured` e entrava na validação. A estratégia "compra e vende no mesmo
+   preço" teria expectância positiva medida on-chain, e o veredito caminharia para
+   `candidato_a_edge` com dado **medido**, não estimado. Este era o caminho pelo qual o bot poderia
+   "provar" um edge inexistente — exatamente o que o S9 existe para impedir.
+
+Origem do erro: o comentário do próprio extrator dizia *"o fluxo de caixa efetivo, incluindo TODOS
+os custos. É a única medida em que confiamos"*. Ele media todos os custos **de uma transação**, e a
+transação de venda não tem o custo da compra. A frase estava certa sobre o método e errada sobre o
+escopo — e foi essa ambiguidade que sustentou o defeito.
+
+### 3. A correção
+
+`src/roundTrip.ts` (novo): duas funções PURAS — `parseTransactionLeg` (economia de uma transação) e
+`computeRoundTrip` (combinação das duas pernas) — mais o wrapper de RPC `measureLeg`/`measureRoundTrip`
+no `server.ts`.
+
+```
+PnL do ciclo = ΔSOL(entrada) + ΔSOL(saída)
+```
+
+Cada delta vem da PRÓPRIA transação, então a soma é imune a movimentações de SOL não relacionadas
+que ocorram entre uma e outra (diferente de comparar o saldo da carteira antes e depois, que só é
+exato numa carteira dedicada).
+
+**A perna de entrada é medida e gravada na posição** (`entryLeg`) no momento da confirmação da
+compra — depois da confirmação, portanto fora do caminho crítico de assinatura (não atrasa nenhuma
+decisão: não há transação pendente esperando por ela).
+
+| Situação | Antes | Agora |
+|---|---|---|
+| Duas pernas medidas | `net_measured` com o valor da venda | `net_measured` com o valor do **ciclo** |
+| Só a saída medida | `net_measured` (RECEITA) | `single_leg_measured`, rótulo próprio, **excluído** da validação |
+| Procedência não declarada (registro antigo) | `net_measured` | `single_leg_measured` — fail-closed |
+| Perna de entrada ausente | somava com zero | `exit_leg_only`: PnL `null`, receita declarada em `saleProceedsSol` |
+
+Regras novas, todas com teste:
+
+- **Procedência obrigatória.** `measuredOnChain: true` sozinho não promove nada: o rótulo exige
+  `pnlBasis` igual a `round_trip_legs` ou `round_trip_legs_window_conflict`.
+- **`saleProceedsSol`** é o nome próprio da receita da venda. Ela continua sendo reportada (é
+  diagnóstico valioso) e nunca é chamada de PnL.
+- **Cobertura fecha.** `coverage.singleLegMeasured` conta esses registros; se a soma das categorias
+  não fechar com o total, o relatório declara **bug de classificação** (antes eles sumiriam da
+  contagem e o operador não saberia onde foram parar).
+- **Venda parcial não fecha posição.** O tamanho da posição vem do Δ de tokens da entrada; vender
+  menos que isso marca `partialExit` com a fração exata, e vender MAIS gera aviso (pode haver tokens
+  do mesmo mint fora desta posição).
+- **Divergência de janela, sem RPC extra.** Se as duas pernas têm saldos absolutos, a diferença
+  `pre(saída) − post(entrada)` revela movimentação de SOL por fora do ciclo (outra posição,
+  transferência, fee avulsa). O PnL continua exato; o fato é declarado. `HFT_PNL_WINDOW_CHECK=1`
+  acrescenta a conferência por `getBalance` (com o custo de latência declarado).
+
+### 4. O que mudou para quem já tem dados
+
+Registros gravados antes desta versão têm `measuredOnChain: true` e **não têm** `pnlBasis`. Eles
+passam a ser classificados como `single_leg_measured` e ficam **fora** da validação, com o motivo
+escrito no próprio rótulo. Isto é intencional: o número deles é a receita da venda, e usá-lo seria
+repetir o defeito. O caminho para reabilitá-los é remeasurear a partir das assinaturas (as duas
+transações estão na cadeia), não reinterpretar o número antigo.
+
+### 5. Evidências
+
+`npm run lint` → 0 · `npm run test` → **273/273** (eram 265; grupo [30] com 7 testes, e o teste
+[28] ganhou a regressão de procedência) · `npm run build` → ok · boot PAPER limpo.
+
+| Cenário | Resultado |
+|---|---|
+| Compra 0,01 SOL, venda rende 0,02 SOL | PnL do ciclo **+0,01** (não +0,02) · `basis=round_trip_legs` · janela confere |
+| Compra 0,01, venda rende 0,01 (empate) | PnL **exatamente 0** lamports (antes: +0,01 "medido") |
+| Compra 0,01, venda rende 0,005 (perda) | PnL **−0,005** (antes: +0,005 "medido") |
+| Venda que falhou on-chain | PnL medido = custo do fracasso, com nota explícita |
+| Só a saída medida | `exit_leg_only`, PnL `null`, receita em `saleProceedsSol`, excluído da validação |
+| `measuredOnChain: true` sem `pnlBasis` | `single_leg_measured` (fail-closed), excluído |
+| Carteira não dedicada (0,05 SOL movidos no meio) | PnL do ciclo intacto + `windowConflict` + nota |
+| Venda de 50% da posição | `partialExit` com a fração, "NÃO está fechada" |
+| Fiação | as DUAS saídas reais usam o ciclo; `measureExitEconomics` **não existe mais** |
+
+### 6. O que continua aberto
+
+- **A correção não foi exercitada com dinheiro real.** Exige `RUNTIME_MODE=LIVE` +
+  `HFT_REAL_ENTRY_ENABLED=1` e uma transação de verdade; nenhuma foi feita. O que está provado é a
+  aritmética (testes puros), a extração (testes contra a forma do RPC) e a fiação (código).
+- **Posições abertas antes desta versão não têm `entryLeg`.** O ciclo delas é declarado não medido.
+  Reabilitar exige remeasurear as assinaturas na cadeia — não reinterpretar o número antigo.
+- **`getTransaction` pode não devolver transações antigas** em nós podados: nesse caso a perna fica
+  `measured: false` com o motivo, e o ciclo não é apurado. É o comportamento correto (melhor não
+  medido que medido errado), mas significa que a cobertura depende do RPC ter histórico.
+- **Nada disto autoriza entrada real.** O S11 corrige a CONTABILIDADE do que for executado; a
+  política de habilitação não mudou (`HFT_REAL_ENTRY_ENABLED=0`).

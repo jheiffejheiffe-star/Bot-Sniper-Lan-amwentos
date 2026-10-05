@@ -207,11 +207,27 @@ Como ler a resposta, na ordem:
 
 Regras que o endpoint aplica e que você pode conferir no código (`src/outcomeLabels.ts`):
 
+- **o PnL é do CICLO: `ΔSOL(entrada) + ΔSOL(saída)`**, medido nas duas transações (S11). Sem as duas
+  pernas, o campo `pnlNetSol` é `null` e o que existe é a **receita da venda** (`saleProceedsSol`),
+  com nome próprio — receita não é lucro;
+- medição de perna única tem rótulo próprio (`single_leg_*`), aparece em
+  `coverage.singleLegMeasured` e fica **fora** da validação;
 - percentual de posição é **estimativa de preço** (não inclui tip, priority fee, base fee nem
   rent) → rótulo `estimated_*`, excluído da conclusão, mantido para diagnóstico;
 - PnL sem assinatura/medição on-chain vira `unresolved`, nunca zero;
 - `mode=paper` não entra, mesmo com PnL positivo;
 - empate só com |PnL| ≤ 0,000001 SOL (1 base fee).
+
+**Como saber se o ciclo está sendo medido:** em `coverage`, `measured` é o número de ciclos com as
+duas pernas e `singleLegMeasured` é o de medições parciais. Se `singleLegMeasured` crescer, a
+cobertura está furada — `coverage.notes` diz o motivo (perna de entrada ausente, RPC sem histórico)
+e a correção é medir a entrada, não reinterpretar o número parcial.
+
+**Divergência de janela** aparece quando a carteira move SOL por fora do ciclo (outra posição,
+transferência, fee avulsa): o PnL continua exato — cada delta é da sua transação — mas o relatório
+declara que a carteira não estava dedicada àquela operação. `HFT_PNL_WINDOW_CHECK=1` acrescenta uma
+segunda conferência por `getBalance` (custa 1 RTT na saída; a conferência por saldos das próprias
+transações já acontece sem configurar nada).
 
 ### 5.3 Postgres (S10) — voo único entre processos e histórico durável
 
@@ -325,3 +341,9 @@ próximo processo o retoma automaticamente. **Nunca** libere claim de outro dono
 6. **Validação estatística (S9)** — o cálculo existe e é honesto, mas **não há amostra**: sem ≥100
    desfechos com PnL líquido medido on-chain, `/api/performance` conclui `sem_dados` ou
    `amostra_insuficiente`. Nenhum resultado deste projeto foi validado estatisticamente ainda.
+7. **PnL do ciclo (S11)** — a contabilidade agora exige as DUAS pernas medidas
+   (`ΔSOL(entrada) + ΔSOL(saída)`); a versão anterior gravava o ΔSOL da venda como PnL "medido", o
+   que inflava todo resultado pelo valor da entrada (ver `AUDIT.md` Adendo 19). Correção de
+   aritmética provada por teste, mas **não exercitada com dinheiro real**: exige entrada ligada.
+   Posições abertas antes desta versão não têm a perna de entrada e ficam declaradas como não
+   medidas.
