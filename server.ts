@@ -2188,7 +2188,8 @@ app.post("/api/positions/close", async (req, res) => {
       // com nome próprio, para nunca ser lido como lucro.
       pnlNetSol: ciclo.measured ? (ciclo.pnlNetSol as number) : undefined,
       saleProceedsSol: pernaSaida.measured && pernaSaida.solDeltaLamports !== null ? pernaSaida.solDeltaLamports / 1e9 : undefined,
-      feesSol: pernaSaida.measured && pernaSaida.feeLamports !== null ? pernaSaida.feeLamports / 1e9 : undefined,
+      // Soma das base fees das DUAS pernas (quando conhecidas): o custo de rede do ciclo, não só da venda.
+      feesSol: ciclo.feesSol ?? undefined,
       measuredOnChain: pernaSaida.measured,
       pnlBasis: ciclo.basis,
       windowConflictSol: ciclo.windowConflict ? (ciclo.discrepancySol as number) : undefined,
@@ -7526,7 +7527,8 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       signature,
       pnlNetSol: ciclo.measured ? (ciclo.pnlNetSol as number) : undefined,
       saleProceedsSol: pernaSaida.measured && pernaSaida.solDeltaLamports !== null ? pernaSaida.solDeltaLamports / 1e9 : undefined,
-      feesSol: pernaSaida.measured && pernaSaida.feeLamports !== null ? pernaSaida.feeLamports / 1e9 : undefined,
+      // Soma das base fees das DUAS pernas (quando conhecidas): o custo de rede do ciclo, não só da venda.
+      feesSol: ciclo.feesSol ?? undefined,
       measuredOnChain: pernaSaida.measured,
       pnlBasis: ciclo.basis,
       windowConflictSol: ciclo.windowConflict ? (ciclo.discrepancySol as number) : undefined,

@@ -368,7 +368,14 @@ export function computeRoundTrip(input: RoundTripInput): RoundTripEconomics {
   );
   const fees = somaFees(entry, exit);
   if (fees !== null) {
-    notes.push(`base fees somadas das duas transações: ${fees.toFixed(9)} SOL (já embutidas no PnL, que é líquido).`);
+    notes.push(
+      `base fees somadas das duas transações: ${fees.toFixed(9)} SOL (já embutidas no PnL, que é líquido).`
+    );
+    notes.push(
+      "LIMITE DA DECOMPOSIÇÃO: tip (Jito) e priority fee NÃO são separáveis do delta de saldo — eles " +
+        "aparecem como transferência/instrução, não como `meta.fee`. O PnL está correto (o delta os " +
+        "inclui), mas a soma de `feesSol` cobre apenas a base fee das transações."
+    );
   }
   if (entry!.onChainError) {
     notes.push(`a transação de ENTRADA falhou on-chain (${entry!.onChainError}): o Δ medido é o custo do fracasso, não uma compra.`);

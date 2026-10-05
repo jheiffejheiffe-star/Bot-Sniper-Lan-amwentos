@@ -175,7 +175,19 @@ export interface StrategyValidationReport {
   exclusionsByReason: Array<{ reason: string; count: number }>;
   byLabel: Record<OutcomeLabel, number>;
   /** Custo medido agregado (só dos registros que o mediram). */
-  measuredCosts: { feesSol: number | null; tipsSol: number | null; samples: number };
+  measuredCosts: {
+    /** Soma de `feesSol` dos desfechos medidos (base fee das transações). */
+    feesSol: number | null;
+    /** Soma de `tipSol` dos desfechos medidos. */
+    tipsSol: number | null;
+    samples: number;
+    /**
+     * O que esta soma COBRE e o que ela não cobre. Sem isto, "custo medido" seria lido como "custo
+     * total": o tip e a priority fee da ENTRADA são parte do ΔSOL do ciclo (portanto do PnL), mas não
+     * chegam aqui decompostos — só o tip da saída é registrado como campo.
+     */
+    note: string;
+  };
 }
 
 export function buildValidationReport(params: {
@@ -242,6 +254,10 @@ export function buildValidationReport(params: {
       feesSol: fees.length > 0 ? fees.reduce((a, b) => a + b, 0) : null,
       tipsSol: tips.length > 0 ? tips.reduce((a, b) => a + b, 0) : null,
       samples: Math.max(fees.length, tips.length),
+      note:
+        "cobre a base fee das transações dos desfechos medidos e o tip registrado (o da SAÍDA). " +
+        "Tip e priority fee da ENTRADA estão embutidos no ΔSOL do ciclo — logo, no PnL — mas não " +
+        "aparecem decompostos aqui.",
     },
   };
 }

@@ -2181,3 +2181,21 @@ transações estão na cadeia), não reinterpretar o número antigo.
   medido que medido errado), mas significa que a cobertura depende do RPC ter histórico.
 - **Nada disto autoriza entrada real.** O S11 corrige a CONTABILIDADE do que for executado; a
   política de habilitação não mudou (`HFT_REAL_ENTRY_ENABLED=0`).
+
+### 7. Dois refinamentos no mesmo ciclo (mesma classe de problema)
+
+Revisando o resto do caminho por números apresentados como medidos sem sê-lo:
+
+1. **`feesSol` do trade somava só a venda.** Agora é a soma das base fees das DUAS pernas
+   (`ciclo.feesSol`) — o custo de rede do ciclo, não o de uma transação.
+2. **`measuredCosts` do relatório não dizia o que cobria.** Passou a trazer uma `note` explícita:
+   tip (Jito) e priority fee **não são decomponíveis** do delta de saldo (aparecem como
+   transferência/instrução, não como `meta.fee`). O PnL está correto — o delta os inclui — mas a
+   soma de `feesSol` cobre apenas base fee, e o tip só é visível para a SAÍDA. Sem essa ressalva,
+   "custo medido" seria lido como "custo total" e o break-even pareceria menor do que é.
+
+Varredura do resto da mesma classe: `replay.ts` produz simulação e alimenta `computeStrategyMetrics`
+diretamente — não grava `measuredOnChain` e não entra em `/api/performance`; o registro de entrada do
+S6 não tem `pnlNetSol` (vira `entry_leg`); `realEntry.fillMeasured` mede o FILL da entrada (tokens
+recebidos), que é outra afirmação, legítima e documentada. Nenhum outro ponto promove número parcial
+a medido. Evidência: `lint` 0 · **274/274** · `build` ok.

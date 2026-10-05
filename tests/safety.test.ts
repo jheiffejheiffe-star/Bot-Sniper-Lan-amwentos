@@ -6118,6 +6118,38 @@ async function main(): Promise<void> {
     assert.equal(pnlSemBase, false, "ainda existe gravação de pnlNetSol a partir do delta da venda");
   });
 
+  await test("S11: custos medidos dizem o que cobrem (tip/priority da entrada não são decompostos)", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    const ol = await import("../src/outcomeLabels.js");
+    const agora = Date.now();
+    const rep = sv.buildValidationReport({
+      labeled: ol.labelAll(
+        [
+          {
+            id: "c1", token: "T", mint: "m", amount: "a", outAmount: "b", block: 1, tipSol: 3e-6, feesSol: 6e-6,
+            time: new Date(agora).toISOString(), latencyMs: 500, status: "success", mode: "live",
+            pnlNetSol: 0.001, measuredOnChain: true, pnlBasis: "round_trip_legs",
+          },
+        ] as any,
+        []
+      ),
+      source: { name: "teste", tradesRead: 1, positionsRead: 0, truncated: false, note: "" },
+    });
+    assert.ok(rep.measuredCosts.feesSol !== null && Math.abs(rep.measuredCosts.feesSol - 6e-6) < 1e-15);
+    assert.ok(rep.measuredCosts.tipsSol !== null && Math.abs(rep.measuredCosts.tipsSol - 3e-6) < 1e-15);
+    // A ressalva precisa existir e nomear o que fica de fora — senão "custo medido" viraria "custo total".
+    assert.ok(/decompostos/.test(rep.measuredCosts.note), rep.measuredCosts.note);
+    assert.ok(/ENTRADA/.test(rep.measuredCosts.note), rep.measuredCosts.note);
+    // E o próprio ciclo declara o limite da decomposição.
+    const rt = await import("../src/roundTrip.js");
+    const perna = (pre: number, post: number) => ({
+      signature: "s", measured: true, solDeltaLamports: post - pre, preLamports: pre, postLamports: post,
+      feeLamports: 5000, tokenDeltaRaw: null, slot: 1, onChainError: null, error: null,
+    });
+    const ciclo = rt.computeRoundTrip({ entry: perna(1_000_000_000, 990_000_000), exit: perna(990_000_000, 1_000_000_000) });
+    assert.ok(ciclo.notes.some((n) => /LIMITE DA DECOMPOSIÇÃO/.test(n)), ciclo.notes.join(" | "));
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);
