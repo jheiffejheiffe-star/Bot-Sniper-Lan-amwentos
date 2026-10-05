@@ -61,6 +61,23 @@ import {
   type RealEntryResult,
 } from "./src/realEntry.js";
 import {
+  GrpcIngestClient,
+  assessGrpcEndpoint,
+  redactGrpcEndpoint,
+  resolveIngestPolicy,
+  sanitizeGrpcError,
+} from "./src/grpcIngest.js";
+import { loadYellowstoneClient } from "./src/grpcYellowstoneClient.js";
+import {
+  buildJitoTransport,
+  buildRpcDirectTransport,
+  buildStakedSenderTransport,
+  describeParallelSendPolicy,
+  resolveParallelSendPolicy,
+  sendInParallel,
+  type TransportAttempt,
+} from "./src/parallelSend.js";
+import {
   PUMP_ACCOUNT_DISCRIMINATORS,
   PUMP_FEE_PROGRAM_ID,
   PUMP_PROGRAM_ID,
@@ -270,6 +287,53 @@ app.use((req, res, next) => {
 let geyserClientRef: GeyserStreamClient | null = null;
 
 /**
+ * FAST PATH gRPC (S7). É ADITIVO, não substituto: o WSS continua assinando todos os programas
+ * (Raydium/CPMM/Meteora também criam pools) e o gRPC acrescenta o caminho de baixa latência do
+ * pump, que é o alvo do sniper. Se o gRPC cair, a cobertura do pump continua pelo WSS — perder
+ * cobertura para ganhar milissegundos não é troca aceitável.
+ */
+let grpcIngestRef: GrpcIngestClient | null = null;
+
+/**
+ * DEDUPE ENTRE FONTES. Os mesmos bytes podem chegar por gRPC (mais rápido) e por WSS (rede de
+ * segurança) — é o preço consciente de rodar as duas. Sem isto, o mesmo lançamento entraria duas
+ * vezes no pipeline (duas auditorias e, em modo real, duas avaliações de compra). O controle é por
+ * ASSINATURA, com teto de memória e descarte FIFO.
+ */
+const CROSS_SOURCE_SEEN_CAP = 5_000;
+const crossSourceSeen = new Set<string>();
+const crossSourceSeenOrder: string[] = [];
+let crossSourceDuplicatesDropped = 0;
+
+/** Registra a assinatura; `false` = já vista nesta janela (outra fonte já entregou). */
+function firstSightAcrossSources(signature: string): boolean {
+  if (crossSourceSeen.has(signature)) return false;
+  crossSourceSeen.add(signature);
+  crossSourceSeenOrder.push(signature);
+  if (crossSourceSeenOrder.length > CROSS_SOURCE_SEEN_CAP) {
+    const oldest = crossSourceSeenOrder.shift();
+    if (oldest) crossSourceSeen.delete(oldest);
+  }
+  return true;
+}
+
+/**
+ * Política de ENVIO PARALELO (S8), resolvida UMA vez no boot e exposta ao operador. Default:
+ * desligada — o caminho continua sendo o bundle Jito único do S6.
+ */
+const PARALLEL_SEND = resolveParallelSendPolicy();
+console.log(`[Boot][Env] ${describeParallelSendPolicy(PARALLEL_SEND).join(" | ")}`);
+/** Último resultado de corrida de envio, para diagnóstico (memória: some no restart). */
+let lastParallelSend: {
+  at: string;
+  signature: string;
+  winner: string | null;
+  acceptedBy: string[];
+  attempts: TransportAttempt[];
+  ok: boolean;
+} | null = null;
+
+/**
  * Feed gratuito da PumpPortal (terceiro) — entrega o mint NA CRIAÇÃO do token, então este
  * caminho não paga `getTransaction` nem a espera até `confirmed` (limite estrutural do S5).
  * Fonte ADICIONAL: o `logsSubscribe` do RPC continua ativo e cobre Raydium/Meteora.
@@ -295,6 +359,27 @@ app.get("/api/health", (_req, res) => {
           lastEventAt: detection.lastEventAt,
           sinceLastEventMs: detection.sinceLastEventMs,
           recentErrors: detection.recentErrors,
+          /**
+           * Cobertura e duplicatas entre fontes (S7). `crossSourceDuplicatesDropped` alto é
+           * ESPERADO quando gRPC e WSS estão ativos ao mesmo tempo — prova de que o dedupe está
+           * trabalhando, não sintoma de defeito.
+           */
+          crossSourceDuplicatesDropped,
+          /** Fast path gRPC: estado próprio, aditivo ao WSS. `null` = não configurado. */
+          grpcFastPath: grpcIngestRef
+            ? (() => {
+                const h: any = grpcIngestRef!.getHealth();
+                return {
+                  endpoint: h.grpc?.endpoint ?? null,
+                  streamOpen: h.socketOpen,
+                  events: h.eventCount,
+                  updatesSeen: h.grpc?.updatesSeen ?? null,
+                  decodeFailures: h.grpc?.decodeFailures ?? null,
+                  reconnects: h.grpc?.reconnectAttempts ?? null,
+                  sinceLastUpdateMs: h.grpc?.sinceLastUpdateMs ?? null,
+                };
+              })()
+            : null,
           /**
            * O /api/health é a PRIMEIRA parada do operador (e a sonda do smoke test): se os
            * contadores do caminho quente só aparecessem em /api/system-truth, a perda de
@@ -1499,6 +1584,15 @@ app.get("/api/system-truth", (_req, res) => {
   const intents = dbStore.getIntents();
   const mode = getRuntimeModeResolution();
 
+  /**
+   * ESTADO DOS TRANSPORTES (S7/S8), declarado com o mesmo rigor das fontes de dados: o operador
+   * precisa saber por QUAL caminho a detecção e o envio estão passando — e o que está desligado.
+   */
+  const parallelPolicy = PARALLEL_SEND;
+  const parallelNotes = describeParallelSendPolicy(parallelPolicy);
+  const ingestPolicy = resolveIngestPolicy(process.env);
+  const grpcHealth: any = grpcIngestRef?.getHealth() ?? null;
+
   const simulatedEndpoints = [
     {
       path: "/api/hft-telemetry",
@@ -1523,6 +1617,31 @@ app.get("/api/system-truth", (_req, res) => {
 
   const realSources = [
     {
+      source: "detecção — fast path gRPC (Yellowstone, S7)",
+      status: !grpcHealth ? ("unavailable" as const) : grpcHealth.eventCount > 0 ? ("real" as const) : ("unavailable" as const),
+      detail: !grpcHealth
+        ? `não ativo (pedido=${ingestPolicy.requested}, efetivo=${ingestPolicy.effective})` +
+          (ingestPolicy.blockers.length ? ` — ${ingestPolicy.blockers.join("; ")}` : "")
+        : `streamOpen=${grpcHealth.socketOpen}, updates=${grpcHealth.grpc?.updatesSeen ?? 0}, ` +
+          `lançamentos=${grpcHealth.eventCount}, reconnects=${grpcHealth.grpc?.reconnectAttempts ?? 0}, ` +
+          `falhas de decode=${grpcHealth.grpc?.decodeFailures ?? 0}`,
+      caveat:
+        "ADITIVO ao WebSocket: se este caminho cair, a detecção continua pelo WSS (mais lenta, com " +
+        "getTransaction). `updates` > 0 prova canal vivo; `lançamentos` > 0 prova o filtro. " +
+        "commitment=processed: rápido para DETECTAR — a decisão de capital continua exigindo confirmação.",
+    },
+    {
+      source: "envio on-chain — paralelo Jito/staked/RPC (S8)",
+      status: "read-only" as const,
+      detail:
+        parallelPolicy.enabled
+          ? `ATIVO: ${parallelPolicy.transports.join(" + ")}; timeout por transporte ${parallelPolicy.transportTimeoutMs}ms`
+          : "DESLIGADO (HFT_PARALLEL_SEND≠1): envio único pelo bundle Jito, como no S6",
+      caveat:
+        parallelNotes.join(" | ") +
+        " — `aceito por um caminho` NÃO é executado: a execução só existe com confirmação e slot observados.",
+    },
+    {
       source: "detecção (logsSubscribe WSS)",
       status: "real",
       detail: detection
@@ -1533,9 +1652,11 @@ app.get("/api/system-truth", (_req, res) => {
           `${detection.hotPath?.lastLocalSlotAgeMs !== null && detection.hotPath?.lastLocalSlotAgeMs !== undefined ? `, amostra de slot local com ${detection.hotPath.lastLocalSlotAgeMs}ms` : ""}`
         : "cliente de detecção ainda não inicializado",
       caveat:
-        "subscriptionsRequested é registro LOCAL; a prova de detecção é eventCount > 0. " +
+        "subscriptionsRequested é registro LOCAL; a prova de detecção é eventCount > 0 (que inclui " +
+        "eventos repassados pelo fast path gRPC — ver hotPath.forwardedFromOtherSources). " +
         "enrichmentFailures > 0 = notificação vista e mint NÃO obtido: perda real de oportunidade, " +
-        "não ausência de lançamento.",
+        "não ausência de lançamento. Com gRPC e WSS ativos, crossSourceDuplicatesDropped > 0 é o " +
+        "comportamento ESPERADO do dedupe entre fontes, não defeito.",
     },
     {
       source: "feed de lançamentos (PumpPortal, terceiro)",
@@ -1613,7 +1734,9 @@ app.get("/api/system-truth", (_req, res) => {
       "Este painel mistura MEDIÇÃO REAL com painéis SIMULADOS (RNG no servidor). " +
       "O caminho de ENTRADA REAL existe desde S6, mas só sai do papel com três declarações " +
       "(RUNTIME_MODE=LIVE + LIVE_TRADING_ENABLED=true + HFT_REAL_ENTRY_ENABLED=1) e teto canário; " +
-      "sem elas, nenhuma compra real é possível. O bloco `realEntry` abaixo diz o estado AGORA.",
+      "sem elas, nenhuma compra real é possível. O bloco `realEntry` abaixo diz o estado AGORA. " +
+      "DETECÇÃO: o fast path gRPC (S7) é aditivo ao WebSocket e vive em `GET /api/real-entry → ingest`. " +
+      "ENVIO: a corrida Jito/staked/RPC (S8) é opt-in e vive em `GET /api/real-entry → parallelSend`.",
     realSources,
     simulatedEndpoints,
     /**
@@ -4827,10 +4950,10 @@ async function runShadowEntry(mint: string, sizeSol: number, tokenName: string):
 //      de instrução é a própria taxa; a simulação descobre de graça).
 //   6. INTENÇÃO PERSISTIDA ANTES DE ASSINAR: sobrevive a crash e impede segunda compra.
 //
-// O que este bloco NÃO faz: não monta instrução nativa do pump.fun "de cabeça". A rota é o
-// agregador (Jupiter), cuja instrução é construída e mantida por quem opera o programa. O
-// builder nativo por IDL é otimização de latência (S6b) e exige o IDL fixado + dry-run em
-// devnet; sem isso, seria trocar latência por risco de queimar taxa com layout vencido.
+// ROTAS (S6b, publicado): `aggregator` (default) usa a transação do Jupiter; `native` monta a
+// instrução `buy_exact_sol_in` do IDL pinado (`src/pumpInstruction.ts`, com anti-drift no boot e
+// `npm run pump:dryrun` como validação de layout contra a rede). O default continua agregador
+// porque o layout nativo só deve ser usado depois de verificado no ambiente do operador.
 
 const realEntryHistory: RealEntryResult[] = [];
 const MAX_REAL_ENTRY_HISTORY = 20;
@@ -5179,18 +5302,116 @@ async function runRealEntry(params: {
         );
 
         const jitoSender = new JitoBundleSender(globalConnection as Connection);
-        const sent = await jitoSender.submitBundle([tx], keypair, measuredTipSol ?? 0.000_001, blockhash, {
-          capitalCommittedSol: cap,
-          maxTipBps,
-          region: (process.env.JITO_REGION as any) || undefined,
-          purpose: "entry",
-        });
+
         /**
-         * `success` do sender significa "aceito pelo block engine" — NÃO "executado". O
-         * nome é traduzido para `ok` sem prometer execução; quem decide se há posição é a
-         * confirmação com slot observado.
+         * ENVIO (S8). Com `HFT_PARALLEL_SEND=1`, os MESMOS bytes assinados saem por vários
+         * caminhos ao mesmo tempo: bundle Jito, sender com stake (se configurado) e envio direto
+         * ao RPC (se ligado). O primeiro aceite vence e os perdedores NÃO são cancelados — abortar
+         * um envio que poderia entrar no próximo bloco destruiria o motivo de existir da corrida.
+         *
+         * O que NÃO muda: `ok` continua significando ACEITO, nunca EXECUTADO. A execução só existe
+         * com confirmação e slot observados (`confirm`/`observeFill` abaixo). E assinar continua
+         * sendo UMA vez: paralelizar entrega não duplica ordem — duplicar exige assinar duas vezes,
+         * que o sistema de intenções bloqueia.
          */
-        return { ok: sent.success, signature, bundleId: sent.bundleId, tipSol: sent.tipSol, error: sent.error };
+        const submitJito = () =>
+          jitoSender.submitBundle([tx], keypair, measuredTipSol ?? 0.000_001, blockhash, {
+            capitalCommittedSol: cap,
+            maxTipBps,
+            region: (process.env.JITO_REGION as any) || undefined,
+            purpose: "entry",
+          });
+
+        if (!PARALLEL_SEND.enabled) {
+          const sent = await submitJito();
+          return { ok: sent.success, signature, bundleId: sent.bundleId, tipSol: sent.tipSol, error: sent.error };
+        }
+
+        const transports = [
+          buildJitoTransport(async () => {
+            const res = await submitJito();
+            return { success: res.success, bundleId: res.bundleId, error: res.error };
+          }),
+        ];
+
+        if (PARALLEL_SEND.stakedSenderUrl !== "") {
+          transports.push(
+            buildStakedSenderTransport({
+              url: PARALLEL_SEND.stakedSenderUrl,
+              swqosOnly: PARALLEL_SEND.swqosOnly,
+              rawTransactionBase64: Buffer.from(tx.serialize()).toString("base64"),
+              timeoutMs: PARALLEL_SEND.transportTimeoutMs,
+            })
+          );
+        }
+
+        if (PARALLEL_SEND.rpcDirect) {
+          transports.push(
+            buildRpcDirectTransport(async () => {
+              const conn = globalConnection as Connection | null;
+              if (!conn) throw new Error("RPC indisponível para envio direto");
+              /**
+               * DEFESA EM PROFUNDIDADE: este caminho transmite os mesmos bytes assinados; passar
+               * pelo choke point aqui impede que um chamador futuro construa um envio paralelo
+               * sem a avaliação de kill switch/read-only/cofre.
+               */
+              assertCanSign("entry");
+              const raw = Buffer.from(tx.serialize());
+              await conn.sendRawTransaction(raw, {
+                // Pré-flight já foi feito na simulação do caminho real: repetir custa RTT e pode
+                // falhar por estado local do nó. Repetição é decisão do sistema de intenções.
+                skipPreflight: true,
+                maxRetries: 0,
+                preflightCommitment: "processed",
+              });
+              return "rpc aceitou";
+            })
+          );
+        }
+
+        const race = await sendInParallel({
+          signature,
+          transports,
+          timeoutMs: PARALLEL_SEND.transportTimeoutMs,
+          now: monotonicNow,
+          onAttempt: (attempt) => {
+            /**
+             * Toda tentativa fica registrada — inclusive as que perdem a corrida e chegam depois.
+             * É isto que permite, mais tarde, medir taxa de aceite POR CAMINHO com dado real em vez
+             * de repetir número publicado por terceiro.
+             */
+            dbStore.saveLog({
+              timestamp: new Date().toISOString(),
+              level: attempt.ok ? "INFO" : "WARN",
+              component: "REAL_ENTRY",
+              message:
+                `[S8] transporte ${attempt.transport}: ${attempt.ok ? "ACEITOU" : "recusou/falhou"} ` +
+                `em ${attempt.latencyMs}ms${attempt.error ? ` — ${attempt.error}` : ""}`,
+              correlationId: params.correlationId,
+            });
+          },
+        });
+
+        lastParallelSend = {
+          at: new Date().toISOString(),
+          signature,
+          winner: race.winner,
+          acceptedBy: race.acceptedBy,
+          attempts: race.attempts,
+          ok: race.ok,
+        };
+
+        const jitoAttempt = race.attempts.find((a) => a.transport === "jito");
+        const jitoWon = race.winner === "jito";
+        return {
+          ok: race.ok,
+          signature,
+          // `bundleId` só existe no caminho Jito; quando outro transporte vence, isso é declarado
+          // em vez de reaproveitar um id de bundle que não foi o responsável pelo aceite.
+          bundleId: jitoWon ? "jito" : "",
+          tipSol: jitoAttempt?.ok ? (measuredTipSol ?? 0.000_001) : 0,
+          error: race.ok ? undefined : race.note,
+        };
       }, "entry"),
     confirm: async (signature, lastValidBlockHeight, timeoutMs) => {
       const conn = globalConnection;
@@ -5369,6 +5590,36 @@ app.get("/api/real-entry", (_req, res) => {
     policy,
     entryRoute,
     idlDrift: pumpIdlDrift,
+    parallelSend: {
+      policy: PARALLEL_SEND,
+      notes: describeParallelSendPolicy(PARALLEL_SEND),
+      lastResult: lastParallelSend,
+      howToMeasure:
+        "cada tentativa de transporte é registrada em log com latência e motivo; `lastResult` é o " +
+        "último corrida inteira. NÃO há taxa de aceite 'por caminho' calculada aqui: ela precisa de " +
+        "amostra medida, não de número publicado por terceiro.",
+    },
+    ingest: (() => {
+      const policy = resolveIngestPolicy(process.env);
+      const health: any = grpcIngestRef?.getHealth() ?? null;
+      return {
+        policy,
+        endpointProblem: policy.effective === "grpc" ? assessGrpcEndpoint(GEYSER_GRPC_URL).problem : null,
+        active: health
+          ? {
+              endpoint: health.grpc?.endpoint ?? null,
+              streamOpen: health.socketOpen,
+              events: health.eventCount,
+              updatesSeen: health.grpc?.updatesSeen ?? null,
+              decodeFailures: health.grpc?.decodeFailures ?? null,
+              reconnects: health.grpc?.reconnectAttempts ?? null,
+            }
+          : null,
+        note:
+          "o fast path gRPC é ADITIVO: o WebSocket continua assinando TODOS os programas. Se o gRPC " +
+          "cair, a cobertura do pump permanece pelo WSS (mais lento, com getTransaction).",
+      };
+    })(),
     entryRouteNote:
       entryRoute === "native"
         ? "ROTA NATIVA: instrução montada do IDL pinado (assets/pump-idl-excerpt.json). Exige que " +
@@ -7140,8 +7391,17 @@ async function startServer() {
           `Sem blockhash real, nenhuma transação é assinada.`
       );
 
-      const geyserClient = new GeyserStreamClient(RPC_ENDPOINT, RPC_WEBSOCKET, GEYSER_GRPC_URL);
+      const geyserClient = new GeyserStreamClient(RPC_ENDPOINT, RPC_WEBSOCKET, "");
       geyserClient.onTokenDetected((event) => {
+        /**
+         * DEDUPE ENTRE FONTES (S7): gRPC e WSS cobrem o MESMO programa (pump). Quem chega primeiro
+         * processa; o segundo é contado e descartado. Sem esta linha, o dedupe por mint do caminho
+         * quente só pegaria a duplicata enquanto a primeira ainda estivesse em voo.
+         */
+        if (!firstSightAcrossSources(event.signature)) {
+          crossSourceDuplicatesDropped++;
+          return;
+        }
         const receivedAt = wallClockNow();
         const trace = new LatencyTrace(
           `evt_${event.signature?.slice(0, 16) ?? event.mint}_${receivedAt}`,
@@ -7203,6 +7463,66 @@ async function startServer() {
       });
       geyserClientRef = geyserClient;
       await geyserClient.connect();
+
+      /**
+       * FAST PATH gRPC (S7) — ADITIVO. Decisão de configuração, com o motivo impresso:
+       *  - `HFT_INGEST=grpc` sem endpoint coerente → aviso alto (o gRPC simplesmente não sobe e o
+       *    WSS cobre tudo, como antes). Não é fatal: a detecção continua funcionando, só mais lenta.
+       *  - endpoint incoerente (http://, wss://, sem porta) → recusa EXPLÍCITA de conectar, com o
+       *    motivo, em vez de um erro de biblioteca nativa ilegível.
+       *  - falha ao carregar o pacote nativo → `degraded` declarado; o WSS segue cobrindo o pump.
+       */
+      {
+        const ingestPolicy = resolveIngestPolicy(process.env);
+        for (const note of ingestPolicy.notes) console.log(`[Boot][Ingest] ${note}`);
+        for (const blocker of ingestPolicy.blockers) console.warn(`[Boot][Ingest] ${blocker}`);
+        if (ingestPolicy.effective === "grpc") {
+          const endpointOk = assessGrpcEndpoint(GEYSER_GRPC_URL);
+          if (!endpointOk.ok) {
+            console.warn(
+              `[Boot][Ingest] GEYSER_GRPC_URL rejeitado (${endpointOk.problem}). ` +
+                `O fast path gRPC NÃO será usado; o WSS cobre todos os programas, como antes.`
+            );
+          } else {
+            const token = process.env.GEYSER_GRPC_TOKEN ?? "";
+            console.log(
+              `[Boot][Ingest] fast path gRPC habilitado em ${redactGrpcEndpoint(GEYSER_GRPC_URL)} ` +
+                `(token ${token ? "presente, não exibido" : "ausente"}).`
+            );
+            try {
+              const grpcClient = new GrpcIngestClient(
+                () => loadYellowstoneClient(GEYSER_GRPC_URL, token),
+                {
+                  url: GEYSER_GRPC_URL,
+                  token,
+                  programId: PROGRAMS.PUMP_FUN,
+                  pingIntervalMs: Number(process.env.HFT_GRPC_PING_MS ?? 15_000),
+                  maxReconnectAttempts: Number(process.env.HFT_GRPC_MAX_RECONNECTS ?? 0),
+                }
+              );
+              grpcClient.onTokenDetected((event) => {
+                if (!firstSightAcrossSources(event.signature)) {
+                  crossSourceDuplicatesDropped++;
+                  return;
+                }
+                geyserClient.emitDetected(event);
+              });
+              grpcIngestRef = grpcClient;
+              await grpcClient.connect();
+            } catch (err: any) {
+              console.warn(
+                `[Boot][Ingest] fast path gRPC NÃO subiu (${sanitizeGrpcError(err?.message ?? String(err), token)}). ` +
+                  `A detecção continua pelo WSS; este é um caminho ADICIONAL, não o único.`
+              );
+            }
+          }
+        } else {
+          console.log(
+            "[Boot][Ingest] gRPC desabilitado (HFT_INGEST não pede grpc ou GEYSER_GRPC_URL ausente): " +
+              "detecção por WebSocket, com getTransaction no enriquecimento."
+          );
+        }
+      }
       // O log anterior ("Yellowstone Geyser stream pipeline connected.") era impresso sem
       // verificar nada: `connect()` apenas anexa listeners. Se o RPC recusa o WebSocket, o
       // operador lia "connected" com o bot cego. Agora imprimimos o estado do cliente.
@@ -7388,6 +7708,11 @@ async function startServer() {
       pumpPortalRef?.stop();
     } catch (err: any) {
       console.warn("[Shutdown] Falha ao encerrar o feed da PumpPortal:", err?.message ?? err);
+    }
+    try {
+      grpcIngestRef?.disconnect();
+    } catch (err: any) {
+      console.warn("[Shutdown] Falha ao encerrar o fast path gRPC:", err?.message ?? err);
     }
     httpServer.close(() => {
       console.log("[Shutdown] HTTP encerrado. Nada ficou pendente.");

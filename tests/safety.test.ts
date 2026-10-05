@@ -22,6 +22,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { PublicKey } from "@solana/web3.js";
+import crypto from "node:crypto";
+import bs58 from "bs58";
+import { deriveBondingCurvePda } from "../src/pumpInstruction.js";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -4490,6 +4493,716 @@ async function main(): Promise<void> {
     const posGuarda = src.indexOf('entryRoute === "native" && pumpIdlDrift.ok !== true');
     const posBuilder = src.indexOf("buildPumpBuyExactSolInInstruction({");
     assert.ok(posGuarda > 0 && posBuilder > 0 && posGuarda < posBuilder, "verificação antes da montagem");
+  });
+
+  // [26] S7 — INGESTÃO gRPC (YELLOWSTONE): política, redação de segredo e decodificação
+  console.log("\n[26] Fast path gRPC (S7): filtro de transações, CreateEvent e reconexão declarada");
+
+  /**
+   * CODIFICADOR dos eventos, montado A PARTIR DO IDL pinado. É o inverso do decoder e existe para
+   * que os testes não dependam de vetor escrito à mão: se o layout mudar no excerto, o dado
+   * sintético muda junto e o decoder tem de continuar lendo os mesmos campos.
+   */
+  const encodeEventBody = (layout: any[], values: Record<string, any>): Buffer => {
+    const parts: Buffer[] = [];
+    for (const f of layout) {
+      const t = f.type;
+      const v = values[f.name];
+      if (t === "pubkey") parts.push(Buffer.from(new PublicKey(v).toBytes()));
+      else if (t === "bool") parts.push(Buffer.from([v ? 1 : 0]));
+      else if (t === "u8") parts.push(Buffer.from([Number(v)]));
+      else if (t === "u16") {
+        const b = Buffer.alloc(2);
+        b.writeUInt16LE(Number(v), 0);
+        parts.push(b);
+      } else if (t === "u32") {
+        const b = Buffer.alloc(4);
+        b.writeUInt32LE(Number(v), 0);
+        parts.push(b);
+      } else if (t === "u64") {
+        const b = Buffer.alloc(8);
+        b.writeBigUInt64LE(BigInt(v), 0);
+        parts.push(b);
+      } else if (t === "i64") {
+        const b = Buffer.alloc(8);
+        b.writeBigInt64LE(BigInt(v), 0);
+        parts.push(b);
+      } else if (t === "string") {
+        const s = Buffer.from(String(v), "utf8");
+        const len = Buffer.alloc(4);
+        len.writeUInt32LE(s.length, 0);
+        parts.push(len, s);
+      } else if (t && typeof t === "object" && t.vec) {
+        const items = Array.isArray(v) ? v : [];
+        const count = Buffer.alloc(4);
+        count.writeUInt32LE(items.length, 0);
+        parts.push(count);
+        for (const item of items) {
+          const sub = encodeEventBody(
+            [{ name: "address", type: "pubkey" }, { name: "share_bps", type: "u16" }],
+            item
+          );
+          parts.push(sub);
+        }
+      } else {
+        throw new Error(`tipo não suportado no codificador de teste: ${JSON.stringify(t)}`);
+      }
+    }
+    return Buffer.concat(parts);
+  };
+
+  const idlExcerpt = JSON.parse(
+    fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "assets/pump-idl-excerpt.json"), "utf8")
+  );
+  const eventLogLine = (name: string, values: Record<string, any>): string => {
+    const ev = idlExcerpt.events.find((e: any) => e.name === name);
+    const body = encodeEventBody(idlExcerpt.types[name], values);
+    const data = Buffer.concat([Buffer.from(ev.discriminator), body]);
+    return `Program data: ${bs58.encode(data)}`;
+  };
+  const creatorKey = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+
+  const createEventValues = (mint: string, over: Record<string, any> = {}) => ({
+    name: "Test Token",
+    symbol: "TEST",
+    uri: "https://exemplo.invalido/meta.json",
+    mint,
+    bonding_curve: deriveBondingCurvePda(mint),
+    user: creatorKey,
+    creator: creatorKey,
+    timestamp: 1_700_000_000n,
+    virtual_token_reserves: 1_073_000_000_000_000n,
+    virtual_sol_reserves: 30_000_000_000n,
+    real_token_reserves: 793_100_000_000_000n,
+    token_total_supply: 1_000_000_000_000_000n,
+    token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    is_mayhem_mode: false,
+    is_cashback_enabled: false,
+    quote_mint: "11111111111111111111111111111111",
+    virtual_quote_reserves: 30_000_000_000n,
+    creator_fee_bps: 50n,
+    is_holder_reward: false,
+    ...over,
+  });
+
+  await test("discriminadores do Anchor conferem com sha256 dos NOMES (verificação independente da leitura)", async () => {
+    /**
+     * O esquema é público: `sha256("global:nome")`, `sha256("account:Nome")`, `sha256("event:Nome")`,
+     * primeiros 8 bytes. Isto é uma verificação INDEPENDENTE do arquivo pinado: se um discriminador
+     * tivesse sido transcrito errado (ou "lembrado" de um snippet), este teste falha. Foi assim que
+     * o endereço sósia do `event_authority` foi pego — por derivação, não por leitura.
+     */
+    const esperado = (prefixo: string, nome: string) =>
+      [...crypto.createHash("sha256").update(`${prefixo}:${nome}`).digest().subarray(0, 8)];
+
+    const idl = JSON.parse(
+      fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "assets/pump-idl-excerpt.json"), "utf8")
+    );
+
+    for (const ix of idl.instructions) {
+      assert.deepEqual(ix.discriminator, esperado("global", ix.name), `instrução ${ix.name}`);
+    }
+    for (const acc of idl.accounts) {
+      assert.deepEqual(acc.discriminator, esperado("account", acc.name), `conta ${acc.name}`);
+    }
+    for (const ev of idl.events) {
+      assert.deepEqual(ev.discriminator, esperado("event", ev.name), `evento ${ev.name}`);
+    }
+
+    const pe = await import("../src/pumpEvents.js");
+    for (const [nome, bytes] of Object.entries(pe.PUMP_EVENT_DISCRIMINATORS)) {
+      assert.deepEqual([...(bytes as Uint8Array)], esperado("event", nome), `módulo de eventos: ${nome}`);
+    }
+  });
+
+  await test("eventos: CreateEvent decodificado dos logs entrega mint, nome e avisos MEDIDOS", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const logs = ["Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]", eventLogLine("CreateEvent", createEventValues(mint)), "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"];
+
+    const create = pe.findCreateEvent(logs);
+    assert.ok(create, "o CreateEvent precisa ser encontrado pelo discriminador");
+    assert.equal(create!.mint, mint);
+    assert.equal(create!.name, "Test Token");
+    assert.equal(create!.symbol, "TEST");
+    assert.equal(create!.creator, creatorKey);
+    assert.equal(create!.virtualSolReserves, 30_000_000_000n);
+    assert.equal(create!.quoteMint, "11111111111111111111111111111111");
+    assert.deepEqual(create!.warnings, [], "lançamento padrão em SOL não gera aviso");
+
+    // Modo mayhem + cotação não-SOL: o operador PRECISA ver, e é medido do evento.
+    const esquisito = pe.findCreateEvent([
+      eventLogLine("CreateEvent", createEventValues(mint, {
+        is_mayhem_mode: true,
+        quote_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      })),
+    ]);
+    assert.ok(esquisito);
+    assert.equal(esquisito!.warnings.length, 2, JSON.stringify(esquisito!.warnings));
+    assert.ok(esquisito!.warnings.some((w) => /MAYHEM/.test(w)));
+    assert.ok(esquisito!.warnings.some((w) => /NÃO é SOL/.test(w)));
+  });
+
+  await test("eventos: corpo TRUNCADO não vira evento com campo lido no lugar errado", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const corpo = encodeEventBody(idlExcerpt.types.CreateEvent, createEventValues(mint));
+    const disc = Buffer.from(idlExcerpt.events.find((e: any) => e.name === "CreateEvent").discriminator);
+    const truncado = Buffer.concat([disc, corpo.subarray(0, 40)]);
+    const decoded = pe.decodePumpEventData(truncado);
+    assert.ok(decoded, "o discriminador é reconhecido");
+    assert.equal(decoded!.name, "CreateEvent");
+    assert.equal(decoded!.value, null, "corpo insuficiente NÃO pode produzir valor parcial");
+    assert.equal(decoded!.problems[0].code, "bytes-insuficientes");
+  });
+
+  await test("eventos: corpo maior que o layout é aceito com aviso (programa pode adicionar campos)", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const corpo = encodeEventBody(idlExcerpt.types.CreateEvent, createEventValues(mint));
+    const disc = Buffer.from(idlExcerpt.events.find((e: any) => e.name === "CreateEvent").discriminator);
+    const comExtra = Buffer.concat([disc, corpo, Buffer.alloc(16, 7)]);
+    const decoded = pe.decodePumpEventData(comExtra)!;
+    assert.equal(decoded.trailingBytes, 16);
+    const create = pe.toCreateEvent(decoded);
+    assert.equal(create!.mint, mint, "os campos conhecidos continuam corretos");
+    assert.ok(create!.warnings.some((w) => /além do layout pinado/.test(w)), "a sobra precisa ser declarada");
+  });
+
+  await test("eventos: discriminação exige o byte exato (não aceita prefixo nem lixo)", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const disc = [...pe.PUMP_EVENT_DISCRIMINATORS.CreateEvent];
+    const corrompido = Uint8Array.from([...disc.slice(0, 7), (disc[7] + 1) % 256]);
+    assert.equal(pe.decodePumpEventData(Uint8Array.from([...corrompido, ...new Array(200).fill(0)])), null);
+    assert.equal(pe.decodePumpEventData(new Uint8Array(4)), null, "menos de 8 bytes não é evento");
+    assert.equal(pe.findCreateEvent(["Program log: nada aqui"]), null, "log sem evento não vira evento");
+  });
+
+  await test("TradeEvent: compra de terceiro é decodificada com taxas e ix_name (preço real, não estimado)", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const trade = {
+      mint,
+      sol_amount: 1_000_000_000n,
+      token_amount: 33_000_000_000_000n,
+      is_buy: true,
+      user: creatorKey,
+      timestamp: 1_700_000_001n,
+      virtual_sol_reserves: 31_000_000_000n,
+      virtual_token_reserves: 1_040_000_000_000_000n,
+      real_sol_reserves: 1_000_000_000n,
+      real_token_reserves: 793_000_000_000_000n,
+      fee_recipient: creatorKey,
+      fee_basis_points: 100n,
+      fee: 10_000_000n,
+      creator: creatorKey,
+      creator_fee_basis_points: 50n,
+      creator_fee: 5_000_000n,
+      track_volume: true,
+      total_unclaimed_tokens: 0n,
+      total_claimed_tokens: 0n,
+      current_sol_volume: 1_000_000_000n,
+      last_update_timestamp: 1_700_000_001n,
+      ix_name: "buy",
+      mayhem_mode: false,
+      cashback_fee_basis_points: 0n,
+      cashback: 0n,
+      buyback_fee_basis_points: 0n,
+      buyback_fee: 0n,
+      shareholders: [{ address: creatorKey, share_bps: 10_000 }],
+      quote_mint: "11111111111111111111111111111111",
+      quote_amount: 1_000_000_000n,
+      virtual_quote_reserves: 31_000_000_000n,
+      real_quote_reserves: 1_000_000_000n,
+      holder_rewards_bps: 0n,
+      holder_rewards: 0n,
+    };
+    const last = pe.findLastTradeEvent([eventLogLine("TradeEvent", trade)]);
+    assert.ok(last, "TradeEvent precisa decodificar (o vec<Shareholder> no meio quebra decoders ingênuos)");
+    assert.equal(last!.mint, mint);
+    assert.equal(last!.isBuy, true);
+    assert.equal(last!.ixName, "buy");
+    assert.equal(last!.fee, 10_000_000n);
+    assert.equal(last!.creatorFee, 5_000_000n);
+    assert.equal(last!.quoteAmount, 1_000_000_000n);
+  });
+
+  await test("eventos: migração/complete é detectada (não se compra curva de token migrado)", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const migrado = eventLogLine("CompletePumpAmmMigrationEvent", {
+      user: creatorKey, mint, mint_amount: 1n, sol_amount: 2n, pool_migration_fee: 3n,
+      bonding_curve: deriveBondingCurvePda(mint), timestamp: 1n, pool: creatorKey,
+      quote_mint: "11111111111111111111111111111111",
+    });
+    assert.equal(pe.findCurveTerminalEvent([migrado]), "migrated");
+    const completo = eventLogLine("CompleteEvent", {
+      user: creatorKey, mint, bonding_curve: deriveBondingCurvePda(mint), timestamp: 1n,
+      quote_mint: "11111111111111111111111111111111",
+    });
+    assert.equal(pe.findCurveTerminalEvent([completo]), "complete");
+    assert.equal(pe.findCurveTerminalEvent(["Program log: nada"]), null);
+  });
+
+  await test("ingestão: política decide gRPC × WSS sem inventar credencial e sem logar segredo", async () => {
+    const gi = await import("../src/grpcIngest.js");
+
+    const semNada = gi.resolveIngestPolicy({} as any);
+    assert.equal(semNada.effective, "wss", "sem endpoint o caminho é WSS — e isto continua funcionando");
+    assert.deepEqual(semNada.blockers, []);
+
+    const comUrl = gi.resolveIngestPolicy({ GEYSER_GRPC_URL: "grpc.exemplo.com:443" } as any);
+    assert.equal(comUrl.effective, "grpc");
+
+    const tokenSobrando = gi.resolveIngestPolicy({ GEYSER_GRPC_TOKEN: "segredo" } as any);
+    assert.equal(tokenSobrando.effective, "wss");
+    assert.ok(tokenSobrando.blockers.some((b) => /TOKEN definido sem GEYSER_GRPC_URL/.test(b)),
+      "segredo sem endpoint é configuração pela metade e precisa ser dito");
+
+    const forcadoGrpc = gi.resolveIngestPolicy({ HFT_INGEST: "grpc" } as any);
+    assert.ok(forcadoGrpc.blockers.some((b) => /exige GEYSER_GRPC_URL/.test(b)));
+
+    const forcadoWss = gi.resolveIngestPolicy({ HFT_INGEST: "wss", GEYSER_GRPC_URL: "grpc.exemplo.com:443" } as any);
+    assert.equal(forcadoWss.effective, "wss");
+    assert.ok(forcadoWss.notes.some((n) => /força o caminho WebSocket/.test(n)));
+
+    // REDAÇÃO: o token nunca pode sair em log/health.
+    // Credencial SEM esquema (a forma que um operador cola em "host:porta")…
+    assert.equal(gi.redactGrpcEndpoint("user:senha@grpc.exemplo.com:443"), "***@grpc.exemplo.com:443");
+    // …e COM esquema: as duas formas precisam ser redigidas.
+    assert.equal(gi.redactGrpcEndpoint("grpc://user:senha@grpc.exemplo.com:443"), "grpc://***@grpc.exemplo.com:443");
+    assert.equal(gi.redactGrpcEndpoint("grpc.exemplo.com:443"), "grpc.exemplo.com:443", "endpoint sem credencial não é alterado");
+    const msg = gi.sanitizeGrpcError("falha com token abcdef123456 no header x-token: abcdef123456", "abcdef123456");
+    assert.equal(msg.includes("abcdef123456"), false, "o token não pode sobreviver à sanitização");
+    assert.ok(msg.includes("***"));
+  });
+
+  await test("ingestão: endpoint incoerente é RECUSADO antes de tentar conectar", async () => {
+    const gi = await import("../src/grpcIngest.js");
+    assert.equal(gi.assessGrpcEndpoint("grpc.exemplo.com:443").ok, true);
+    for (const ruim of ["", "https://grpc.exemplo.com:443", "wss://grpc.exemplo.com", "grpc.exemplo.com", "grpc.exemplo.com:443/"]) {
+      const r = gi.assessGrpcEndpoint(ruim);
+      assert.equal(r.ok, false, `deveria recusar: "${ruim}"`);
+      assert.ok(r.problem && r.problem.length > 10, "recusar sem motivo não ajuda o operador");
+    }
+    assert.equal(gi.assessGrpcEndpoint("grpc.exemplo.com:99999").ok, false, "porta fora do intervalo");
+  });
+
+  await test("ingestão: update do stream vira lançamento; trade, voto, falha e duplicata NÃO", async () => {
+    const gi = await import("../src/grpcIngest.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const logCreate = eventLogLine("CreateEvent", createEventValues(mint));
+
+    const listeners: Record<string, Array<(...a: any[]) => void>> = {};
+    const stream = {
+      on(event: string, cb: (...a: any[]) => void) {
+        (listeners[event] ||= []).push(cb);
+        return stream;
+      },
+      write() {},
+      destroy() {},
+    };
+    const fakeClient = {
+      connect: async () => {},
+      subscribe: async () => stream,
+      getSlot: async () => 5000,
+      buildTransactionSubscribeRequest: (programId: string, commitment: string) => ({ programId, commitment }),
+      buildPingRequest: (id: number) => ({ ping: { id } }),
+      // Nos testes o update já chega normalizado (a normalização do protobuf tem teste próprio).
+      normalizeTransactionUpdate: (raw: any) => raw,
+    };
+
+    const client = new gi.GrpcIngestClient(async () => fakeClient as any, {
+      url: "grpc.exemplo.com:443",
+      token: "segredo-nao-pode-vazar",
+      programId: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      pingIntervalMs: 10_000,
+    });
+    const recebidos: any[] = [];
+    client.onTokenDetected((ev: any) => recebidos.push(ev));
+    await client.connect();
+
+    assert.equal(client.getHealth().connected, true);
+    assert.equal(client.getHealth().subscriptionsRequested, 1);
+
+    const emit = (u: any) => listeners.data.forEach((cb) => cb(u));
+    const base = { slot: 4999, signature: "sigA", failed: false, isVote: false, logMessages: [logCreate], accountKeys: [] };
+
+    emit(base);
+    assert.equal(recebidos.length, 1, "CreateEvent no log = lançamento");
+    assert.equal(recebidos[0].mint, mint);
+    assert.equal(recebidos[0].source, "grpc-geyser");
+    assert.equal(recebidos[0].slot, 4999);
+    assert.equal(recebidos[0].grpcLatencyMs, 0, "sem enriquecimento não há RTT: zero MEDIDO, não null");
+
+    emit(base);
+    assert.equal(recebidos.length, 1, "mesma assinatura reentregue NÃO pode virar segundo lançamento");
+    assert.equal(client.getHealth().hotPath.duplicatesDropped, 1);
+
+    emit({ ...base, signature: "sigB", failed: true });
+    emit({ ...base, signature: "sigC", isVote: true });
+    emit({ ...base, signature: "sigD", logMessages: ["Program log: sem evento do pump"] });
+    assert.equal(recebidos.length, 1, "falha, voto e transação sem CreateEvent não são lançamentos");
+
+    emit({ ...base, signature: "sigE", logMessages: ["Program data: 111111"] });
+    assert.equal(recebidos.length, 1);
+    const h = client.getHealth();
+    assert.equal(h.grpc.decodeFailures, 0, "base58 inválido não é falha de DECODIFICAÇÃO de evento do pump");
+    assert.ok(h.grpc.updatesSeen >= 5, "todos os updates foram contados como tráfego do canal");
+
+    client.disconnect();
+    assert.equal(client.getHealth().connected, false);
+  });
+
+  await test("ingestão: stream que cai agenda reconexão e o health diz o que aconteceu", async () => {
+    const gi = await import("../src/grpcIngest.js");
+    const listeners: Record<string, Array<(...a: any[]) => void>> = {};
+    let subscriptions = 0;
+    const stream = {
+      on(event: string, cb: (...a: any[]) => void) {
+        (listeners[event] ||= []).push(cb);
+        return stream;
+      },
+      write() {},
+      destroy() {},
+    };
+    const fakeClient = {
+      connect: async () => {},
+      subscribe: async () => {
+        subscriptions++;
+        return stream;
+      },
+      buildTransactionSubscribeRequest: () => ({}),
+      buildPingRequest: (id: number) => ({ ping: { id } }),
+      normalizeTransactionUpdate: (raw: any) => raw,
+    };
+
+    const client = new gi.GrpcIngestClient(async () => fakeClient as any, {
+      url: "grpc.exemplo.com:443",
+      token: "",
+      programId: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      initialBackoffMs: 1,
+      maxBackoffMs: 4,
+    });
+    await client.connect();
+    assert.equal(subscriptions, 1);
+
+    // Stream encerrado pelo provedor → reconexão com backoff curto (configurado no teste).
+    listeners.end?.forEach((cb) => cb());
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(subscriptions, 2, "o stream precisa ser reaberto sozinho");
+    assert.ok(
+      client.getHealth().grpc.reconnectAttempts >= 1,
+      "a reconexão precisa ser CONTADA (silêncio aqui esconde um canal morto)"
+    );
+    assert.ok(
+      client.getHealth().recentErrors.some((e) => /stream encerrado/.test(e)),
+      "o motivo precisa estar no health"
+    );
+    client.disconnect();
+  });
+
+  await test("ingestão: falha ao carregar o cliente nativo é degradação declarada, não queda", async () => {
+    const gi = await import("../src/grpcIngest.js");
+    const client = new gi.GrpcIngestClient(
+      async () => {
+        throw new Error("não foi possível carregar @triton-one/yellowstone-grpc (MODULE_NOT_FOUND)");
+      },
+      { url: "grpc.exemplo.com:443", token: "segredo", programId: "6EF8rrecthR5Dkz", initialBackoffMs: 1, maxReconnectAttempts: 1 }
+    );
+    await client.connect();
+    const h = client.getHealth();
+    assert.equal(h.connected, false);
+    assert.equal(h.degraded, true);
+    assert.ok(h.recentErrors.some((e) => /YELLOWSTONE|carregar/.test(e)), JSON.stringify(h.recentErrors));
+    assert.equal(h.grpc.endpoint, "grpc.exemplo.com:443");
+    client.disconnect();
+  });
+
+  await test("ingestão: o módulo não assina, não envia e não guarda chave; o adaptador é o único que toca o pacote nativo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ingestSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/grpcIngest.ts"), "utf8"));
+    for (const proibido of ["Keypair", "signTransaction", "sendTransaction", "sendRawTransaction", "OPERATIONAL_PRIVATE_KEY"]) {
+      assert.equal(ingestSrc.includes(proibido), false, `grpcIngest.ts não pode referenciar ${proibido}`);
+    }
+    const adapterSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/grpcYellowstoneClient.ts"), "utf8"));
+    assert.ok(/@triton-one\/yellowstone-grpc/.test(adapterSrc), "o adaptador é quem carrega o pacote nativo");
+    for (const proibido of ["Keypair", "sendTransaction", "sendRawTransaction"]) {
+      assert.equal(adapterSrc.includes(proibido), false, `o adaptador só LÊ a rede: não pode referenciar ${proibido}`);
+    }
+    // O núcleo não pode depender do pacote nativo (é o que mantém o teste e o WSS independentes dele).
+    assert.equal(/@triton-one/.test(ingestSrc), false, "o núcleo de ingestão não importa o pacote nativo");
+
+    const serverSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/resolveIngestPolicy/.test(serverSrc), "a escolha do transporte precisa ser por política");
+    assert.ok(/firstSightAcrossSources/.test(serverSrc), "dedupe entre fontes é obrigatório com dois transportes");
+    assert.ok(
+      /grpcClient\.onTokenDetected[\s\S]{0,800}emitDetected/.test(serverSrc),
+      "o evento do gRPC entra no pipeline pelo MESMO ponto de entrada do WSS"
+    );
+  });
+
+  // [27] S8 — ENVIO PARALELO: corrida de transportes, primeira aceitação vence, aceito ≠ executado
+  console.log("\n[27] Envio paralelo (S8): corrida, timeouts, recusas agregadas e o que 'ok' NÃO significa");
+
+  await test("política: paralelo é opt-in; sem flag o caminho continua sendo o bundle Jito único", async () => {
+    const ps = await import("../src/parallelSend.js");
+
+    const desligado = ps.resolveParallelSendPolicy({} as any);
+    assert.equal(desligado.enabled, false);
+    assert.deepEqual(desligado.transports, ["jito"], "default = comportamento do S6, sem surpresa");
+    assert.equal(desligado.transportTimeoutMs, 3000);
+
+    const comSender = ps.resolveParallelSendPolicy({
+      HFT_PARALLEL_SEND: "1",
+      HFT_STAKED_SENDER_URL: "https://sender.exemplo.com/fast",
+      HFT_SEND_RPC_DIRECT: "1",
+    } as any);
+    assert.equal(comSender.enabled, true);
+    assert.deepEqual(comSender.transports, ["jito", "staked", "rpc"]);
+    assert.equal(comSender.swqosOnly, true, "default: pede SWQOS ao sender");
+
+    // URL definida mas corrida desligada: o transporte NÃO entra e isso é dito.
+    const urlSemFlag = ps.resolveParallelSendPolicy({ HFT_STAKED_SENDER_URL: "https://x.invalido" } as any);
+    assert.equal(urlSemFlag.enabled, false);
+    assert.deepEqual(urlSemFlag.transports, ["jito"]);
+    assert.ok(ps.describeParallelSendPolicy(urlSemFlag).some((n) => /não é usado/.test(n)));
+
+    // AUSÊNCIA ≠ ZERO (bug histórico desta base): timeout ausente/ inválido cai no default.
+    assert.equal(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_TRANSPORT_TIMEOUT_MS: "" } as any).transportTimeoutMs, 3000);
+    assert.equal(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_TRANSPORT_TIMEOUT_MS: "abc" } as any).transportTimeoutMs, 3000);
+    assert.equal(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_TRANSPORT_TIMEOUT_MS: "50" } as any).transportTimeoutMs, 250, "piso de 250ms");
+    assert.equal(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_TRANSPORT_TIMEOUT_MS: "999999" } as any).transportTimeoutMs, 30_000, "teto de 30s");
+
+    // Notas honestas: sem sender configurado o operador precisa saber o que está perdendo.
+    const notes = ps.describeParallelSendPolicy(comSender);
+    assert.ok(notes.some((n) => /swqos_only/.test(n)), "o efeito de ?swqos_only precisa ser declarado");
+    assert.ok(notes.some((n) => /não podem executar duas vezes/.test(n)), "a base da segurança da corrida precisa estar escrita");
+  });
+
+  await test("corrida: o PRIMEIRO aceite vence, os perdedores NÃO são cancelados", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const ordem: string[] = [];
+    let liberaSegundo: () => void = () => {};
+    const segundoPendente = new Promise<void>((r) => {
+      liberaSegundo = r;
+    });
+
+    const outcome = await ps.sendInParallel({
+      signature: "sig123",
+      timeoutMs: 1_000,
+      now: () => Date.now(),
+      transports: [
+        {
+          name: "jito",
+          send: async () => {
+            ordem.push("jito:inicio");
+            await new Promise((r) => setTimeout(r, 30));
+            throw new Error("block engine recusou");
+          },
+        },
+        {
+          name: "staked",
+          send: async () => {
+            ordem.push("staked:inicio");
+            await new Promise((r) => setTimeout(r, 5));
+            return "sender aceitou";
+          },
+        },
+        {
+          name: "rpc",
+          send: async () => {
+            ordem.push("rpc:inicio");
+            await segundoPendente;
+            ordem.push("rpc:terminou");
+            return null;
+          },
+        },
+      ],
+    });
+
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.winner, "staked");
+    assert.deepEqual(ordem.slice(0, 3), ["jito:inicio", "staked:inicio", "rpc:inicio"], "TODOS partem juntos");
+    assert.ok(ordem.includes("rpc:terminou") === false, "o resultado não espera os lentos");
+
+    // O perdedor continua: liberar depois NÃO muda o vencedor, mas fica registrado na telemetria.
+    liberaSegundo();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(ordem.includes("rpc:terminou"), "o transporte lento terminou seu trabalho (não foi abortado)");
+    assert.equal(outcome.winner, "staked", "o vencedor não pode ser reescrito por quem chega depois");
+    assert.deepEqual(outcome.acceptedBy, ["staked"]);
+    assert.ok(outcome.note.includes("ACEITO não é EXECUTADO"), "a nota precisa recusar a leitura 'executado'");
+  });
+
+  await test("corrida: todos recusando agrega os MOTIVOS (nunca um erro genérico)", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const outcome = await ps.sendInParallel({
+      signature: "sig9",
+      timeoutMs: 1_000,
+      now: () => Date.now(),
+      transports: [
+        { name: "jito", send: async () => { throw new Error("HTTP 429 do block engine"); } },
+        { name: "staked", send: async () => { throw new Error("sender HTTP 403"); } },
+      ],
+    });
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.winner, null);
+    assert.equal(outcome.attempts.length, 2);
+    assert.ok(outcome.note.includes("jito=HTTP 429"), outcome.note);
+    assert.ok(outcome.note.includes("staked=sender HTTP 403"), outcome.note);
+    assert.equal(outcome.attempts.every((a) => a.latencyMs >= 0), true);
+  });
+
+  await test("corrida: transporte pendurado morre no timeout e não segura o resultado", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const inicio = Date.now();
+    const outcome = await ps.sendInParallel({
+      signature: "sigT",
+      timeoutMs: 120,
+      now: () => Date.now(),
+      transports: [
+        // Nunca resolve: é o caso do endpoint que aceita a conexão e não responde.
+        { name: "staked", send: () => new Promise(() => {}) },
+      ],
+    });
+    const gasto = Date.now() - inicio;
+    assert.equal(outcome.ok, false);
+    assert.ok(outcome.attempts[0].error?.includes("timeout"), JSON.stringify(outcome.attempts));
+    assert.ok(gasto < 1_500, `o timeout precisa respeitar o limite configurado (gastou ${gasto}ms)`);
+  });
+
+  await test("corrida: transporte duplicado é config inválida (ambiguidade em telemetria de execução)", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const outcome = await ps.sendInParallel({
+      signature: "sigD",
+      timeoutMs: 500,
+      now: () => Date.now(),
+      transports: [
+        { name: "jito", send: async () => "a" },
+        { name: "jito", send: async () => "b" },
+      ],
+    });
+    assert.equal(outcome.ok, false);
+    assert.ok(outcome.note.includes("duplicado"), outcome.note);
+    assert.equal(outcome.attempts.length, 0, "config inválida não deve nem tentar enviar");
+  });
+
+  await test("corrida: sem transporte configurado é recusa explícita, não 'sucesso por vacuidade'", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const outcome = await ps.sendInParallel({ signature: "s", transports: [], timeoutMs: 100, now: () => Date.now() });
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.acceptedBy.length, 0);
+    assert.ok(/nenhum transporte/.test(outcome.note));
+  });
+
+  await test("sender com stake: aceite exige ASSINATURA na resposta (HTTP 200 não é aceite)", async () => {
+    const ps = await import("../src/parallelSend.js");
+
+    const ok = ps.buildStakedSenderTransport({
+      url: "https://sender.exemplo.com/fast",
+      swqosOnly: true,
+      rawTransactionBase64: "AQID",
+      timeoutMs: 500,
+      fetchImpl: (async (url: any, init: any) => {
+        assert.ok(String(url).includes("swqos_only=true"), "o parâmetro de SWQOS precisa ir na URL");
+        const body = JSON.parse(String(init.body));
+        assert.equal(body.method, "sendTransaction");
+        assert.equal(body.params[1].encoding, "base64");
+        assert.equal(body.params[1].skipPreflight, true, "pré-flight já foi feito na simulação");
+        assert.equal(body.params[1].maxRetries, 0, "repetição é decisão do sistema de intenções");
+        return { ok: true, status: 200, json: async () => ({ result: "5" + "x".repeat(80) }) } as any;
+      }) as any,
+    });
+    const aceito = await ok.send(new AbortController().signal);
+    assert.ok(typeof aceito === "string" && aceito.includes("aceitou"));
+
+    const semResultado = ps.buildStakedSenderTransport({
+      url: "https://sender.exemplo.com/fast",
+      swqosOnly: false,
+      rawTransactionBase64: "AQID",
+      timeoutMs: 500,
+      fetchImpl: (async () => ({ ok: true, status: 200, json: async () => ({}) }) as any) as any,
+    });
+    await assert.rejects(() => semResultado.send(new AbortController().signal) as Promise<any>, /sem assinatura/);
+
+    const erroJson = ps.buildStakedSenderTransport({
+      url: "https://sender.exemplo.com/fast",
+      swqosOnly: false,
+      rawTransactionBase64: "AQID",
+      timeoutMs: 500,
+      fetchImpl: (async () => ({ ok: true, status: 200, json: async () => ({ error: { message: "tip abaixo do mínimo" } }) }) as any) as any,
+    });
+    await assert.rejects(() => erroJson.send(new AbortController().signal) as Promise<any>, /tip abaixo do mínimo/);
+
+    const http500 = ps.buildStakedSenderTransport({
+      url: "https://sender.exemplo.com/fast",
+      swqosOnly: false,
+      rawTransactionBase64: "AQID",
+      timeoutMs: 500,
+      fetchImpl: (async () => ({ ok: false, status: 500, text: async () => "boom" }) as any) as any,
+    });
+    await assert.rejects(() => http500.send(new AbortController().signal) as Promise<any>, /HTTP 500/);
+  });
+
+  await test("adaptadores Jito e RPC: aceite é traduzido e recusa vira exceção (sem 'sucesso' por HTTP)", async () => {
+    const ps = await import("../src/parallelSend.js");
+
+    const jitoOk = ps.buildJitoTransport(async () => ({ success: true, bundleId: "abc123def456" }));
+    assert.ok(String(await jitoOk.send(new AbortController().signal)).includes("aceito"));
+
+    const jitoRecusou = ps.buildJitoTransport(async () => ({ success: false, error: "block engine fora do ar" }));
+    await assert.rejects(() => jitoRecusou.send(new AbortController().signal) as Promise<any>, /fora do ar/);
+
+    const rpcOk = ps.buildRpcDirectTransport(async () => "rpc aceitou");
+    assert.equal(await rpcOk.send(new AbortController().signal), "rpc aceitou");
+
+    const rpcFalhou = ps.buildRpcDirectTransport(async () => {
+      throw new Error("sendRawTransaction: blockhash expirado");
+    });
+    await assert.rejects(() => rpcFalhou.send(new AbortController().signal) as Promise<any>, /blockhash expirado/);
+  });
+
+  await test("integração: a corrida existe no caminho assinado e mantém 'aceito ≠ executado'", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+
+    assert.ok(/PARALLEL_SEND\.enabled/.test(src), "a corrida precisa ser condicionada à política");
+    assert.ok(/buildJitoTransport/.test(src) && /buildStakedSenderTransport/.test(src) && /buildRpcDirectTransport/.test(src));
+    assert.ok(/assertCanSign\("entry"\)/.test(src), "o envio direto passa pelo choke point de assinatura (defesa em profundidade)");
+    /**
+     * A LEITURA das variáveis de envio fica centralizada em `resolveParallelSendPolicy`. Texto
+     * explicativo que cita o nome da variável é permitido — o que não pode existir é um segundo
+     * ponto de decisão no servidor (duas leituras = duas políticas possíveis).
+     */
+    for (const v of ["HFT_PARALLEL_SEND", "HFT_STAKED_SENDER_URL", "HFT_SEND_RPC_DIRECT"]) {
+      assert.equal(
+        src.includes(`process.env.${v}`),
+        false,
+        `${v} não pode ser lida no server: a política é resolvida uma única vez em parallelSend.ts`
+      );
+    }
+
+    // A ordem importa: assinar UMA vez e só então enviar por vários caminhos.
+    const posSign = src.indexOf("tx.sign([keypair])");
+    const posRace = src.indexOf("sendInParallel(");
+    assert.ok(posSign > 0 && posRace > posSign, "a corrida de envio vem DEPOIS da assinatura única");
+
+    // Nenhuma linha pode reportar execução: a confirmação é outro estágio.
+    assert.ok(
+      /status: "submitted_unconfirmed"/.test(src) || /submitted_unconfirmed/.test(src),
+      "aceite continua sendo estado próprio, distinto de confirmado"
+    );
+    assert.ok(/race\.note/.test(src), "o motivo agregado da corrida precisa ser reportado quando falha");
+  });
+
+  await test("envio paralelo: nada aqui assina, guarda chave ou abre conexão própria", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/parallelSend.ts"), "utf8"));
+    for (const proibido of ["Keypair", ".sign(", "secretKey", "OPERATIONAL_PRIVATE_KEY", "new Connection"]) {
+      assert.equal(src.includes(proibido), false, `parallelSend.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(/rawTransactionBase64/.test(src), "recebe bytes JÁ assinados — é o chamador que assina");
   });
 
   console.log("\n=========================================");

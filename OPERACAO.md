@@ -117,11 +117,14 @@ Como LER cada resposta (fato → interpretação):
 6. Deixe rodando em PAPER e observe por tempo suficiente para ver `eventCount` subir e
    aparecerem `shadow-entries`. Se `eventCount` ficar em 0 com `socketOpen=true`, o problema
    é a *filtragem* de logs (programas/hints), não a conexão.
-7. **Se for usar a rota NATIVA de compra** (instrução montada do IDL, sem agregador), valide o
+7. **Se for usar o fast path gRPC** (S7), prove o canal no SEU ambiente antes de ligar:
+   `npm run grpc:check -- --seconds 30` → `VERDICT: canal PROVADO` (updates > 0). Read-only:
+   nada é assinado nem enviado. Sem isso, `HFT_INGEST=wss` (o default) já cobre todos os programas.
+8. **Se for usar a rota NATIVA de compra** (instrução montada do IDL, sem agregador), valide o
    layout contra a rede antes de tudo:
    `npm run pump:dryrun -- <mint> --payer <sua_chave_PUBLICA>` → verdict `err: null`.
    O script **não assina e não envia nada** (simulação com `sigVerify: false`).
-8. Só depois de dias de dado medido — e nunca antes de `npm run replay` mostrar expectativa
+9. Só depois de dias de dado medido — e nunca antes de `npm run replay` mostrar expectativa
    positiva líquida de custos — considere LIVE, que exige as três declarações do item abaixo.
 
 ---
@@ -135,6 +138,21 @@ Como LER cada resposta (fato → interpretação):
 | `LIVE` | sim (exige duas declarações + chave + `ADMIN_TOKEN` + RPC https) | sim, **quando o caminho existir** | trades `mode: live` com assinatura real |
 
 `LIVE` sem todas as condições **não sobe** (exit 1) — é configuração fatal, não aviso.
+
+### 5.0 Transportes: detecção e envio
+
+| Capacidade | Default | Como ligar | O que muda |
+|---|---|---|---|
+| Detecção WebSocket (logsSubscribe) | **ativa** | — | cobre Raydium/CPMM/pump/Meteora; para o pump exige `getTransaction` (`confirmed`) para obter o mint |
+| Fast path gRPC (S7, Yellowstone) | **desligado** | `GEYSER_GRPC_URL` + `GEYSER_GRPC_TOKEN` (e `HFT_INGEST=grpc`) | assina TRANSAÇÕES do pump em `processed`; o mint vem do `CreateEvent` do stream — sem espera de `confirmed` e sem `getTransaction`. É **aditivo**: o WSS continua |
+| Envio paralelo (S8) | **desligado** | `HFT_PARALLEL_SEND=1` (+ `HFT_STAKED_SENDER_URL`, `HFT_SEND_RPC_DIRECT`) | os MESMOS bytes assinados saem por Jito + sender com stake + RPC ao mesmo tempo; o primeiro aceite vence |
+
+Os dois são opt-in por um motivo comum: **cada caminho novo é um custo novo (cota, segredo, taxa) e
+uma responsabilidade nova**. Ligados, ambos são declarados em `GET /api/real-entry` (`ingest`,
+`parallelSend`) — e o que não foi medido aparece como não medido, nunca como número.
+
+`aceito` continua ≠ `executado`: no S8, ganhar a corrida significa "um caminho aceitou os bytes";
+a posição só existe com confirmação e slot observados.
 
 ### 5.1 Caminho de compra (S6) e a rota de entrada
 
@@ -188,9 +206,11 @@ não derruba o boot — a rota não usa o layout.
    quando as três declarações estão presentes, com teto de canário. Enquanto a variável não for
    ligada, todo PnL continua simulado. A **saída** continua dependendo das condições de venda já
    implementadas — leia `GET /api/system-truth` antes de tratar qualquer número como dinheiro.
-   Limites conhecidos: sem bundle Jito (S8), sem gRPC (S7), sem idempotência entre processos.
-2. **gRPC Yellowstone** — o canal de baixa latência está declarado como não implementado; o
-   runtime cai para WSS (mais lento) e diz isso no log.
+   Limites conhecidos: sem idempotência entre processos; envio paralelo (S8) é opt-in; gRPC (S7)
+   é opt-in e exige endpoint do operador.
+2. **gRPC Yellowstone (S7)** — IMPLEMENTADO e **desligado por default**: sem `GEYSER_GRPC_URL` o
+   runtime usa WebSocket (mais lento, com `getTransaction`). O fast path é aditivo, não substitui o
+   WSS. Provedor gRPC de produção costuma ser pago — a ausência dele não impede operar.
 3. **Idempotência entre processos** — a trava de voo único vale por processo; duas instâncias
    na mesma carteira não se enxergam (a solução é guarda NA CADEIA, que não existe aqui).
 4. **Postgres** — persistência é JSON atômico com backup; suficiente para single-writer, não

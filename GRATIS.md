@@ -181,10 +181,12 @@ lançamento visto pelas duas fontes vire **uma** decisão — a duplicata é con
 ## 7. Quando pagar: a ordem que rende mais por real
 
 1. **gRPC (S7)** — assina transação no nível `processed` e elimina a espera de `confirmed` no
-   enriquecimento. É o maior ganho de latência real do sistema hoje. (Helius LaserStream entra no
-   plano Business, US$ 499/mês; Triton e QuickNode têm ofertas próprias.)
+   enriquecimento. É o maior ganho de latência real do sistema hoje. **Já implementado** (aditivo ao
+   WSS): falta apenas um endpoint — `npm run grpc:check` prova o canal antes de ligar. (Helius
+   LaserStream entra no plano Business, US$ 499/mês; Triton e QuickNode têm ofertas próprias.)
 2. **Envio com conexão *staked* (SWQoS)** — isso muda **inclusão** (a transação entrar no bloco),
-   não detecção. É o passo que torna execução real viável.
+   não detecção. É o passo que torna execução real viável. **A corrida de envio já existe**
+   (`HFT_PARALLEL_SEND=1`); o que se paga aqui é o ENDPOINT com stake, que é a sua parte.
 3. **Co-location / ShredStream** — só depois de medir a janela real em milissegundos (S11).
 4. **Postgres / multi-processo** — escala e durabilidade, não velocidade (S10).
 

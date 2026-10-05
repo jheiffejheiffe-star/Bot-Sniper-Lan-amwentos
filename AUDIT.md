@@ -1850,3 +1850,93 @@ Decisão de instrução: `buy_exact_sol_in` (gasta o SOL exato e impõe `min_tok
   implementada, testada estaticamente e *desligada*.
 - **S8 (envio paralelo/bundle) segue não implementado** — a rota nativa melhora a montagem, não o
   envio. Sem bundle, o landing continua sujeito ao que o RPC entregar.
+
+---
+
+## Adendo 17 — S7 (ingestão gRPC) e S8 (envio paralelo): o que cada um remove do caminho crítico (2026-10-05)
+
+### 1. Contexto
+
+O S6b tirou o agregador do caminho de MONTAGEM da compra. Restavam dois gargalos declarados:
+**detecção** (o mint do pump só era obtido com `getTransaction` em `confirmed`, porque a RPC não
+aceita `processed` nessa chamada — uma espera estrutural, não um bug) e **entrega** (a transação
+saía por um único caminho — o bundle Jito). Este adendo cobre os dois, com a mesma régua dos
+anteriores: o que entra é o que foi medido; o que não foi medido aparece como não medido.
+
+### 2. S7 — ingestão gRPC (Yellowstone)
+
+**O que muda no caminho crítico, em concreto:** a transação chega inteira no próprio update do
+stream (mensagem + meta + logs) em `processed`. O mint passa a vir do `CreateEvent` **dentro dos
+logs daquela transação**, decodificado do IDL pinado — zero `getTransaction`, zero repetição de
+80 ms, zero espera por confirmação para ENRIQUECER. A confirmação continua obrigatória para
+DECIDIR (o `realEntry` exige slot observado).
+
+**Decisão de arquitetura: aditivo, não substituto.** O WebSocket continua assinando os 4 programas.
+Motivo medido: trocar de transporte não pode custar COBERTURA — Raydium/CPMM/Meteora também criam
+pools, e o WSS é o que os cobre. Com os dois ativos, o mesmo lançamento pode chegar duas vezes; por
+isso há dedupe por assinatura **entre fontes** (`crossSourceDuplicatesDropped` no health), com teto
+de memória e descarte FIFO. Contador alto ali é o comportamento esperado do dedupe, não defeito.
+
+**Segredo:** o token do provedor nunca entra em log — `redactGrpcEndpoint` cobre credencial com e
+sem esquema de URL, `sanitizeGrpcError` remove o valor das mensagens, e há teste que varre o código.
+O teste pegou uma falha real na primeira versão da redação (só tratava `proto://user:pass@host`).
+
+### 3. S8 — envio paralelo
+
+**O que paraleliza é a ENTREGA, nunca a assinatura.** A transação é assinada UMA vez; os bytes são
+idênticos em todos os caminhos, e na Solana a assinatura é o identificador da transação — os mesmos
+bytes não podem entrar duas vezes. Duplicar a operação exigiria assinar duas vezes, e isso o sistema
+de intenções bloqueia ANTES de assinar. Esta é a razão pela qual a corrida é segura por construção,
+e ela está escrita no módulo e fixada por teste.
+
+**Semântica fixada por teste:** todos partem juntos; o primeiro aceite vence; **os perdedores não são
+cancelados** (abortar um envio que poderia entrar no próximo bloco destruiria o motivo da corrida);
+todos falhando, os motivos são AGREGADOS (`jito=HTTP 429 | staked=HTTP 403`), nunca um erro genérico;
+timeout por transporte sem deixar `await` pendurado; transporte duplicado é config inválida.
+
+**Aceite exige prova:** o transporte com stake só considera aceito quando o JSON-RPC devolve
+assinatura em `result`. HTTP 200 com corpo estranho, `{error: ...}` ou resposta não-JSON são
+RECUSAS declaradas. Aceitar "algo respondeu 200" é como a telemetria vira ficção.
+
+**O que NÃO foi feito, de propósito:** nenhum endpoint de provedor foi inventado. O caminho com
+stake exige URL do operador (`HFT_STAKED_SENDER_URL`) e uma relação de stake/tip com o provedor que
+é de infraestrutura, não de código. Sem URL, o transporte simplesmente não entra na corrida — e o
+fato de estar fora é declarado em `GET /api/real-entry → parallelSend.notes`.
+
+### 4. Progresso do IDL: discriminadores agora são VERIFICADOS, não lidos
+
+O excerto ganhou os eventos (`CreateEvent`, `TradeEvent`, `CompleteEvent`,
+`CompletePumpAmmMigrationEvent`, `Shareholder`) — verbatim dos blocos 29/30/32/33 do IDL oficial. E
+o teste [25] passou a conferir **todo** discriminador por recálculo de
+`sha256("global:nome")` / `sha256("account:Nome")` / `sha256("event:Nome")` (primeiros 8 bytes): o
+esquema do Anchor é público e conferível sem rede. Isso é verificação independente da transcrição —
+o mesmo tipo de prova que pegou o endereço sósia do `event_authority` no S6b.
+
+### 5. Evidências (medidas, não declaradas)
+
+`npm run lint` → 0 erros · `npm run test` → **244/244** (eram 221; grupos [26] e [27] com 23 testes) ·
+`npm run build` → ok.
+
+| Cenário | Resultado observado |
+|---|---|
+| Boot PAPER com `HFT_INGEST=grpc` + endpoint inexistente | WSS segue assinando **os 4 programas**; gRPC tenta, falha e faz backoff 1s→2s→4s→8s; `/api/real-entry → ingest.active.reconnects` conta as tentativas |
+| Token do provedor no ambiente | **0 ocorrências** do valor em todo o log de boot (verificado por `grep -c`) |
+| `npm run grpc:check --url <inexistente> --token <segredo>` | verdict honesto (`canal MUDO`), motivos por extenso, `reconnects: 3`, token ausente da saída, e a instrução de manter `wss` |
+| `npm run grpc:check` sem endpoint | recusa com motivo e **sem** stack trace: não inventa endpoint |
+| Boot PAPER com `HFT_PARALLEL_SEND=1` + sender + RPC direto | `[Boot][Env]` declara `jito + staked + rpc` e as ressalvas (`?swqos_only=true`, cota de envio, base da segurança) |
+| `/api/real-entry` em PAPER | `parallelSend.policy` e `ingest.policy` publicados; `idlDrift` continua `IDL_NAO_VERIFICADO` neste sandbox (sem egress) |
+| Pacote nativo no bundle CJS | carregado por `import()` dinâmico: o runtime subiu e a falha de conexão veio do provedor, não do módulo |
+| Timeout de transporte | transporte pendurado morre no limite configurado e o resultado sai mesmo assim (teste: < 1,5s para timeout de 120ms) |
+
+### 6. O que continua aberto
+
+- **Nenhum dos dois foi exercitado contra infraestrutura real aqui**: não há egress neste sandbox. O
+  gRPC precisa de `npm run grpc:check` no VPS; a corrida precisa de um sender com stake configurado
+  pelo operador. **Nada disto autoriza ligar `HFT_INGEST=grpc` nem `HFT_PARALLEL_SEND=1` sozinho.**
+- **Taxa de aceite por caminho não é medida aqui.** Publicado (RPC público < 30%, mid-tier 70-75%,
+  dedicado ~94%) é número de terceiro — o sistema registra CADA tentativa com latência e motivo
+  (`[S8] transporte … ACEITOU/recusou … em Nms`), que é o dado bruto para calcular a taxa quando
+  houver amostra.
+- **`processed` não é final**: detecção em `processed` acelera, mas uma transação pode não entrar no
+  bloco. A confirmação com slot observado continua sendo o único caminho para uma posição existir.
+- **S9+ seguem fora**: rótulos de resultado, Postgres, ShredStream, Rust.

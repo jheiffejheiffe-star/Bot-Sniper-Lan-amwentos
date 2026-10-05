@@ -370,6 +370,8 @@ export class GeyserStreamClient {
   private activeSubscriptions: number[] = [];
   private lastEventAt: number = 0;
   private eventCount: number = 0;
+  /** Eventos entregues por OUTRA fonte (fast path gRPC) via `emitDetected`. */
+  private forwardedFromOtherSources = 0;
   /**
    * DEDUPE DE NOTIFICAÇÃO (S5). Um WebSocket que reconecta reentrega o que perdeu, e o
    * `logsSubscribe` não promete entrega única. Sem isso, a MESMA criação de pool entra
@@ -406,19 +408,38 @@ export class GeyserStreamClient {
   }
 
   public async connect(): Promise<void> {
-    console.log(`[GeyserClient] Handshake de ingresso: gRPC=${this.grpcUrl || "não configurado (usando WSS fallback)"}, RPC=${this.rpcUrl}`);
-
+    /**
+     * S7: o canal gRPC dedicado NÃO é mais aberto por aqui. Ele vive em `src/grpcIngest.ts`
+     * (cliente próprio, com filtro de transações no commitment `processed`) e é CRIADO PELO
+     * SERVIDOR em paralelo a este cliente — que passou a ser o caminho de WebSocket para TODOS os
+     * programas, incluindo o pump. Dois clientes no mesmo objeto era uma confusão que impedia
+     * declarar honestamente o que cada transporte estava entregando.
+     */
     if (this.grpcUrl) {
-      // Yellowstone gRPC exige cliente protobuf dedicado (@triton-one/yellowstone-grpc
-      // ou equivalente). Não simulamos a conexão: declaramos explicitamente que o
-      // caminho gRPC não está implementado neste runtime.
       console.warn(
-        "[GeyserClient] GEYSER_GRPC_URL configurado, mas o cliente protobuf Yellowstone não está " +
-          "implementado neste runtime. Caindo para WebSocket RPC (latência maior). " +
-          "Para latência competitiva, implemente o canal gRPC dedicado."
+        "[GeyserClient] GEYSER_GRPC_URL foi passado a este cliente WebSocket, que não abre gRPC. " +
+          "O fast path gRPC é criado pelo servidor (`GrpcIngestClient`); este cliente cobre o " +
+          "WebSocket de todos os programas."
       );
     }
     await this.connectWebsocketFallback();
+  }
+
+  /**
+   * ENTREGA DE EVENTO EXTERNO (S7) — um evento obtido pelo fast path gRPC entra no pipeline por
+   * aqui, para haver UM único ponto de entrada e UMA contagem de detecção.
+   *
+   * `eventCount`/`lastEventAt` SÃO incrementados: a pergunta que estes campos respondem é "quantos
+   * lançamentos chegaram ao pipeline", não "quantos chegaram por WebSocket". Voltar a contá-los
+   * apenas no WSS faria `/api/health → detection.eventCount` mostrar 0 enquanto o bot detecta
+   * lançamentos pelo gRPC — exatamente o tipo de telemetria enganosa que este projeto remove.
+   * `forwardedFromOtherSources` separa as duas origens para quem precisa do detalhe.
+   */
+  public emitDetected(event: LaunchEvent): void {
+    this.eventCount++;
+    this.lastEventAt = Date.now();
+    this.forwardedFromOtherSources++;
+    if (this.callback) this.callback(event);
   }
 
   /**
@@ -667,10 +688,13 @@ export class GeyserStreamClient {
         enrichmentFailures: this.enrichmentFailures,
         lastLocalSlot: this.lastLocalSlot,
         lastLocalSlotAgeMs: this.lastLocalSlotAt ? Date.now() - this.lastLocalSlotAt : null,
+        /** Quantos dos eventos contados vieram do fast path gRPC (S7) em vez deste WebSocket. */
+        forwardedFromOtherSources: this.forwardedFromOtherSources,
       },
       note:
         "socketOpen=true significa socket estabelecido. subscriptionsRequested NÃO é confirmação " +
-        "do RPC. A prova de detecção é eventCount > 0.",
+        "do RPC. A prova de detecção é eventCount > 0 — que inclui eventos repassados pelo fast " +
+        "path gRPC (`hotPath.forwardedFromOtherSources`), pois ambos entram pelo mesmo pipeline.",
       recentErrors: this.subscriptionErrors.slice(-5),
     };
   }
