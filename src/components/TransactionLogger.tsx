@@ -33,6 +33,8 @@ export function TransactionLogger({ transactions }: TransactionLoggerProps) {
                 <th className="py-3 px-2">Acquired</th>
                 <th className="py-3 px-2">Latency</th>
                 <th className="py-3 px-2">Tip</th>
+                {/* B: o resultado só aparece COM procedência (régua do rótulo do S9/S11/S14). */}
+                <th className="py-3 px-2">Resultado</th>
                 <th className="py-3 px-2 text-right">Status</th>
               </tr>
             </thead>
@@ -75,6 +77,33 @@ export function TransactionLogger({ transactions }: TransactionLoggerProps) {
                     </span>
                   </td>
                   <td className="py-3.5 px-2 text-slate-400 text-[11px]">{tx.tipSol} SOL</td>
+                  <td className="py-3.5 px-2">
+                    {/*
+                      B: sem rótulo do servidor, NADA de PnL é exibido — "não medido" é a resposta
+                      honesta. Um número sem procedência (receita da venda lida como lucro, por
+                      exemplo) é o defeito do Adendo 19; aqui ele não tem por onde aparecer.
+                    */}
+                    {typeof tx.pnlNetSol === "number" && tx.label ? (
+                      <div className="flex flex-col" title={`${tx.labelBasis ?? "?"}${tx.labelReason ? ` — ${tx.labelReason}` : ""}`}>
+                        <span
+                          className={`text-[11px] font-bold ${
+                            tx.pnlNetSol >= 0 ? "text-emerald-400" : "text-rose-400"
+                          }`}
+                        >
+                          {tx.pnlNetSol >= 0 ? "+" : ""}
+                          {tx.pnlNetSol.toFixed(6)} SOL
+                        </span>
+                        <span className="text-[9px] text-slate-500">
+                          {tx.labelBasis === "net_measured" ? "ciclo medido" : (tx.labelBasis ?? tx.label)}
+                          {tx.excludedFromValidation ? " · fora da validação" : ""}
+                        </span>
+                      </div>
+                    ) : (
+                      <span className="text-[10px] text-slate-500" title={tx.labelReason ?? "sem rótulo de procedência do servidor"}>
+                        não medido
+                      </span>
+                    )}
+                  </td>
                   <td className="py-3.5 px-2 text-right">
                     <span
                       className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${

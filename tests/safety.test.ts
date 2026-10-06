@@ -6679,6 +6679,120 @@ async function main(): Promise<void> {
     assert.ok(serverSrc.includes('app.get("/api/reconciliation"'), "o endpoint de leitura precisa existir");
   });
 
+  // ---------------------------------------------------------------------------
+  // [34] B — procedência até a superfície + gate de saída na via AUTÔNOMA
+  // ---------------------------------------------------------------------------
+  console.log("\n[34] B — o rótulo viaja com o número; a via autônoma passa pelo gate");
+
+  /** Trade cru como o banco guarda (sem rótulo: o rótulo é ANEXADO na superfície). */
+  const tradeCru = (over: any = {}) => ({
+    id: "txn_1",
+    token: "TOKEN",
+    mint: "MintHigi1111111111111111111111111111111111",
+    amount: "0.01 SOL (REAL)",
+    outAmount: "1.00 TOKEN",
+    status: "success",
+    block: 123,
+    tipSol: 0.0001,
+    route: "KMS Real Exit Jito (TAKE_PROFIT)",
+    time: "12:00:00.000",
+    latencyMs: 900,
+    mode: "live",
+    signature: "sigHigi11111111111111111111111111111111111111111111111111",
+    ...over,
+  });
+
+  await test("superfície: o rótulo é ANEXADO ao registro (medido, reconciliado e sem procedência)", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+
+    // 1) Ciclo medido: PnL elegível, com procedência declarada.
+    const medido = ol.annotateTradeWithOutcome(tradeCru({ pnlNetSol: -0.004, pnlBasis: "round_trip_legs", measuredOnChain: true }) as any);
+    assert.equal(medido.labelBasis, "net_measured");
+    assert.equal(medido.excludedFromValidation, false);
+    assert.equal(medido.pnlNetSol, -0.004, "o registro original continua inteiro (annotate é aditivo)");
+    assert.equal(medido.id, "txn_1");
+    assert.ok(medido.labelReason.length > 0);
+
+    // 2) Reconciliado (S14): elegível, mas com base PRÓPRIA — a superfície mostra de onde veio.
+    const reconciliado = ol.annotateTradeWithOutcome(
+      tradeCru({ pnlNetSol: 0.01, pnlBasis: "round_trip_legs_reconciled", measuredOnChain: true, reconciledAt: "2026-10-06T18:00:00.000Z", supersededPnlNetSol: 0.02 }) as any
+    );
+    assert.equal(reconciliado.labelBasis, "net_measured");
+    assert.equal(reconciliado.excludedFromValidation, false);
+
+    // 3) O defeito do Adendo 19 na superfície: número "medido" SEM procedência declarada não vira
+    //    resultado — fica excluído e o motivo viaja junto (nada de número solto).
+    const semProcedencia = ol.annotateTradeWithOutcome(tradeCru({ pnlNetSol: 0.02, measuredOnChain: true }) as any);
+    assert.notEqual(semProcedencia.labelBasis, "net_measured");
+    assert.equal(semProcedencia.excludedFromValidation, true);
+    assert.ok(/proced/i.test(semProcedencia.labelReason) || /sem/i.test(semProcedencia.labelReason), semProcedencia.labelReason);
+  });
+
+  await test("/api/snipes serve o BANCO (fonte única): o array em memória não existe mais", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+
+    assert.equal(code.includes("snipedTransactions"), false, "o segundo estado do histórico foi REMOVIDO (era o que divergia do banco)");
+    // Remover o array em memória NÃO pode ter removido a PERSISTÊNCIA: cada gravador continua
+    // salvando no banco (o que sobrava era só o espelho em memória, que divergia).
+    for (const gravacao of ["saveTrade(realCloseTx)", "saveTrade(mockTx)", "saveTrade(paperTx)", "saveTrade(paperTrade)", "saveTrade(failedExitTx)"]) {
+      assert.ok(code.includes(gravacao), `a persistência precisa continuar: ${gravacao} ausente`);
+    }
+    // Outros arrays em memória (telemetria/ring buffer de eventos) são legítimos e permanecem:
+    assert.ok(code.includes("failoverEvents.unshift("), "a telemetria de failover não faz parte desta remoção");
+
+    const i = code.indexOf('app.get("/api/snipes"');
+    assert.ok(i > 0, "o endpoint precisa existir");
+    const corpo = code.slice(i, code.indexOf("});", i));
+    assert.ok(corpo.includes("dbStore.getTrades()"), "o histórico servido precisa vir do banco no momento da requisição");
+    assert.ok(corpo.includes("annotateTradeWithOutcome"), "e cada registro precisa sair COM a procedência anexada");
+  });
+
+  await test("via AUTÔNOMA de saída: mesmo gate do manual, ANTES da trava de voo único e da intenção", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const code = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+
+    const iFn = code.indexOf("async function executeAutonomousExit(");
+    assert.ok(iFn > 0, "a função precisa existir");
+    // Fim da função: o próximo "async function" ou "function" no mesmo nível — usa a distância até o
+    // próximo cabeçalho de função conhecido para delimitar a inspeção.
+    const iFim = code.indexOf("\nasync function", iFn + 10);
+    const corpo = code.slice(iFn, iFim > 0 ? iFim : iFn + 6000);
+
+    const iGate = corpo.indexOf("assertExitAllowed()");
+    const iLock = corpo.indexOf("exitLocks.add(pos.id)");
+    const iIntent = corpo.indexOf("persistIntent(");
+    const iSign = corpo.indexOf("submitSignedTransaction(");
+    assert.ok(iGate > 0, "a via autônoma precisa chamar assertExitAllowed()");
+    assert.ok(iGate < iLock, "o gate precisa vir ANTES de a posição entrar em exit_pending");
+    assert.ok(iGate < iIntent, "e ANTES de persistir intenção (não se cria intenção para recusar depois)");
+    assert.ok(iGate < iSign, "e antes de qualquer assinatura/envio");
+    assert.ok(corpo.includes("permanece ABERTA"), "a recusa precisa dizer que a posição continua aberta");
+    assert.ok(code.includes("exitGateBlockedWarned"), "aviso único por posição (não inundar o log a cada ciclo)");
+
+    // A via autônoma continua sendo SÓ de posição real: paper fecha em sombra.
+    const iLoop = code.indexOf("const isPaper = posClass.kind");
+    assert.ok(iLoop > 0, "o classificador de posição precisa existir no laço");
+    // A janela cobre o laço inteiro até a primeira chamada de fechamento em sombra (distância real
+    // medida no arquivo: ~15 mil caracteres).
+    const trecho = code.slice(iLoop, iLoop + 25000);
+    assert.ok(/if \(isPaper\)/.test(trecho), "paper precisa continuar fechando em sombra (recordPaperClose)");
+    assert.ok(trecho.includes("recordPaperClose("), "o fechamento em sombra precisa continuar existindo");
+  });
+
+  await test("painel: NÃO existe PnL exibido sem rótulo do servidor", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ui = fs.readFileSync(path.join(repoRoot, "src/components/TransactionLogger.tsx"), "utf8");
+    assert.ok(/typeof tx\.pnlNetSol === "number" && tx\.label/.test(ui), "o PnL só pode ser exibido quando o rótulo vier junto");
+    assert.ok(ui.includes("não medido"), "sem rótulo, o painel diz 'não medido' em vez de mostrar número");
+
+    const tipos = fs.readFileSync(path.join(repoRoot, "src/types.ts"), "utf8");
+    for (const campo of ["label?", "labelBasis?", "labelReason?", "excludedFromValidation?", "pnlNetSol?"]) {
+      assert.ok(tipos.includes(campo), `SnipedTransaction precisa declarar ${campo}`);
+    }
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

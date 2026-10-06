@@ -24,6 +24,16 @@ export interface RpcNode {
 
 export interface SnipedTransaction {
   id: string;
+  /**
+   * B — PROCEDÊNCIA DO RESULTADO, anexada pelo servidor (`annotateTradeWithOutcome`) em
+   * `GET /api/snipes`. Sem estes campos a tabela mostra um PnL sem dizer se ele é medido, de qual
+   * perna veio, ou se está fora da validação estatística.
+   */
+  label?: string;
+  labelBasis?: string;
+  labelReason?: string;
+  excludedFromValidation?: boolean;
+  pnlNetSol?: number;
   token: string;
   mint: string;
   amount: string;

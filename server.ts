@@ -61,7 +61,7 @@ import {
   type RealEntryDeps,
   type RealEntryResult,
 } from "./src/realEntry.js";
-import { labelAll } from "./src/outcomeLabels.js";
+import { annotateTradeWithOutcome, labelAll } from "./src/outcomeLabels.js";
 import { buildValidationReport } from "./src/strategyValidation.js";
 import {
   PostgresStorage,
@@ -1000,8 +1000,12 @@ function restrictToDev(_req: express.Request, res: express.Response, next: expre
   next();
 }
 
-// Initialize Trades (Snipes) from persistent database
-const snipedTransactions: any[] = dbStore.getTrades();
+/**
+ * B: o array em memória foi REMOVIDO. Ele era um segundo estado do histórico (semeado no boot,
+ * teto de 25 por `unshift`/`pop`) que podia divergir do banco — inclusive ficando invisível para
+ * registros gravados fora dele (reconciliação S14, restauração do Postgres S10). O histórico é
+ * servido por `GET /api/snipes` direto de `dbStore.getTrades()`.
+ */
 
 // Global thread-safe set for position liquidation locks (Race condition prevention)
 const exitLocks = new Set<string>();
@@ -1010,6 +1014,8 @@ const exitLocks = new Set<string>();
 const invalidPositionWarned = new Set<string>();
 /** Intenções de saída bloqueadas já avisadas (evita commit em disco a cada ciclo). */
 const blockedIntentWarned = new Set<string>();
+/** B: gate de saída recusando — 1 aviso por posição, para não inundar o log a cada ciclo. */
+const exitGateBlockedWarned = new Set<string>();
 
 /**
  * ORÁCULO DE TIP (S3).
@@ -2501,10 +2507,6 @@ app.post("/api/positions/close", async (req, res) => {
     };
 
     dbStore.saveTrade(realCloseTx);
-    snipedTransactions.unshift(realCloseTx);
-    if (snipedTransactions.length > 25) {
-      snipedTransactions.pop();
-    }
 
     /**
      * S12 — LIVRO DE PERDA DIÁRIA. Recebe SOMENTE PnL de ciclo medido (as duas pernas); ganho
@@ -3141,8 +3143,20 @@ app.get("/api/jito/bundle-status", async (req, res) => {
 });
 
 // 3. API: Recent Snipes
+/**
+ * HISTÓRICO SERVIDO AO PAINEL. Duas correções de higiene (B):
+ *
+ * 1. **Fonte única.** Antes servia `snipedTransactions`, um array EM MEMÓRIA semeado uma vez no boot
+ *    e limitado a 25 entradas por `unshift`/`pop` — ou seja, a superfície podia divergir do banco: um
+ *    registro gravado por caminho que não passasse por ali (reconciliação do S14, restauração do
+ *    Postgres/S10) NÃO aparecia, e o histórico visível ficava truncado em 25. Agora lê
+ *    `dbStore.getTrades()` no momento da requisição: o que está no banco é o que se vê.
+ * 2. **Procedência junto do número.** Cada registro sai com `label`/`labelBasis`/
+ *    `excludedFromValidation`/`labelReason` (ver `annotateTradeWithOutcome`): PnL sem procedência
+ *    declarada não pode ser lido como resultado — nem aqui, nem em `jq`.
+ */
 app.get("/api/snipes", (_req, res) => {
-  return res.json(snipedTransactions);
+  return res.json(dbStore.getTrades().map((t) => annotateTradeWithOutcome(t as any)));
 });
 
 // 4. API: Simulate sniper execution
@@ -3331,11 +3345,6 @@ app.post("/api/simulate-snipe", restrictToDev, async (req, res) => {
         correlationId
       });
     }
-  }
-
-  snipedTransactions.unshift(mockTx);
-  if (snipedTransactions.length > 25) {
-    snipedTransactions.pop();
   }
 
   // Persist the transaction to the relational JSON database
@@ -5027,10 +5036,6 @@ Respond in a short, scannable JSON object with these keys:
   };
 
   dbStore.saveTrade(paperTx);
-  snipedTransactions.unshift(paperTx);
-  if (snipedTransactions.length > 25) {
-    snipedTransactions.pop();
-  }
 
   dbStore.savePosition({
     id: `pos_paper_${Date.now()}`,
@@ -6782,8 +6787,6 @@ function recordPaperClose(pos: any, reason: string, pnlPercent: number): void {
   };
 
   dbStore.saveTrade(paperTrade);
-  snipedTransactions.unshift(paperTrade);
-  if (snipedTransactions.length > 25) snipedTransactions.pop();
 
   pos.status = "closed";
   pos.pnlPercent = pnlPercent;
@@ -7771,6 +7774,46 @@ async function measureRoundTrip(
 
 async function executeAutonomousExit(pos: any, reason: string, pnlPercent: number, correlationId: string): Promise<void> {
   /**
+   * GATE DE SAÍDA (B) — a via AUTÔNOMA passa pela MESMA política do fechamento manual
+   * (`POST /api/positions/close`). Antes, só o manual chamava `assertExitAllowed()`: aqui a saída ia
+   * direto para trava de intenção → assinatura, e uma configuração explícita de bloqueio
+   * (`BLOCK_EXITS_ON_KILL_SWITCH=true`) era IGNORADA justamente no caminho que decide o prejuízo.
+   *
+   * A política é assimétrica de propósito e vale igual nos dois caminhos: fora do modo LIVE a
+   * liquidação on-chain é recusada (409 `EXIT_BLOCKED_BY_MODE`); com kill switch ativo a saída é
+   * PERMITIDA (reduz exposição) a menos que o operador tenha pedido bloqueio total; read-only
+   * permite saída com aviso.
+   *
+   * Recusar AQUI — antes da trava de voo único e antes de persistir intenção — é deliberado: nada é
+   * assinado, nenhuma intenção é criada, a posição NÃO entra em `exit_pending` e continua aberta,
+   * apenas declarada. Criar a intenção para depois falhar deixaria a posição travada em
+   * `exit_pending` esperando uma evidência que nunca viria.
+   */
+  const exitGate = assertExitAllowed();
+  if (!exitGate.ok) {
+    if (!exitGateBlockedWarned.has(pos.id)) {
+      exitGateBlockedWarned.add(pos.id);
+      console.warn(`[Exit Gate] Saída autônoma de ${pos.id} bloqueada: ${exitGate.error}`);
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "WARN",
+        component: "RISK_ENGINE",
+        message:
+          `[EXIT GATE] Saída autônoma de $${pos.token ?? pos.id} (${reason}) NÃO iniciada: ${exitGate.error} ` +
+          `A posição permanece ABERTA e a exposição continua contando. Nada foi assinado.`,
+        correlationId,
+      });
+    }
+    return;
+  }
+  for (const w of exitGate.warnings) {
+    if (!exitGateBlockedWarned.has(`${pos.id}:${w}`)) {
+      exitGateBlockedWarned.add(`${pos.id}:${w}`);
+      console.warn(`[Exit Gate] Saída autônoma de ${pos.id}: ${w}`);
+    }
+  }
+
+  /**
    * Trilha de latência da SAÍDA. O caminho de saída é o que decide se a perda para no
    * stop ou vira prejuízo grande — medir cada estágio é o mínimo para poder discuti-lo.
    * A amostra é gravada tanto no sucesso quanto na falha (falha também é resultado).
@@ -8223,10 +8266,6 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     };
 
     dbStore.saveTrade(realCloseTx);
-    snipedTransactions.unshift(realCloseTx);
-    if (snipedTransactions.length > 25) {
-      snipedTransactions.pop();
-    }
 
     /** S12 — livro de perda diária (mesma doutrina do fechamento manual). */
     dailyLossLedger.record({
@@ -8406,10 +8445,6 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     };
 
     dbStore.saveTrade(failedExitTx);
-    snipedTransactions.unshift(failedExitTx);
-    if (snipedTransactions.length > 25) {
-      snipedTransactions.pop();
-    }
 
     // Tentativa de saída FRACASSADA não é fechamento: a posição segue aberta e exposta.
     // Gravar como 'closed' aqui mascararia capital preso — o registro é 'exit_failed'.

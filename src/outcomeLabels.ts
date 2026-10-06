@@ -181,6 +181,34 @@ export function classifyAttemptKind(trade: Partial<DBTrade>): { kind: AttemptKin
 /* 2. RÓTULO DE UM TRADE                                                      */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * B — O RÓTULO NO PRÓPRIO REGISTRO (para a superfície que serve trades ao operador).
+ *
+ * `labelTrade` devolve um objeto de ANÁLISE. Quando o registro cru é servido a quem opera — o painel,
+ * um `jq` no `/api/snipes`, um relatório de terceiro — o número de PnL viaja SOZINHO e pode ser lido
+ * como resultado. Aqui o rótulo é ANEXADO ao registro: quem lê o número vê, no mesmo objeto, se ele
+ * é `net_measured`, se está excluído da validação e por quê.
+ *
+ * Aditivo e sem custo: mesmos campos, nenhuma chamada de rede.
+ */
+export interface TradeOutcomeAnnotation {
+  label: OutcomeLabel;
+  labelBasis: OutcomeBasis;
+  excludedFromValidation: boolean;
+  labelReason: string;
+}
+
+export function annotateTradeWithOutcome(trade: DBTrade): DBTrade & TradeOutcomeAnnotation {
+  const rotulo = labelTrade(trade);
+  return {
+    ...trade,
+    label: rotulo.label,
+    labelBasis: rotulo.basis,
+    excludedFromValidation: rotulo.excluded,
+    labelReason: rotulo.reason,
+  };
+}
+
 export function labelTrade(trade: DBTrade): LabeledOutcome {
   const provenance: string[] = [];
   const mode: LabeledOutcome["mode"] = trade.mode === "live" || trade.mode === "paper" ? trade.mode : "unknown";

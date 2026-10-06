@@ -324,6 +324,16 @@ O caminho que decide o prejuízo é a SAÍDA. Três invariantes valem nos **dois
    pré-requisito para gerir como real. Posição herdada sem `mode` é `unverified`: não assina saída,
    não é apagada e continua contando para EXPOSIÇÃO (lado conservador).
 
+**Gate de saída nos DOIS caminhos (B).** `assertExitAllowed()` era chamado só no fechamento
+manual (`POST /api/positions/close`). A via AUTÔNOMA (stop/take-profit/trailing) ia direto para a
+trava de intenção e a assinatura — ou seja, uma configuração explícita de bloqueio
+(`BLOCK_EXITS_ON_KILL_SWITCH=true`) era ignorada justamente no caminho que decide o prejuízo. Agora
+a política é a mesma nos dois: fora do LIVE recusa (`EXIT_BLOCKED_BY_MODE`, nada é assinado);
+kill switch permite sair (reduz exposição) salvo bloqueio explícito; read-only permite com aviso. A
+recusa acontece **antes** de a posição entrar em `exit_pending` e **antes** de persistir intenção —
+recusar depois deixaria a posição travada esperando uma evidência que nunca viria. Aviso único por
+posição (não inundar o log a cada ciclo de 3 s).
+
 **Freios por resultado (ENFORÇADOS desde o S12):** `MAX_DAILY_LOSS_SOL` soma **só** PnL de ciclo
 medido (as duas pernas) com data legível — ganho não abate perda e medido sem data fica declarado
 fora da soma; ao atingir o teto, o kill switch é acionado (entradas param, saídas continuam).
@@ -367,6 +377,13 @@ entrando no teto de perda diária); **nada é assinado, enviado, ou precisa de c
 ser visto sem medir nada em `GET /api/reconciliation`. O relatório sai em
 `data/reconciliation-<timestamp>.json` (fora do git, também no dry-run) e o banco é gravado só no
 ramo `--apply`.
+
+**Onde isso aparece.** `GET /api/snipes` (o histórico servido ao painel) agora lê o banco no
+momento da requisição — antes servia um array EM MEMÓRIA semeado uma vez no boot e limitado a 25
+entradas, então reconciliação e restauração do Postgres podiam simplesmente não aparecer. Cada
+registro sai com `label`/`labelBasis`/`excludedFromValidation`/`labelReason`, e o painel só mostra
+PnL quando o rótulo vem junto (`não medido` no resto dos casos): um número solto não tem por onde
+ser lido como resultado.
 
 **Perspectiva honesta:** reconciliar não valida estratégia. Transforma registros existentes em
 amostra legível — a conclusão de `/api/performance` continua sendo `sem_dados` até haver ≥100

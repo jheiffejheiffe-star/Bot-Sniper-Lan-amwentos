@@ -2362,3 +2362,54 @@ ponto de escrita no banco fora do ramo `--apply`, ou se o dry-run deixar de ser 
 - Reconciliar **não** valida a estratégia: apenas transforma registros existentes em amostra
   legível. Sem ≥100 desfechos `net_measured`, a conclusão estatística continua sendo "não há
   evidência suficiente".
+
+---
+
+## Adendo 23 — B: procedência até a superfície + gate de saída na via autônoma (2026-10-06)
+
+### 1. Item original reavaliado (e por que não foi implementado como estava)
+
+O item pendente dizia `DBSession.label = DBTrade["pnlBasis"]` em `src/persistence.ts`. **Esse tipo
+não existe neste repositório**: não há `DBSession` em nenhum arquivo (`grep -rn "DBSession"` → 0
+ocorrências). O que existia de verdade era o problema que ele tentava resolver: **o rótulo de
+procedência do PnL não chegava à superfície que serve trades ao operador**. Também foi verificado,
+e NÃO procede, um defeito suspeitado no espelho Postgres: `mirrorTrade` grava o registro inteiro em
+`payload JSONB` e `fetchTrades` lê `payload` — `pnlBasis`, `supersededPnlNetSol`, `entryLegSignature`
+sobrevivem ao espelho e à restauração.
+
+### 2. Defeitos REAIS encontrados e corrigidos
+
+1. **`GET /api/snipes` divergia do banco.** Servia `snipedTransactions`: um array em memória semeado
+   UMA vez no boot e limitado a 25 entradas por `unshift`/`pop`. Consequência: registro gravado por
+   caminho que não passasse por ali (reconciliação do S14, restauração do S10/Postgres) **não
+   aparecia**, e o histórico visível ficava truncado em 25. O array foi REMOVIDO (e os 6 pares
+   `unshift`/`pop` com ele); a persistência (`saveTrade`) de cada gravador foi mantida — há teste que
+   falha se alguma delas sumir.
+2. **PnL sem procedência na superfície.** Os registros crus carregavam `pnlNetSol` sem dizer se é
+   `net_measured`, de qual perna veio, ou se está fora da validação. `annotateTradeWithOutcome`
+   (em `src/outcomeLabels.ts`, puro) anexa `label`/`labelBasis`/`excludedFromValidation`/`labelReason`
+   a cada registro servido; `SnipedTransaction` passou a declarar esses campos; e o
+   `TransactionLogger` só mostra PnL **quando o rótulo vem junto** (`não medido` no resto) — a
+   receita da venda não tem mais por onde ser exibida como lucro.
+3. **A via AUTÔNOMA de saída não passava pelo gate.** `assertExitAllowed()` só era chamado no
+   fechamento manual; o stop/take-profit/trailing ia direto para a trava de intenção e a assinatura.
+   `BLOCK_EXITS_ON_KILL_SWITCH=true` era ignorado exatamente no caminho que decide o prejuízo. Agora
+   a chamada fica no topo de `executeAutonomousExit` — **antes** de `exitLocks.add(pos.id)` e de
+   `persistIntent(...)`: recusar depois deixaria a posição travada em `exit_pending` à espera de uma
+   evidência que nunca viria. Aviso único por posição, com a frase explícita de que a posição
+   permanece ABERTA e a exposição continua contando.
+
+### 3. Verificação
+
+`npm run lint` 0 · `npm run test` **302/302** (grupo `[34]`, 4 testes novos) · `npm run build` ok.
+Os testes falham se: o array voltar, o endpoint perder a leitura do banco ou o rótulo, alguma
+`saveTrade` sumir junto com a remoção, o gate sair de posição (depois da trava/intenção), ou a UI
+exibir PnL sem rótulo.
+
+### 4. Limitações declaradas
+
+- O gate usa a MESMA política do caminho manual: se `RUNTIME_MODE` não for LIVE, uma posição real
+  herdada tem a saída autônoma recusada (declarada) — comportamento idêntico ao endpoint manual, que
+  já era assim. Nada foi exercitado com dinheiro real.
+- O painel é o scaffold do projeto: a coluna nova mostra o que o servidor servir, e o resto do
+  dashboard continua como declarado em `/api/system-truth` (painéis com RNG).
