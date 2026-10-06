@@ -288,3 +288,12 @@ gratuito) com retry limitado e um teto de perda diária. A verificação de res�
 leitura por fechamento (com retry só em caso de falha) — no pior caso, 3 leituras. Não há provedor
 novo, não há tier pago, e o teto de perda não depende de nenhum dado externo: é aritmética sobre as
 pernas já medidas.
+
+### S13 — entrega com fallback: o que muda na camada gratuita
+
+O fallback por RPC (`HFT_RPC_FALLBACK_ON_JITO_FAIL`, default ligado) **não é** um caminho extra
+gratuito de landing: ele consome cota de ENVIO do plano de RPC, e no tier gratuito essa cota é
+pequena (Helius Free: 1 envio/s). Ele existe para o caso em que a alternativa é pior — **capital
+preso** porque o block engine aplicou rate limit. Na prática: com um provider gratuito, conte com
+*uma* tentativa de saída por vez, e a corrida Jito+staked (paga) é o upgrade que muda a taxa de
+landing — não o fallback.

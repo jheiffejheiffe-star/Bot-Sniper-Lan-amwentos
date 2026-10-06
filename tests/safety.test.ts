@@ -6348,6 +6348,102 @@ async function main(): Promise<void> {
     );
   });
 
+  // ---------------------------------------------------------------------------
+  // [32] S13 — ENTREGA: CORRIDA DE TRANSPORTES E FALLBACK POR RPC
+  // ---------------------------------------------------------------------------
+  console.log("\n[32] S13 — entrega da transação: corrida ou Jito com fallback por RPC");
+
+  await test("fallback por RPC: default LIGADO e desligar é declarado, não silencioso", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const padrao = ps.resolveRpcFallbackPolicy({} as any);
+    assert.equal(padrao.enabled, true, "sem variável, o fallback é LIGADO");
+    assert.equal(padrao.raw, null);
+    assert.ok(/MESMOS bytes/.test(padrao.note), padrao.note);
+
+    for (const off of ["0", "false", "no", "FALSE"]) {
+      const desligado = ps.resolveRpcFallbackPolicy({ HFT_RPC_FALLBACK_ON_JITO_FAIL: off } as any);
+      assert.equal(desligado.enabled, false, `${off} desliga`);
+      assert.ok(/FALHA TERMINAL/.test(desligado.note), desligado.note);
+    }
+    const ligado = ps.resolveRpcFallbackPolicy({ HFT_RPC_FALLBACK_ON_JITO_FAIL: "1" } as any);
+    assert.equal(ligado.enabled, true);
+    assert.ok(/ligado/.test(ligado.note));
+  });
+
+  await test("plano de entrega: desligado + fallback ⇒ Jito primeiro e RPC na recusa", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const policy = ps.resolveParallelSendPolicy({} as any);
+    const plano = ps.planSubmission(policy, ps.resolveRpcFallbackPolicy({} as any));
+    assert.equal(plano.mode, "jito_with_fallback");
+    // EQUIVALÊNCIA PINADA: `mode === "race"` ⟺ `policy.enabled`. Se alguém mudar uma das duas
+    // condições sem a outra, isto quebra (as duas são usadas em lugares diferentes do server).
+    assert.notEqual(ps.planSubmission(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1" } as any), ps.resolveRpcFallbackPolicy({} as any)).mode, "jito_with_fallback");
+    assert.deepEqual(plano.transports, ["jito", "rpc"]);
+    assert.equal(plano.rpcFallback, true);
+    assert.ok(/só paga o custo quando o Jito falha/.test(plano.note), plano.note);
+  });
+
+  await test("plano de entrega: corrida ligada lista os transportes e diz se o RPC está nela", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const semRpc = ps.planSubmission(
+      ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_STAKED_SENDER_URL: "https://sender.invalido" } as any),
+      ps.resolveRpcFallbackPolicy({} as any)
+    );
+    assert.equal(semRpc.mode, "race");
+    assert.deepEqual(semRpc.transports, ["jito", "staked"]);
+    assert.equal(semRpc.rpcFallback, false, "na corrida o fallback sequencial não é usado");
+    assert.ok(/RPC NÃO está na corrida/.test(semRpc.note), semRpc.note);
+
+    const comRpc = ps.planSubmission(
+      ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_SEND_RPC_DIRECT: "1" } as any),
+      ps.resolveRpcFallbackPolicy({} as any)
+    );
+    assert.deepEqual(comRpc.transports, ["jito", "rpc"]);
+    assert.ok(/RPC já faz parte da corrida/.test(comRpc.note), comRpc.note);
+  });
+
+  await test("plano de entrega: tudo desligado é declarado como falha terminal", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const plano = ps.planSubmission(
+      ps.resolveParallelSendPolicy({} as any),
+      ps.resolveRpcFallbackPolicy({ HFT_RPC_FALLBACK_ON_JITO_FAIL: "0" } as any)
+    );
+    assert.equal(plano.mode, "jito_only");
+    assert.equal(plano.rpcFallback, false);
+    assert.ok(/falha terminal/.test(plano.note), plano.note);
+  });
+
+  await test("o servidor entrega pelos TRÊS pontos (entrada + 2 saídas) e não tem mais envio solto", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const code = serverSrc
+      .split("\n")
+      .filter((l) => {
+        const t = l.trim();
+        return !(t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"));
+      })
+      .join("\n");
+    assert.equal(
+      code.split("submitSignedTransaction(").length - 1,
+      4,
+      "esperado: 1 definição + 3 pontos de entrega (entrada, saída manual, saída autônoma)"
+    );
+    assert.ok(code.includes("PARALLEL_SEND.enabled"), "a corrida segue condicionada à política (contrato do S8)");
+    assert.equal(
+      code.includes("process.env.HFT_RPC_FALLBACK_ON_JITO_FAIL"),
+      false,
+      "o servidor não lê a variável direto: quem resolve a política é o módulo (fonte única)"
+    );
+    assert.ok(code.includes("assertCanSign(params.purpose)"), "o envio de fallback passa pelo choke point");
+    assert.ok(code.includes("sendRawTransaction"), "o fallback usa sendRawTransaction");
+    assert.equal(code.includes("jitoRes"), false, "nenhuma saída ficou presa ao resultado do Jito");
+    assert.equal(
+      code.includes("[Jito Bundle Exit] Bundle enviado"),
+      false,
+      "o log antigo não pode voltar: a entrega passa a declarar o caminho vencedor"
+    );
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

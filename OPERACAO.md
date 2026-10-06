@@ -284,6 +284,29 @@ dono, expiração) e a garantia vigente. Um claim com `expired: true` é normal 
 próximo processo o retoma automaticamente. **Nunca** libere claim de outro dono — a liberação é por
 `claim_id`, e é isso que impede dois processos no mesmo mint.
 
+### 5.0.1 Entrega da transação (S13): corrida ou Jito com fallback
+
+A pergunta operacional é: **"se o block engine do Jito recusar, o que acontece?"**
+
+| Configuração | Modo | Comportamento |
+|---|---|---|
+| `HFT_PARALLEL_SEND=1` | `race` | Jito + sender com stake (se `HFT_STAKED_SENDER_URL`) + RPC (se `HFT_SEND_RPC_DIRECT=1`) ao mesmo tempo; primeiro aceite vence, perdedores seguem rodando |
+| default (`=0`) + `HFT_RPC_FALLBACK_ON_JITO_FAIL` ausente/1 | `jito_with_fallback` | Jito primeiro; **recusa** ⇒ os MESMOS bytes assinados vão pelo RPC |
+| `=0` + `HFT_RPC_FALLBACK_ON_JITO_FAIL=0` | `jito_only` | Só Jito; recusa é falha terminal da tentativa (declarado) |
+
+**Por que o fallback é default LIGADO:** os dois modos de falha não são simétricos. Entrada
+recusada = oportunidade perdida; **saída recusada = capital preso no token** com o preço andando.
+E a causa mais comum de recusa é rate limit do provider (1 req/s por IP/região no endpoint
+público), não indisponibilidade.
+
+**Por que não duplica:** os bytes são idênticos em todos os caminhos — a assinatura identifica a
+transação e a runtime deduplica por *message hash*. Duplicar exigiria **assinar duas vezes**, e
+isso o sistema de intenções (`src/executionIntent.ts`) bloqueia antes de qualquer chave.
+
+**Custo declarado:** o fallback consome cota de ENVIO do RPC e usa `skipPreflight: true`
+(a simulação já ocorreu antes de assinar). `GET /api/system-truth → parallelSend` mostra o plano
+efetivo (`plan.mode`, `plan.transports`, `rpcFallback`) e o resultado da última entrega.
+
 ### 5.4 Saída fail-closed e teto de perda (S12)
 
 O caminho que decide o prejuízo é a SAÍDA. Três invariantes valem nos **dois** caminhos de venda
@@ -374,6 +397,9 @@ declarada) e `notGuaranteed`.
    aritmética provada por teste, mas **não exercitada com dinheiro real**: exige entrada ligada.
    Posições abertas antes desta versão não têm a perna de entrada e ficam declaradas como não
    medidas.
+9. **Sender com stake (SWQOS)** — o caminho de maior landing publicado (70-75% contra <30% do RPC
+   público) exige um endpoint de envio com stake **do seu provedor**; sem ele, a corrida é
+   Jito (+RPC, se ligado). Configurar é decisão de infraestrutura, nunca presumida pelo bot.
 8. **Garantia de lucro** — NÃO existe e não pode existir por configuração: cada operação paga base
    fee, priority fee, tip, spread e slippage, e o ativo pode cair depois da compra. O que o S12
    garante é o LIMITE da perda (teto diário medido + kill switch + teto de posições) e a AUSÊNCIA

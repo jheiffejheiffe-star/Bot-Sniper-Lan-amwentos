@@ -2252,3 +2252,51 @@ calculation`) ou se um dos quatro pontos de verificação desaparecer.
 - Tip/priority fee continuam embutidos no ΔSOL e não decomponíveis (Adendo 19).
 - **Lucro não é garantido por configuração nenhuma.** O invariante é: nada é construído sobre
   número adivinhado, nada é apagado sem prova e nenhum resultado é fabricado.
+
+
+---
+
+## Adendo 21 — S13: entrega da transação (corrida + fallback por RPC)
+
+**Origem:** autorização da opção "envio paralelo" apresentada após o S12. O módulo de corrida
+(`src/parallelSend.ts`, S8) já existia e estava fiado **apenas na entrada**.
+
+### 1. O defeito que estava aberto
+
+| # | Defeito | Onde | Consequência |
+|---|---|---|---|
+| 1 | As DUAS saídas (manual e autônoma) chamavam `jitoSender.submitBundle` e **lançavam erro na recusa** — sem nenhum caminho alternativo | `server.ts` (fechamento manual e `executeAutonomousExit`) | com rate limit do block engine (1 req/s por IP/região no endpoint público) a venda simplesmente não acontecia: **capital preso no token**, preço andando contra, retry de 3 tentativas também preso ao Jito |
+| 2 | A entrada, com a corrida desligada (`HFT_PARALLEL_SEND=0`, default), também não tinha alternativa | idem | oportunidade perdida (menos grave que (1), mas mesma causa) |
+
+Também era o **P0-3** do relatório de terceiros ("adicionar fallback imediato para
+`sendRawTransaction` tanto no Buy quanto no Exit"), que eu havia classificado como parcialmente
+ausente aqui. Estava correto.
+
+### 2. Correção
+
+1. `src/parallelSend.ts`: `resolveRpcFallbackPolicy` (default **LIGADO**, com o motivo declarado)
+   e `planSubmission` — decisão PURA de como entregar: `race` | `jito_with_fallback` | `jito_only`,
+   com os transportes do plano e a nota do que acontece na recusa.
+2. `server.ts`: helper `submitSignedTransaction` — **um único ponto de entrega** para entrada e
+   saídas: corrida quando ligada; caso contrário Jito primeiro e, na recusa, `sendRawTransaction`
+   com os MESMOS bytes (passando por `assertCanSign(purpose)`).
+3. As três chamadas foram migradas (`runRealEntry`, `/api/positions/close`,
+   `executeAutonomousExit`); o log de saída agora declara o caminho vencedor (`via`).
+4. `/api/system-truth → parallelSend` expõe `plan` e `rpcFallback`.
+
+### 3. Verificação
+
+`npm run lint` 0 · `npm run test` **289/289** (grupo `[32]`, 5 testes novos) · `npm run build` ok.
+Teste de fonte falha se: algum dos 3 pontos perder a entrega, a corrida deixar de ser condicionada
+à política, o envio direto perder o choke point, ou `jitoRes` (envio solto) voltar ao arquivo.
+**Preservados os contratos do S8**: assinatura única ANTES do envio, `aceito ≠ executado`,
+`race.note` agregando os motivos.
+
+### 4. Limitações declaradas
+
+- **Nada foi exercitado com dinheiro real** (exige `RUNTIME_MODE=LIVE` + `HFT_REAL_ENTRY_ENABLED=1`).
+- O fallback **consome cota de envio** do RPC; em plano gratuito a cota é pequena — por isso ele
+  só é pago quando o Jito recusa.
+- **Não há caminho com stake na corrida** sem `HFT_STAKED_SENDER_URL` do provedor do operador.
+- `skipPreflight: true` no fallback assume simulação prévia (entrada) ou inutilidade do pré-flight
+  após confirmação (saída).

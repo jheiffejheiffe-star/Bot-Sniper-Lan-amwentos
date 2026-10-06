@@ -455,3 +455,104 @@ export function buildJitoTransport(
     },
   };
 }
+
+/* -------------------------------------------------------------------------- */
+/* S13 — PLANO DE SUBMISSÃO (decisão PURA, testável)                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Política do fallback por RPC quando o block engine do Jito RECUSA o bundle.
+ *
+ * ## Por que o default é LIGADO
+ *
+ * Os dois modos de falha não são simétricos:
+ *   - **Entrada** recusada pelo Jito ⇒ oportunidade perdida (custo: não operar).
+ *   - **Saída** recusada pelo Jito ⇒ capital PRESO no token, com preço se movendo contra
+ *     (`[C6]` da auditoria). O custo é ilimitado, e é o modo de falha que trava a operação.
+ *
+ * Então a entrega tem de sobreviver à recusa do block engine. Os MESMOS bytes assinados vão por
+ * RPC (`sendRawTransaction`): a assinatura é o identificador da transação, e a runtime deduplica
+ * por *message hash* — reenviar o mesmo par (bytes, assinatura) NÃO duplica a ordem. Duplicar
+ * exigiria assinar duas vezes, e isso o sistema de intenções bloqueia antes de qualquer chave.
+ *
+ * O custo é declarado, não escondido: o envio consome cota do plano de RPC (no plano gratuito,
+ * essa cota é pequena) e é justamente por isso que o caminho NÃO é ligado para tudo — só quando
+ * o Jito recusa.
+ */
+export interface RpcFallbackPolicy {
+  enabled: boolean;
+  /** Valor literal do ambiente (`null` quando ausente). */
+  raw: string | null;
+  note: string;
+}
+
+export function resolveRpcFallbackPolicy(env: NodeJS.ProcessEnv = process.env): RpcFallbackPolicy {
+  const raw = (env.HFT_RPC_FALLBACK_ON_JITO_FAIL ?? "").trim();
+  if (raw === "") {
+    return {
+      enabled: true,
+      raw: null,
+      note:
+        "default LIGADO: se o block engine recusar, os MESMOS bytes assinados vão pelo RPC. " +
+        "Saída presa é pior do que gastar cota de envio (reativar/desligar: HFT_RPC_FALLBACK_ON_JITO_FAIL).",
+    };
+  }
+  const off = raw.toLowerCase();
+  if (off === "0" || off === "false" || off === "no") {
+    return {
+      enabled: false,
+      raw,
+      note:
+        "HFT_RPC_FALLBACK_ON_JITO_FAIL desligado: recusa do Jito passa a ser FALHA TERMINAL da tentativa. " +
+        "Com um provider que aplica rate limit (a causa mais comum de recusa), uma saída pode ficar presa.",
+    };
+  }
+  return { enabled: true, raw, note: `HFT_RPC_FALLBACK_ON_JITO_FAIL=${raw}: fallback por RPC ligado.` };
+}
+
+export interface SubmissionPlan {
+  mode: "race" | "jito_with_fallback" | "jito_only";
+  transports: TransportName[];
+  rpcFallback: boolean;
+  note: string;
+}
+
+/**
+ * Decide COMO entregar a transação assinada, a partir de duas políticas independentes.
+ *
+ * - `HFT_PARALLEL_SEND=1` ⇒ corrida (perde-se em latência se o Jito demorar, ganha-se em landing).
+ * - desligado (default) + fallback ligado ⇒ **Jito primeiro**; recusa do block engine ⇒ RPC.
+ * - desligado + fallback desligado ⇒ só Jito; recusa é terminal (declarado, não silencioso).
+ */
+export function planSubmission(policy: ParallelSendPolicy, fallback: RpcFallbackPolicy): SubmissionPlan {
+  if (policy.enabled) {
+    const temRpc = policy.transports.includes("rpc");
+    return {
+      mode: "race",
+      transports: policy.transports,
+      rpcFallback: false,
+      note:
+        `corrida de transportes: ${policy.transports.join(" + ")} — o primeiro aceite vence; os perdedores ` +
+        `seguem rodando (podem entrar no próximo bloco).` +
+        (temRpc
+          ? " O RPC já faz parte da corrida (HFT_SEND_RPC_DIRECT=1)."
+          : " O RPC NÃO está na corrida (HFT_SEND_RPC_DIRECT≠1): a corrida é Jito/staked."),
+    };
+  }
+  if (fallback.enabled) {
+    return {
+      mode: "jito_with_fallback",
+      transports: ["jito", "rpc"],
+      rpcFallback: true,
+      note:
+        "corrida DESLIGADA: bundle Jito primeiro; se o block engine recusar, os MESMOS bytes assinados " +
+        "são enviados pelo RPC (fallback sequencial — só paga o custo quando o Jito falha).",
+    };
+  }
+  return {
+    mode: "jito_only",
+    transports: ["jito"],
+    rpcFallback: false,
+    note: "corrida DESLIGADA e fallback DESLIGADO: recusa do Jito é falha terminal da tentativa.",
+  };
+}

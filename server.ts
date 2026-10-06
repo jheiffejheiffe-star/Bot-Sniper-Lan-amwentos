@@ -17,6 +17,7 @@ import {
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
+  type Keypair,
 } from "@solana/web3.js";
 import { 
   RecentBlockhashCache, 
@@ -83,7 +84,9 @@ import {
   buildRpcDirectTransport,
   buildStakedSenderTransport,
   describeParallelSendPolicy,
+  planSubmission,
   resolveParallelSendPolicy,
+  resolveRpcFallbackPolicy,
   sendInParallel,
   type TransportAttempt,
 } from "./src/parallelSend.js";
@@ -346,6 +349,18 @@ function firstSightAcrossSources(signature: string): boolean {
 const PARALLEL_SEND = resolveParallelSendPolicy();
 console.log(`[Boot][Env] ${describeParallelSendPolicy(PARALLEL_SEND).join(" | ")}`);
 
+/**
+ * S13 — PLANO DE ENTREGA, declarado no boot. Responde a pergunta operacional que faltava:
+ * **"se o block engine recusar a saída, o que acontece?"** Antes desta etapa a resposta era
+ * "nada": as duas saídas chamavam `submitBundle` e lançavam erro na recusa — com o capital
+ * preso no token e o preço andando. Agora a recusa do Jito cai no RPC com os MESMOS bytes
+ * assinados (sem duplicar ordem: a assinatura identifica a transação).
+ */
+const RPC_FALLBACK = resolveRpcFallbackPolicy();
+const SUBMISSION_PLAN = planSubmission(PARALLEL_SEND, RPC_FALLBACK);
+console.log(`[Boot][Env] Entrega (S13): ${SUBMISSION_PLAN.note}`);
+console.log(`[Boot][Env] ${RPC_FALLBACK.note}`);
+
 /* -------------------------------------------------------------------------- */
 /* S12 — POLÍTICA DE SAÍDA E LIMITE DE PERDA                                   */
 /* -------------------------------------------------------------------------- */
@@ -476,6 +491,7 @@ async function readMintBalanceForDecision(owner: PublicKey, mint: string, attemp
     backoffMs: EXIT_SAFETY.balanceBackoffMs,
   });
 }
+
 /**
  * ARMAZENAMENTO (S10): política resolvida uma vez no boot + adaptador quando em modo Postgres.
  * `storageRef` nulo em modo JSON — e o modo JSON é o default, com o comportamento anterior.
@@ -2306,7 +2322,7 @@ app.post("/api/positions/close", async (req, res) => {
           lastValidBlockHeight = latest.lastValidBlockHeight;
         }
 
-        const jitoRes = await executeWithDecryptedKeypair(async (keypair) => {
+        const submission = await executeWithDecryptedKeypair(async (keypair) => {
           if (!alreadySigned) {
             transaction.sign([keypair]);
             manualExitIntent = advanceIntentOrKeep(
@@ -2316,16 +2332,21 @@ app.post("/api/positions/close", async (req, res) => {
               `manual, tentativa ${attempt + 1}: assinada (ainda não transmitida)`
             );
           }
-          return await jitoSender.submitBundle([transaction], keypair, jitoTip, blockhash, {
+          return await submitSignedTransaction({
+            transaction,
+            keypair,
+            jitoSender,
+            tipSol: jitoTip,
+            blockhash,
             capitalCommittedSol: pos.sizeSol,
-            maxTipBps: Number(process.env.MAX_TIP_BPS ?? 50),
-            region: (process.env.JITO_REGION as any) || undefined,
             purpose: "exit",
+            label: `fechamento manual de $${pos.token}`,
+            correlationId,
           });
         }, "exit");
 
-        if (!jitoRes.success) {
-          throw new Error(`Jito Bundle rejected: ${jitoRes.error || "Unknown bundle error"}`);
+        if (!submission.ok) {
+          throw new Error(`Fechamento manual: nenhuma entrega aceitou — ${submission.note}`);
         }
 
         signature = bs58.encode(transaction.signatures[0]);
@@ -5775,8 +5796,28 @@ async function runRealEntry(params: {
             });
 
           if (!PARALLEL_SEND.enabled) {
-            const sent = await submitJito();
-            return { ok: sent.success, signature, bundleId: sent.bundleId, tipSol: sent.tipSol, error: sent.error };
+            /**
+             * S13 — sem corrida (default): bundle Jito e, se o block engine RECUSAR, os MESMOS
+             * bytes assinados vão pelo RPC. Antes, a recusa era erro terminal da tentativa.
+             */
+            const sent = await submitSignedTransaction({
+              transaction: tx,
+              keypair,
+              jitoSender,
+              tipSol: measuredTipSol ?? 0.000_001,
+              blockhash,
+              capitalCommittedSol: cap,
+              purpose: "entry",
+              label: `entrada real de ${params.tokenName.toUpperCase()}`,
+              correlationId: params.correlationId,
+            });
+            return {
+              ok: sent.ok,
+              signature,
+              bundleId: sent.bundleId ?? "",
+              tipSol: sent.ok ? (measuredTipSol ?? 0.000_001) : 0,
+              error: sent.ok ? undefined : sent.note,
+            };
           }
 
           const transports = [
@@ -6097,6 +6138,9 @@ app.get("/api/real-entry", (_req, res) => {
     parallelSend: {
       policy: PARALLEL_SEND,
       notes: describeParallelSendPolicy(PARALLEL_SEND),
+      /** S13 — plano de entrega efetivo e a política de fallback por RPC, declarados. */
+      plan: SUBMISSION_PLAN,
+      rpcFallback: RPC_FALLBACK,
       lastResult: lastParallelSend,
       howToMeasure:
         "cada tentativa de transporte é registrada em log com latência e motivo; `lastResult` é o " +
@@ -6719,6 +6763,224 @@ function recordPaperClose(pos: any, reason: string, pnlPercent: number): void {
 }
 
 // ETAPA 12 — Motor de Gerenciamento de Posições On-Chain REAL (Zero Simulation Mode)
+/**
+ * S13 — ENTREGA DA TRANSAÇÃO ASSINADA (entrada e saída), pelo plano declarado no boot.
+ *
+ * ## O que faz
+ * Recebe a transação JÁ ASSINADA e entrega por: corrida de transportes (`HFT_PARALLEL_SEND=1`)
+ * ou Jito com fallback por RPC (default). Devolve o que foi ACEITO por qual caminho — nunca
+ * "executado": executar exige confirmação e slot observados.
+ *
+ * ## Como funciona
+ * - `race`: bundle Jito + sender com stake (se configurado) + RPC direto (se ligado) disparados
+ *   ao mesmo tempo; o primeiro aceite vence e os perdedores seguem (podem entrar no próximo bloco).
+ * - `jito_with_fallback`: Jito primeiro; recusa do block engine ⇒ `sendRawTransaction` com os
+ *   MESMOS bytes.
+ * - `jito_only`: só Jito (fallback desligado por configuração explícita).
+ *
+ * ## Segurança (por que não duplica)
+ * Quem duplicaria seria ASSINAR duas vezes — e isso o sistema de intenções bloqueia antes de
+ * qualquer chave. Aqui os bytes são idênticos em todos os caminhos: a assinatura identifica a
+ * transação e a runtime deduplica por *message hash*.
+ *
+ * ## Riscos
+ * - O fallback consome cota de ENVIO do RPC (no plano gratuito, pequena) — só é pago quando o
+ *   Jito recusa.
+ * - `skipPreflight: true` assume que a simulação já ocorreu (entrada) ou que repetir pré-flight
+ *   após a confirmação é inútil (saída).
+ *
+ * ## Como testar
+ * `npm run test` (grupo [32]): plano por configuração + presença dos três pontos de entrega.
+ */
+async function submitSignedTransaction(params: {
+  transaction: VersionedTransaction;
+  keypair: Keypair;
+  jitoSender: JitoBundleSender;
+  tipSol: number;
+  blockhash: string;
+  capitalCommittedSol: number;
+  purpose: "entry" | "exit";
+  label: string;
+  correlationId: string;
+}): Promise<{
+  ok: boolean;
+  via: string;
+  signature: string;
+  bundleId: string | null;
+  attempts: TransportAttempt[];
+  note: string;
+}> {
+  const signature = bs58.encode(params.transaction.signatures[0]);
+  const raw = Buffer.from(params.transaction.serialize());
+
+  const submitJito = () =>
+    params.jitoSender.submitBundle([params.transaction], params.keypair, params.tipSol, params.blockhash, {
+      capitalCommittedSol: params.capitalCommittedSol,
+      maxTipBps: Number(process.env.MAX_TIP_BPS ?? 50),
+      region: (process.env.JITO_REGION as any) || undefined,
+      purpose: params.purpose,
+    });
+
+  /** Envio direto pelos MESMOS bytes, passando pelo choke point de segurança. */
+  const sendViaRpc = async (): Promise<string> => {
+    assertCanSign(params.purpose);
+    const conn = globalConnection as Connection | null;
+    if (!conn) throw new Error("RPC indisponível para o envio de fallback");
+    return await runWithRpcFailover(async (c) =>
+      await c.sendRawTransaction(raw, {
+        skipPreflight: true,
+        maxRetries: 0,
+        preflightCommitment: "processed",
+      })
+    );
+  };
+
+  const attempts: TransportAttempt[] = [];
+
+  // ── Corrida de transportes ─────────────────────────────────────────────────
+  if (SUBMISSION_PLAN.mode === "race") {
+    const transports = [
+      buildJitoTransport(async () => {
+        const res = await submitJito();
+        return { success: res.success, bundleId: res.bundleId, error: res.error };
+      }),
+    ];
+
+    if (PARALLEL_SEND.stakedSenderUrl !== "") {
+      transports.push(
+        buildStakedSenderTransport({
+          url: PARALLEL_SEND.stakedSenderUrl,
+          swqosOnly: PARALLEL_SEND.swqosOnly,
+          rawTransactionBase64: raw.toString("base64"),
+          timeoutMs: PARALLEL_SEND.transportTimeoutMs,
+        })
+      );
+    }
+
+    if (PARALLEL_SEND.rpcDirect) {
+      transports.push(
+        buildRpcDirectTransport(async () => {
+          await sendViaRpc();
+          return "rpc aceitou";
+        })
+      );
+    }
+
+    const race = await sendInParallel({
+      signature,
+      transports,
+      timeoutMs: PARALLEL_SEND.transportTimeoutMs,
+      now: monotonicNow,
+      onAttempt: (attempt) => {
+        dbStore.saveLog({
+          timestamp: new Date().toISOString(),
+          level: attempt.ok ? "INFO" : "WARN",
+          component: params.purpose === "exit" ? "RISK_ENGINE" : "REAL_ENTRY",
+          message:
+            `[S13] ${params.label}: transporte ${attempt.transport} ` +
+            `${attempt.ok ? "ACEITOU" : "recusou/falhou"} em ${attempt.latencyMs}ms` +
+            `${attempt.error ? ` — ${attempt.error}` : ""}`,
+          correlationId: params.correlationId,
+        });
+      },
+    });
+
+    lastParallelSend = {
+      at: new Date().toISOString(),
+      signature,
+      winner: race.winner,
+      acceptedBy: race.acceptedBy,
+      attempts: race.attempts,
+      ok: race.ok,
+    };
+
+    return {
+      ok: race.ok,
+      via: race.winner ?? "none",
+      signature,
+      bundleId: race.winner === "jito" ? "jito" : null,
+      attempts: race.attempts,
+      note: race.ok
+        ? `${params.label}: aceito por ${race.winner} (aceito ≠ executado)`
+        : `${params.label}: NENHUM transporte aceitou — ${race.note}`,
+    };
+  }
+
+  // ── Jito primeiro; recusa cai no RPC (se o plano permitir) ─────────────────
+  let jitoError: string | null = null;
+  const tJito = Date.now();
+  try {
+    const res = await submitJito();
+    attempts.push({
+      transport: "jito",
+      ok: res.success,
+      error: res.success ? null : res.error ?? "recusa sem motivo informado",
+      latencyMs: Date.now() - tJito,
+    });
+    if (res.success) {
+      return {
+        ok: true,
+        via: "jito",
+        signature,
+        bundleId: res.bundleId ?? null,
+        attempts,
+        note: `${params.label}: bundle aceito pelo block engine (aceito ≠ executado)`,
+      };
+    }
+    jitoError = res.error ?? "recusa sem motivo informado";
+  } catch (err: any) {
+    jitoError = err?.message ?? String(err);
+    attempts.push({ transport: "jito", ok: false, error: jitoError, latencyMs: Date.now() - tJito });
+  }
+
+  if (!SUBMISSION_PLAN.rpcFallback) {
+    return {
+      ok: false,
+      via: "none",
+      signature,
+      bundleId: null,
+      attempts,
+      note:
+        `${params.label}: o block engine recusou (${jitoError}) e o fallback por RPC está ` +
+        `DESLIGADO (HFT_RPC_FALLBACK_ON_JITO_FAIL=0) — sem caminho alternativo por configuração`,
+    };
+  }
+
+  const tRpc = Date.now();
+  try {
+    const sent = await sendViaRpc();
+    attempts.push({ transport: "rpc", ok: true, error: null, latencyMs: Date.now() - tRpc });
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "WARN",
+      component: params.purpose === "exit" ? "RISK_ENGINE" : "REAL_ENTRY",
+      message:
+        `[S13][FALLBACK] ${params.label}: o block engine recusou (${jitoError}). Os MESMOS bytes assinados ` +
+        `foram aceitos pelo RPC (${sent}). Isto NÃO duplica a ordem — a assinatura identifica a transação.`,
+      correlationId: params.correlationId,
+    });
+    return {
+      ok: true,
+      via: "rpc-fallback",
+      signature,
+      bundleId: null,
+      attempts,
+      note: `${params.label}: Jito recusou (${jitoError}); RPC aceitou os mesmos bytes (fallback declarado)`,
+    };
+  } catch (err: any) {
+    const viaErr = err?.message ?? String(err);
+    attempts.push({ transport: "rpc", ok: false, error: viaErr, latencyMs: Date.now() - tRpc });
+    return {
+      ok: false,
+      via: "none",
+      signature,
+      bundleId: null,
+      attempts,
+      note: `${params.label}: Jito recusou (${jitoError}) e o fallback por RPC também falhou (${viaErr})`,
+    };
+  }
+}
+
 async function startAutonomousPositionManager(): Promise<void> {
   console.log("[HFT Position Manager] Motor de Gerenciamento de Posições On-Chain REAL iniciado.");
   
@@ -7747,7 +8009,7 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
           lastValidBlockHeight = latest.lastValidBlockHeight;
         }
 
-        const jitoRes = await executeWithDecryptedKeypair(async (keypair) => {
+        const submission = await executeWithDecryptedKeypair(async (keypair) => {
           if (!alreadySigned) {
             transaction.sign([keypair]);
             const signedSignature = bs58.encode(transaction.signatures[0]);
@@ -7764,18 +8026,23 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
             );
           }
           trace.mark("signed");
-          const submitted = await jitoSender.submitBundle([transaction], keypair, jitoTip, blockhash, {
+          const submitted = await submitSignedTransaction({
+            transaction,
+            keypair,
+            jitoSender,
+            tipSol: jitoTip,
+            blockhash,
             capitalCommittedSol: pos.sizeSol,
-            maxTipBps: Number(process.env.MAX_TIP_BPS ?? 50),
-            region: (process.env.JITO_REGION as any) || undefined,
             purpose: "exit",
+            label: `saída de $${pos.token} (${reason})`,
+            correlationId,
           });
           trace.mark("submitted");
           return submitted;
         }, "exit");
 
-        if (!jitoRes || !jitoRes.success) {
-          throw new Error(`Jito Block Engine rejected bundle: ${jitoRes?.error || "Unknown bundle error"}`);
+        if (!submission || !submission.ok) {
+          throw new Error(`Saída: nenhuma entrega aceitou — ${submission?.note ?? "sem resultado do envio"}`);
         }
 
         signature = bs58.encode(transaction.signatures[0]);
@@ -7791,7 +8058,9 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
           timestamp: new Date().toISOString(),
           level: "INFO",
           component: "JITO_BUNDLE",
-          message: `[Jito Bundle Exit] Bundle enviado (Tentativa ${jitoAttempt + 1}/3, intenção ${exitIntent.id}). ID Jito: ${jitoRes.bundleId}. Assinatura: ${signature}. Aguardando confirmação...`,
+          message:
+            `[S13] Saída aceita (Tentativa ${jitoAttempt + 1}/3, intenção ${exitIntent.id}) via ${submission.via}` +
+            `${submission.bundleId ? ` (bundle ${submission.bundleId})` : ""}. Assinatura: ${signature}. Aguardando confirmação...`,
           correlationId
         });
 
