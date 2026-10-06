@@ -226,6 +226,17 @@ import {
 } from "./src/security.js";
 import { dbStore, type LegRecord } from "./src/persistence.js";
 import { computeRoundTrip, parseTransactionLeg, unmeasuredLeg } from "./src/roundTrip.js";
+import {
+  classifyManagedPosition,
+  createDailyLossLedger,
+  dailyLossGate,
+  decideCloseFromResidual,
+  decideExitFromBalance,
+  readMintBalanceFailClosed,
+  resolveExitSafetyPolicy,
+  type DailyLossState,
+  type MintBalanceRead,
+} from "./src/exitSafety.js";
 
 const app = express();
 const PORT = 3000;
@@ -334,6 +345,137 @@ function firstSightAcrossSources(signature: string): boolean {
  */
 const PARALLEL_SEND = resolveParallelSendPolicy();
 console.log(`[Boot][Env] ${describeParallelSendPolicy(PARALLEL_SEND).join(" | ")}`);
+
+/* -------------------------------------------------------------------------- */
+/* S12 — POLÍTICA DE SAÍDA E LIMITE DE PERDA                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Resolvida UMA vez no boot e declarada em voz alta: o operador precisa saber, antes de ligar
+ * capital, (a) que toda ordem de venda nasce de quantidade VERIFICADA na cadeia e (b) qual é o
+ * teto de perda diária. Sem teto declarado, o boot AVISA — a ausência de freio não fica muda.
+ */
+const EXIT_SAFETY = resolveExitSafetyPolicy();
+console.log(
+  `[Boot][Env] Saída fail-closed (S12): leitura de saldo com ${EXIT_SAFETY.balanceAttempts} tentativa(s) ` +
+    `(backoff ${EXIT_SAFETY.balanceBackoffMs}ms), tolerância de resíduo ${EXIT_SAFETY.residualDustRaw} unidade(s) bruta(s), ` +
+    `rechecagem de aborto ${EXIT_SAFETY.abortRecheckMs}ms.`
+);
+{
+  const limit = Number(process.env.MAX_DAILY_LOSS_SOL ?? 0);
+  if (Number.isFinite(limit) && limit > 0) {
+    console.log(
+      `[Boot][Env] MAX_DAILY_LOSS_SOL=${limit} SOL: ao atingir a PERDA MEDIDA do dia (ciclo completo), ` +
+        `o kill switch é acionado e novas entradas param; saídas continuam liberadas.`
+    );
+  } else {
+    console.warn(
+      "[Boot][Env] MAX_DAILY_LOSS_SOL não declarado (ou 0): NÃO existe teto de perda diária. " +
+        "Nenhuma configuração garante lucro — este é o freio que limita o prejuízo de um dia ruim. " +
+        "Declare um valor (ex.: 0.02) antes de operar LIVE."
+    );
+  }
+}
+
+/** Livro de perda diária (só PnL de ciclo medido; ver src/exitSafety.ts). */
+const dailyLossLedger = createDailyLossLedger();
+let dailyLossLedgerSeeded = false;
+let lastDailyLossCheckAt = 0;
+/** Instante do acionamento do kill switch por perda (auditoria; `null` = nunca). */
+let dailyLossKillSwitchAt: string | null = null;
+/** Anti-loop: instantes mínimos de nova tentativa por posição com saída abortada por falta de prova. */
+const exitAbortRecheckAt = new Map<string, number>();
+/** Aviso único por posição não-provada (evita inundar o log a cada 3 s). */
+const unverifiedPositionWarned = new Set<string>();
+
+function dailyLossLimitSol(): number {
+  const n = Number(process.env.MAX_DAILY_LOSS_SOL ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** Semeia o livro com o histórico do dia UMA vez por processo (idempotente por trade). */
+function currentDailyLossState(): DailyLossState {
+  if (!dailyLossLedgerSeeded) {
+    dailyLossLedgerSeeded = true;
+    dailyLossLedger.seed(dbStore.getTrades() as any[]);
+  }
+  return dailyLossLedger.state();
+}
+
+/**
+ * S12 — TETO DE PERDA DIÁRIA. Devolve a mensagem de bloqueio (entradas) ou `null`.
+ * Aciona o kill switch UMA vez ao cruzar o teto; saídas seguem liberadas por política
+ * (`assertExitAllowed`), porque reduzir exposição não é o risco a conter.
+ */
+function enforceDailyLossLimit(where: string): string | null {
+  const state = currentDailyLossState();
+  const verdict = dailyLossGate(state, dailyLossLimitSol());
+  if (!verdict.exceeded) return null;
+  if (!getOperationalSecurityState().killSwitchActive) {
+    triggerKillSwitch(true);
+    dailyLossKillSwitchAt = new Date().toISOString();
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "CRITICAL",
+      component: "RISK_ENGINE",
+      message:
+        `[S12] MAX_DAILY_LOSS_SOL: ${verdict.reason}. Kill switch ACIONADO (${where}). ` +
+        `Novas entradas bloqueadas; SAÍDAS liberadas (reduzir exposição não é o risco a conter). ` +
+        `Reconcilie os resultados do dia e rearme conscientemente.`,
+      correlationId: `corr_daily_loss_${state.dayIso}`,
+    });
+  }
+  return `MAX_DAILY_LOSS_SOL atingido (${verdict.reason}). Kill switch ativo: nenhuma entrada nova; saídas liberadas.`;
+}
+
+/**
+ * S12 — TETO DE POSIÇÕES ABERTAS (`MAX_OPEN_POSITIONS`).
+ *
+ * Esta variável estava no `.env.example` e NUNCA era lida pelo código: config morta. Um teto
+ * que existe só no papel é pior do que teto nenhum, porque o operador acredita estar limitado.
+ * Conta posições REAIS (tudo que não é `paper`), o lado conservador: posição não-provada
+ * também ocupa vaga até ser reconciliada.
+ */
+function enforceMaxOpenPositions(): string | null {
+  const raw = Number(process.env.MAX_OPEN_POSITIONS ?? 0);
+  const max = Number.isFinite(raw) ? Math.trunc(raw) : 0;
+  if (max <= 0) return null;
+  const abertas = dbStore
+    .getPositions()
+    .filter((p: any) => p.mode !== "paper" && (p.status === "open" || p.status === "exit_pending" || !p.status));
+  if (abertas.length >= max) {
+    return (
+      `MAX_OPEN_POSITIONS=${max} atingido (${abertas.length} posição(ões) real(is) aberta(s); paper não conta): ` +
+      `nenhuma entrada nova até fechar.`
+    );
+  }
+  return null;
+}
+
+/**
+ * S12 — leitura de saldo do mint (todas as contas) com failover e retry, para decisão
+ * fail-closed. `ok:false` = não consegui ver (≠ carteira vazia).
+ */
+async function readMintBalanceForDecision(owner: PublicKey, mint: string, attempts: number): Promise<MintBalanceRead> {
+  return readMintBalanceFailClosed({
+    readAccounts: () =>
+      runWithRpcFailover(async (conn) => {
+        const res = await conn.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(mint) });
+        return (res.value ?? []).map((item: any) => {
+          const info = item?.account?.data?.parsed?.info;
+          const raw = Number(info?.tokenAmount?.amount ?? 0);
+          const dec = Number(info?.tokenAmount?.decimals ?? NaN);
+          return {
+            rawAmount: Number.isFinite(raw) ? raw : 0,
+            decimals: Number.isFinite(dec) ? dec : null,
+            tokenAccount: item?.pubkey?.toBase58?.() ?? null,
+          };
+        });
+      }),
+    attempts,
+    backoffMs: EXIT_SAFETY.balanceBackoffMs,
+  });
+}
 /**
  * ARMAZENAMENTO (S10): política resolvida uma vez no boot + adaptador quando em modo Postgres.
  * `storageRef` nulo em modo JSON — e o modo JSON é o default, com o comportamento anterior.
@@ -1759,6 +1901,61 @@ app.get("/api/system-truth", (_req, res) => {
     },
   ];
 
+  /**
+   * S12 — POLÍTICA DE SAÍDA E PERDA, medida no instante do pedido. É aqui que o operador lê
+   * (a) quantas posições NÃO estão provadas e por isso não assinam saída e (b) quanto de perda
+   * MEDIDA o dia acumulou contra o teto declarado.
+   */
+  const exitSafetySnapshot = (() => {
+    const state = currentDailyLossState();
+    const limit = dailyLossLimitSol();
+    const verdict = dailyLossGate(state, limit);
+    const positions = dbStore.getPositions();
+    const unverified = positions.filter((p: any) => classifyManagedPosition(p).kind === "unverified");
+    return {
+      policy: EXIT_SAFETY,
+      dailyLoss: {
+        ...state,
+        limitSol: limit,
+        exceeded: verdict.exceeded,
+        verdict: verdict.reason,
+        killSwitchAt: dailyLossKillSwitchAt,
+      },
+      /**
+       * LIMITES DECLARADOS, um por um, com o valor EFETIVO lido do ambiente. Um limite que o
+       * painel mostra como "não declarado" é um limite que não existe na prática.
+       */
+      limits: {
+        maxOpenPositions: Number(process.env.MAX_OPEN_POSITIONS ?? 0) || null,
+        maxDailyLossSol: limit || null,
+        maxPositionSol: Number(process.env.MAX_POSITION_SOL ?? 0) || null,
+        maxTotalExposureSol: Number(process.env.MAX_TOTAL_EXPOSURE_SOL ?? 0) || null,
+        maxTipBps: Number(process.env.MAX_TIP_BPS ?? 50),
+        canaryMaxSol: resolveRealEntryPolicy().canaryMaxSol,
+        note:
+          "`null` = NÃO declarado (sem efeito). Os dois freios por RESULTADO são MAX_OPEN_POSITIONS " +
+          "e MAX_DAILY_LOSS_SOL; o resto limita tamanho/custo por operação.",
+      },
+      managedClassification: {
+        unverifiedPositions: unverified.length,
+        ids: unverified.slice(0, 10).map((p: any) => p.id),
+        note:
+          "posições sem `mode: live` + evidência on-chain de entrada NÃO são geridas como reais: " +
+          "não assinam saída, não são apagadas e não consomem o canário — continuam contando para EXPOSIÇÃO.",
+      },
+      guarantees: [
+        "quantidade de venda vem do saldo on-chain (retry + fail-closed); sem leitura, a saída ABORTA sem assinar",
+        "posição só sai do banco com prova de resíduo zero; resíduo > tolerância ⇒ continua aberta e é vendida no próximo ciclo",
+        "nenhuma perna mede PnL sem as duas pernas (S11): PnL não medido é `null`, nunca número plausível",
+        "perda do dia é somada SÓ com PnL de ciclo medido e data legível; ao atingir MAX_DAILY_LOSS_SOL o kill switch é acionado",
+      ],
+      notGuaranteed:
+        "ISSO NÃO TORNA A OPERAÇÃO LUCRATIVA. Nenhuma configuração garante \"só ganhar\": cada operação paga " +
+        "base fee, priority fee, tip, spread e slippage, e o ativo pode cair depois da compra. O que está " +
+        "garantido é o LIMITE da perda e a AUSÊNCIA de resultado fabricado — não o sinal do resultado.",
+    };
+  })();
+
   return res.json({
     generatedAt: new Date().toISOString(),
     headline:
@@ -1772,6 +1969,7 @@ app.get("/api/system-truth", (_req, res) => {
       "e o voo único entre processos, em `GET /api/storage` (S10).",
     realSources,
     simulatedEndpoints,
+    exitSafety: exitSafetySnapshot,
     /**
      * Estado da entrada real — a pergunta "este bot pode gastar agora?" precisa de resposta
      * direta aqui, no painel de veracidade, e não só em /api/real-entry.
@@ -1827,6 +2025,8 @@ app.get("/api/system-truth", (_req, res) => {
     summary: {
       realSources: realSources.filter((s) => s.status === "real").length,
       simulatedEndpoints: simulatedEndpoints.length,
+      unverifiedPositions: exitSafetySnapshot.managedClassification.unverifiedPositions,
+      dailyLossExceeded: exitSafetySnapshot.dailyLoss.exceeded,
       liveExecutionPath: (() => {
         const policy = resolveRealEntryPolicy();
         const res = getRuntimeModeResolution();
@@ -1930,29 +2130,55 @@ app.post("/api/positions/close", async (req, res) => {
 
     const walletPublicKey = getActiveWalletPublicKey();
 
-    // 2. Fetch exact token account balance and decimals from RPC
+    /**
+     * S12 — A QUANTIDADE VEM DA CADEIA, OU A SAÍDA NÃO ACONTECE.
+     * (Mesma doutrina do caminho autônomo: retry com backoff e aborto fail-closed; nunca
+     * `sizeSol / entryPrice` como quantidade.)
+     */
     let rawAmount = 0;
     let decimals = 9;
 
-    try {
-      const tokenAccounts = await globalConnection.getParsedTokenAccountsByOwner(
-        walletPublicKey,
-        { mint: new PublicKey(pos.mint) }
+    const balanceRead = await readMintBalanceForDecision(walletPublicKey, pos.mint, EXIT_SAFETY.balanceAttempts);
+    const balanceVerdict = decideExitFromBalance(balanceRead, 9);
+
+    if (balanceVerdict.action !== "proceed") {
+      exitLocks.delete(pos.id);
+      pos.status = "open";
+      pos.exitAttempts = (pos.exitAttempts ?? 0) + 1;
+      pos.lastExitError = `${balanceVerdict.code}: ${balanceVerdict.reason}`;
+      pos.lastExitAttemptAt = new Date().toISOString();
+      dbStore.savePosition(pos);
+      manualExitIntent = advanceIntentOrKeep(
+        manualExitIntent,
+        "failed",
+        { lastError: balanceVerdict.reason },
+        "S12: abortado ANTES de assinar (quantidade não verificada)"
       );
-      if (tokenAccounts.value.length > 0) {
-        const accInfo = tokenAccounts.value[0].account.data.parsed.info;
-        rawAmount = parseInt(accInfo.tokenAmount.amount) || 0;
-        decimals = accInfo.tokenAmount.decimals || 9;
-      }
-    } catch (err: any) {
-      console.log(`[On-Chain Manual Close] Parsed token accounts lookup for ${pos.token}: ${err.message}. Using local balance calculation.`);
+      blockedIntentWarned.delete(manualExitIntent.id);
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "CRITICAL",
+        component: "RISK_ENGINE",
+        message: `[S12][EXIT ABORTADO] ${balanceVerdict.code} em $${pos.token}: ${balanceVerdict.reason}`,
+        correlationId,
+      });
+      return res.status(balanceVerdict.action === "abort_zero_balance" ? 409 : 424).json({
+        error: balanceVerdict.reason,
+        code: balanceVerdict.code,
+        positionStatus: "open",
+        estimated: false,
+      });
     }
 
-    // Fallback if balance is 0
-    if (rawAmount === 0) {
-      const qtyFloat = (pos.sizeSol / pos.entryPrice) || 1000000;
-      rawAmount = Math.floor(qtyFloat * Math.pow(10, decimals));
-    }
+    rawAmount = balanceVerdict.rawAmount;
+    decimals = balanceVerdict.decimals;
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "INFO",
+      component: "RISK_ENGINE",
+      message: `[S12] quantidade de saída VERIFICADA on-chain: ${balanceVerdict.note}`,
+      correlationId,
+    });
 
     // Tip LIMITADO por bps do capital (auditoria: tip fixo de 0.003 SOL = 300 bps em
     // uma posição de 0.1 SOL, o que inviabiliza matematicamente a operação).
@@ -2193,6 +2419,8 @@ app.post("/api/positions/close", async (req, res) => {
       measuredOnChain: pernaSaida.measured,
       pnlBasis: ciclo.basis,
       windowConflictSol: ciclo.windowConflict ? (ciclo.discrepancySol as number) : undefined,
+      /** S12: data completa do fechamento — sem ela o livro de perda diária não soma o dia. */
+      closedAtIso: new Date().toISOString(),
       mode: "live" as const,
     };
 
@@ -2202,25 +2430,65 @@ app.post("/api/positions/close", async (req, res) => {
       snipedTransactions.pop();
     }
 
-    // Set status to closed & save, then delete from memory active list
-    pos.status = "closed";
-    dbStore.savePosition(pos);
-    dbStore.deletePosition(id);
-    exitLocks.delete(id);
-
-    recorder.recordPositionLifecycle({
-      positionId: id,
-      mint: pos.mint,
-      token: pos.token,
-      event: "closed",
-      mode: "live",
-      sizeSol: pos.sizeSol,
-      entryPriceSol: pos.entryPrice ?? null,
-      exitPriceSol: outSol,
-      pnlPercent: ciclo.measured && pos.sizeSol > 0 ? ((ciclo.pnlNetSol as number) / pos.sizeSol) * 100 : null,
-      reason: "manual-exit",
-      pnlMeasuredOnChain: ciclo.measured,
+    /**
+     * S12 — LIVRO DE PERDA DIÁRIA. Recebe SOMENTE PnL de ciclo medido (as duas pernas); ganho
+     * não abate perda de outro trade e o não medido não vira zero. Ao atingir o teto, o kill
+     * switch é acionado aqui mesmo, no instante em que o prejuízo fica conhecido.
+     */
+    dailyLossLedger.record({
+      tradeId: realCloseTx.id,
+      pnlNetSol: realCloseTx.pnlNetSol ?? null,
+      pnlBasis: realCloseTx.pnlBasis ?? null,
+      closedAtIso: (realCloseTx as any).closedAtIso ?? null,
     });
+    enforceDailyLossLimit("após fechamento manual");
+
+    /**
+     * S12 — FECHAMENTO SÓ COM PROVA DE RESÍDUO (caminho manual).
+     * Mesma doutrina do caminho autônomo: sem resíduo verificado, a posição NÃO sai do banco.
+     */
+    const residualRead = await readMintBalanceForDecision(walletPublicKey, pos.mint, 2);
+    const closeVerdict = decideCloseFromResidual(residualRead, EXIT_SAFETY.residualDustRaw);
+
+    if (closeVerdict.close) {
+      recorder.recordPositionLifecycle({
+        positionId: id,
+        mint: pos.mint,
+        token: pos.token,
+        event: "closed",
+        mode: "live",
+        sizeSol: pos.sizeSol,
+        entryPriceSol: pos.entryPrice ?? null,
+        exitPriceSol: outSol,
+        pnlPercent: ciclo.measured && pos.sizeSol > 0 ? ((ciclo.pnlNetSol as number) / pos.sizeSol) * 100 : null,
+        reason: "manual-exit",
+        pnlMeasuredOnChain: ciclo.measured,
+      });
+
+      // Set status to closed & save, then delete from memory active list
+      pos.status = "closed";
+      pos.timeClosed = new Date().toISOString();
+      dbStore.savePosition(pos);
+      dbStore.deletePosition(id);
+      exitLocks.delete(id);
+    } else {
+      pos.status = "open";
+      pos.exitAttempts = (pos.exitAttempts ?? 0) + 1;
+      pos.lastExitError = closeVerdict.reason;
+      pos.lastExitAttemptAt = new Date().toISOString();
+      dbStore.savePosition(pos);
+      exitLocks.delete(id);
+
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "CRITICAL",
+        component: "RISK_ENGINE",
+        message:
+          `[S12][RESÍDUO] Fechamento manual de $${pos.token} confirmado, mas ${closeVerdict.reason} ` +
+          `A posição CONTINUA ABERTA: o restante é vendido em novo ciclo.`,
+        correlationId,
+      });
+    }
 
     dbStore.saveLog({
       timestamp: new Date().toISOString(),
@@ -2238,7 +2506,18 @@ app.post("/api/positions/close", async (req, res) => {
     });
 
     reportTradeOutcome(true);
-    return res.json({ success: true, transaction: realCloseTx });
+    return res.json({
+      success: true,
+      transaction: realCloseTx,
+      /**
+       * S12 — a resposta DECLARA se a posição saiu do banco. `positionStatus: "closed"` só com
+       * prova de resíduo; `open` significa que a venda foi confirmada mas sobrou token e a
+       * posição continua sendo gerida (nada foi apagado nem estimado).
+       */
+      positionStatus: closeVerdict.close ? "closed" : "open",
+      residualRaw: residualRead.ok ? residualRead.rawAmount : null,
+      residualNote: closeVerdict.reason,
+    });
 
   } catch (err: any) {
     /**
@@ -5094,6 +5373,29 @@ async function runRealEntry(params: {
   const { gateInput, policy } = buildEntryGateInput(params);
   const gate = assessEntryGate(gateInput);
 
+  /**
+   * S12 — LIMITE DE PERDA DIÁRIA (fail-closed, antes do gate de tamanho).
+   * O gate puro cobre tamanho/mint/exposição; este é o freio por RESULTADO: quando a perda
+   * medida do dia alcança `MAX_DAILY_LOSS_SOL`, o kill switch é acionado e nenhuma entrada
+   * nova acontece até o operador rearmar. Saídas continuam liberadas (reduzem exposição).
+   */
+  const dailyLossBlock = enforceDailyLossLimit("entrada real");
+  if (dailyLossBlock) {
+    return registrarRecusaDeEntrada(
+      refusedRealEntry(params.mint, params.sizeSol, gate, dailyLossBlock),
+      params.correlationId
+    );
+  }
+
+  /** S12 — teto de posições abertas (o `MAX_OPEN_POSITIONS` do template passa a valer). */
+  const openPositionsBlock = enforceMaxOpenPositions();
+  if (openPositionsBlock) {
+    return registrarRecusaDeEntrada(
+      refusedRealEntry(params.mint, params.sizeSol, gate, openPositionsBlock),
+      params.correlationId
+    );
+  }
+
   if (!gate.allowed) {
     return registrarRecusaDeEntrada(refusedRealEntry(params.mint, params.sizeSol, gate), params.correlationId);
   }
@@ -6424,6 +6726,13 @@ async function startAutonomousPositionManager(): Promise<void> {
     try {
       // Monitor every 3 seconds
       await new Promise((resolve) => setTimeout(resolve, 3000));
+
+      /** S12 — verificação periódica (1x/min) do teto de perda diária, barata: só lê o livro. */
+      if (Date.now() - lastDailyLossCheckAt >= 60_000) {
+        lastDailyLossCheckAt = Date.now();
+        const blocked = enforceDailyLossLimit("verificação periódica do loop de gestão");
+        if (blocked) console.warn(`[S12] ${blocked}`);
+      }
       
       if (!globalConnection) {
         continue;
@@ -6580,10 +6889,39 @@ async function startAutonomousPositionManager(): Promise<void> {
       );
 
       for (const pos of openPositions) {
-        // POSIÇÕES PAPER: gestão de risco em modo sombra. Nenhuma assinatura, nenhuma
-        // transação. Sem este desvio, o gerenciador tentaria VENDER tokens que nunca
-        // foram comprados — e antes da correção, gravava essa "venda" como sucesso.
-        const isPaper = (pos as any).mode === "paper";
+        /**
+         * S12 — CLASSIFICAÇÃO PARA GESTÃO (pergunta diferente da contagem de exposição).
+         *
+         * `pos.mode` AUSENTE era tratado como posição real: o laço tentava vender on-chain e o
+         * gate de duplicidade contava a posição como entrada já usada. Posição sem evidência de
+         * entrada (herança de scaffold) agora é `unverified`: NÃO assina saída, NÃO é apagada e
+         * fica declarada — a reconciliação (`GET /api/positions/desync`) decide o destino. Ela
+         * CONTINUA contando para exposição (`collectRealEntryState`): capital possivelmente
+         * exposto nunca é ignorado.
+         */
+        const posClass = classifyManagedPosition(pos as any);
+        if (posClass.kind === "unverified") {
+          if (!unverifiedPositionWarned.has(pos.id)) {
+            unverifiedPositionWarned.add(pos.id);
+            dbStore.saveLog({
+              timestamp: new Date().toISOString(),
+              level: "WARN",
+              component: "RISK_ENGINE",
+              message:
+                `[S12][POSIÇÃO NÃO PROVADA] ${pos.token ?? pos.id}: ${posClass.reason}. ` +
+                `Não é gerida como real (não assina saída), não é apagada e não consome o canário. ` +
+                `Reconcile antes de operar LIVE.`,
+              correlationId: `corr_unverified_pos_${pos.id}`,
+            });
+          }
+          continue;
+        }
+        const isPaper = posClass.kind === "paper";
+
+        /** Anti-loop: saída abortada por falta de prova não reconsulta o RPC a cada 3 s. */
+        const recheckAt = exitAbortRecheckAt.get(pos.id);
+        if (recheckAt && Date.now() < recheckAt) continue;
+        exitAbortRecheckAt.delete(pos.id);
 
         /**
          * SANIDADE DE POSIÇÃO — corta lixo ANTES de gastar RPC.
@@ -7189,32 +7527,59 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
     const connection = await runWithRpcFailover(async (conn) => conn);
     const walletPublicKey = getActiveWalletPublicKey();
 
-    // 2. Fetch exact token account balance and decimals from RPC
-    let rawAmount = 0;
-    let decimals = 9;
+    /**
+     * S12 — A QUANTIDADE VEM DA CADEIA, OU A SAÍDA NÃO ACONTECE.
+     *
+     * O bloco anterior (herdado do scaffold) fazia `sizeSol / entryPrice` quando a leitura do
+     * saldo falhava ou voltava zero, e SEGUIA para cotar/assinar: a ordem era montada sobre um
+     * número inventado. Aqui a leitura tem retry e, sem prova de saldo, a saída é ABORTADA
+     * (fail-closed) — sem estimar, sem assinar e sem apagar a posição.
+     */
+    const balanceRead = await readMintBalanceForDecision(walletPublicKey, pos.mint, EXIT_SAFETY.balanceAttempts);
+    const balanceVerdict = decideExitFromBalance(balanceRead, 9);
 
-    try {
-      const tokenAccounts = await runWithRpcFailover(async (conn) => {
-        return await conn.getParsedTokenAccountsByOwner(
-          walletPublicKey,
-          { mint: new PublicKey(pos.mint) }
-        );
+    if (balanceVerdict.action !== "proceed") {
+      /**
+       * ABORTO LIMPO — e deliberadamente NÃO é reportado ao circuit breaker como "falha de
+       * execução". Saldo ilegível/zero é estado a RECONCILIAR, não erro do nosso envio;
+       * alimentar o breaker com isso transforma um problema de dados em negação de serviço
+       * (no scaffold, 3 abortos derrubavam o kill switch e paravam o bot inteiro).
+       */
+      exitAbortRecheckAt.set(pos.id, Date.now() + EXIT_SAFETY.abortRecheckMs);
+      exitLocks.delete(pos.id);
+      exitIntent = advanceIntentOrKeep(
+        exitIntent,
+        "failed",
+        { lastError: balanceVerdict.reason },
+        "S12: abortado ANTES de assinar (quantidade não verificada)"
+      );
+      blockedIntentWarned.delete(exitIntent.id);
+      pos.status = "open";
+      pos.exitAttempts = (pos.exitAttempts ?? 0) + 1;
+      pos.lastExitError = `${balanceVerdict.code}: ${balanceVerdict.reason}`;
+      pos.lastExitAttemptAt = new Date().toISOString();
+      dbStore.savePosition(pos);
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "CRITICAL",
+        component: "RISK_ENGINE",
+        message:
+          `[S12][EXIT ABORTADO] ${balanceVerdict.code} em $${pos.token}: ${balanceVerdict.reason} ` +
+          `Nenhuma ordem foi construída. Rechecagem em ${(EXIT_SAFETY.abortRecheckMs / 1000).toFixed(0)}s.`,
+        correlationId,
       });
-      if (tokenAccounts.value.length > 0) {
-        const accInfo = tokenAccounts.value[0].account.data.parsed.info;
-        rawAmount = parseInt(accInfo.tokenAmount.amount) || 0;
-        decimals = accInfo.tokenAmount.decimals || 9;
-      }
-    } catch (err: any) {
-      console.log(`[On-Chain Exit] Parsed token accounts query for ${pos.token}: ${err.message}. Using local calculation.`);
+      return;
     }
 
-    // If balance is 0, fall back to calculated quantity
-    if (rawAmount === 0) {
-      const qtyFloat = (pos.sizeSol / (pos.entryPrice || 0.0001)) || 1000000;
-      rawAmount = Math.floor(qtyFloat * Math.pow(10, decimals));
-      console.log(`[On-Chain Exit] Local token balance was 0. Proceeding with position qty ${qtyFloat} units.`);
-    }
+    const rawAmount = balanceVerdict.rawAmount;
+    const decimals = balanceVerdict.decimals;
+    dbStore.saveLog({
+      timestamp: new Date().toISOString(),
+      level: "INFO",
+      component: "RISK_ENGINE",
+      message: `[S12] quantidade de saída VERIFICADA on-chain: ${balanceVerdict.note}`,
+      correlationId,
+    });
 
     // Tip LIMITADO por bps do capital (mesmo motivo do fechamento manual).
     const { tipSol: jitoTip, clamped: tipClamped } = clampTipSol(
@@ -7532,6 +7897,8 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       measuredOnChain: pernaSaida.measured,
       pnlBasis: ciclo.basis,
       windowConflictSol: ciclo.windowConflict ? (ciclo.discrepancySol as number) : undefined,
+      /** S12: data completa do fechamento — sem ela o livro de perda diária não soma o dia. */
+      closedAtIso: new Date().toISOString(),
       mode: "live" as const,
     };
 
@@ -7541,25 +7908,76 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       snipedTransactions.pop();
     }
 
-    // Set status to closed, save to db, and remove from memory active list
-    pos.status = "closed";
-    dbStore.savePosition(pos);
-    dbStore.deletePosition(pos.id);
-    exitLocks.delete(pos.id);
-
-    recorder.recordPositionLifecycle({
-      positionId: pos.id,
-      mint: pos.mint,
-      token: pos.token,
-      event: "closed",
-      mode: "live",
-      sizeSol: pos.sizeSol,
-      entryPriceSol: pos.entryPrice ?? null,
-      exitPriceSol: rawAmount > 0 ? outSol / (rawAmount / Math.pow(10, decimals)) : null,
-      pnlPercent: ciclo.measured && pos.sizeSol > 0 ? ((ciclo.pnlNetSol as number) / pos.sizeSol) * 100 : null,
-      reason,
-      pnlMeasuredOnChain: ciclo.measured,
+    /** S12 — livro de perda diária (mesma doutrina do fechamento manual). */
+    dailyLossLedger.record({
+      tradeId: realCloseTx.id,
+      pnlNetSol: realCloseTx.pnlNetSol ?? null,
+      pnlBasis: realCloseTx.pnlBasis ?? null,
+      closedAtIso: (realCloseTx as any).closedAtIso ?? null,
     });
+    enforceDailyLossLimit("após fechamento autônomo");
+
+    /**
+     * S12 — FECHAMENTO SÓ COM PROVA DE RESÍDUO (caminho autônomo).
+     *
+     * A venda foi CONFIRMADA, mas confirmar não é o mesmo que ter esvaziado a carteira: token
+     * com transfer fee, venda parcial aceita pelo agregador ou saldo residual deixam o ativo
+     * na carteira. Antes, a posição era marcada `closed` e APAGADA do banco sem verificação —
+     * e o resto do token virava exposição sem stop, sem alvo e sem registro. Agora: resíduo
+     * acima da tolerância ⇒ a posição CONTINUA aberta (o resto sai no próximo ciclo); leitura
+     * falhou ⇒ permanece aberta também (não se apaga o que não se viu).
+     */
+    const residualRead = await readMintBalanceForDecision(walletPublicKey, pos.mint, 2);
+    const closeVerdict = decideCloseFromResidual(residualRead, EXIT_SAFETY.residualDustRaw);
+
+    if (closeVerdict.close) {
+      exitAbortRecheckAt.delete(pos.id);
+      recorder.recordPositionLifecycle({
+        positionId: pos.id,
+        mint: pos.mint,
+        token: pos.token,
+        event: "closed",
+        mode: "live",
+        sizeSol: pos.sizeSol,
+        entryPriceSol: pos.entryPrice ?? null,
+        exitPriceSol: rawAmount > 0 ? outSol / (rawAmount / Math.pow(10, decimals)) : null,
+        pnlPercent: ciclo.measured && pos.sizeSol > 0 ? ((ciclo.pnlNetSol as number) / pos.sizeSol) * 100 : null,
+        reason,
+        pnlMeasuredOnChain: ciclo.measured,
+      });
+
+      // Set status to closed, save to db, and remove from memory active list
+      pos.status = "closed";
+      pos.timeClosed = new Date().toISOString();
+      dbStore.savePosition(pos);
+      dbStore.deletePosition(pos.id);
+      exitLocks.delete(pos.id);
+
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "INFO",
+        component: "RISK_ENGINE",
+        message: `[S12] $${pos.token} encerrada com prova de resíduo: ${closeVerdict.reason}.`,
+        correlationId,
+      });
+    } else {
+      pos.status = "open";
+      pos.exitAttempts = (pos.exitAttempts ?? 0) + 1;
+      pos.lastExitError = closeVerdict.reason;
+      pos.lastExitAttemptAt = new Date().toISOString();
+      dbStore.savePosition(pos);
+      exitLocks.delete(pos.id);
+      exitAbortRecheckAt.set(pos.id, Date.now() + EXIT_SAFETY.abortRecheckMs);
+      dbStore.saveLog({
+        timestamp: new Date().toISOString(),
+        level: "CRITICAL",
+        component: "RISK_ENGINE",
+        message:
+          `[S12][RESÍDUO] Venda confirmada, mas ${closeVerdict.reason} ` +
+          `A posição CONTINUA ABERTA e nada foi apagado: o restante entra no próximo ciclo de saída.`,
+        correlationId,
+      });
+    }
 
     dbStore.saveLog({
       timestamp: new Date().toISOString(),

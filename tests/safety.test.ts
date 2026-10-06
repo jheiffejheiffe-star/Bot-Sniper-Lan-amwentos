@@ -6150,6 +6150,204 @@ async function main(): Promise<void> {
     assert.ok(ciclo.notes.some((n) => /LIMITE DA DECOMPOSIÇÃO/.test(n)), ciclo.notes.join(" | "));
   });
 
+  // ---------------------------------------------------------------------------
+  // [31] S12 — SAÍDA FAIL-CLOSED E TETO DE PERDA DIÁRIA
+  // ---------------------------------------------------------------------------
+  console.log("\n[31] S12 — quantidade verificada, prova de resíduo e limite de perda");
+
+  await test("política de saída (S12): defaults e override por env, com piso e teto", async () => {
+    const es = await import("../src/exitSafety.js");
+    assert.deepEqual(es.resolveExitSafetyPolicy({} as any), es.EXIT_SAFETY_DEFAULTS);
+    const o = es.resolveExitSafetyPolicy({
+      HFT_EXIT_BALANCE_ATTEMPTS: "5",
+      HFT_EXIT_BALANCE_BACKOFF_MS: "0",
+      HFT_RESIDUAL_DUST_RAW: "2",
+      HFT_EXIT_ABORT_RECHECK_MS: "1000",
+    } as any);
+    assert.equal(o.balanceAttempts, 5);
+    assert.equal(o.balanceBackoffMs, 0);
+    assert.equal(o.residualDustRaw, 2);
+    assert.equal(o.abortRecheckMs, 1000);
+    const clamped = es.resolveExitSafetyPolicy({ HFT_EXIT_BALANCE_ATTEMPTS: "99", HFT_EXIT_BALANCE_BACKOFF_MS: "-5" } as any);
+    assert.equal(clamped.balanceAttempts, 5, "teto de 5 tentativas");
+    assert.equal(clamped.balanceBackoffMs, 0, "piso 0 (não se espera negativo)");
+  });
+
+  await test("leitura de saldo: zero contas é FATO; falha em todas as tentativas é 'não consegui ver'", async () => {
+    const es = await import("../src/exitSafety.js");
+    const vazio = await es.readMintBalanceFailClosed({ readAccounts: async () => [], attempts: 3, backoffMs: 0 });
+    assert.equal(vazio.ok, true, "leitura concluída sem contas é um fato, não uma falha");
+    assert.equal(vazio.rawAmount, 0);
+    assert.equal(vazio.attempts, 1, "não se repete uma leitura que respondeu");
+
+    let calls = 0;
+    const falha = await es.readMintBalanceFailClosed({
+      readAccounts: async () => { calls++; throw new Error("RPC indisponível"); },
+      attempts: 3,
+      backoffMs: 0,
+    });
+    assert.equal(falha.ok, false, "sem leitura, o resultado é 'não consegui ver'");
+    assert.equal(calls, 3, "as 3 tentativas acontecem");
+    assert.equal(falha.errors.length, 3);
+
+    let n = 0;
+    const retry = await es.readMintBalanceFailClosed({
+      readAccounts: async () => { n++; if (n === 1) throw new Error("timeout"); return [{ rawAmount: 42, decimals: 6 }]; },
+      attempts: 3,
+      backoffMs: 0,
+    });
+    assert.equal(retry.ok, true);
+    assert.equal(retry.rawAmount, 42);
+    assert.equal(retry.attempts, 2, "o retry é provado pela contagem de tentativas");
+  });
+
+  await test("decisão de saída: zero ⇒ abort_zero_balance; ilegível ⇒ abort_unverified; nunca estima", async () => {
+    const es = await import("../src/exitSafety.js");
+    const zero = es.decideExitFromBalance({ ok: true, rawAmount: 0, decimals: 6, accounts: 1, attempts: 1, errors: [] });
+    assert.equal(zero.action, "abort_zero_balance");
+    assert.equal((zero as any).code, "EXIT_ABORTED_ZERO_ONCHAIN_BALANCE");
+    assert.ok(/permanece aberta/.test((zero as any).reason), "o motivo diz que a posição continua aberta");
+
+    const ilegivel = es.decideExitFromBalance({ ok: false, rawAmount: 0, decimals: null, accounts: 0, attempts: 3, errors: ["tentativa 1/3: timeout"] });
+    assert.equal(ilegivel.action, "abort_unverified");
+    assert.equal((ilegivel as any).code, "EXIT_ABORTED_BALANCE_UNREADABLE");
+    assert.ok(/SEM estimar/.test((ilegivel as any).reason));
+
+    const ok = es.decideExitFromBalance({ ok: true, rawAmount: 1234, decimals: 9, accounts: 2, attempts: 1, errors: [] });
+    assert.equal(ok.action, "proceed");
+    assert.equal((ok as any).rawAmount, 1234);
+    assert.equal((ok as any).decimals, 9);
+  });
+
+  await test("decisão de saída: decimals ausente usa o valor declarado e DIZ que usou", async () => {
+    const es = await import("../src/exitSafety.js");
+    const v = es.decideExitFromBalance({ ok: true, rawAmount: 7, decimals: null, accounts: 1, attempts: 1, errors: [] }, 6);
+    assert.equal(v.action, "proceed");
+    assert.equal((v as any).decimals, 6);
+    assert.ok(/decimals não veio na leitura/.test((v as any).note), "o fallback é declarado, não silencioso");
+  });
+
+  await test("fechamento: só com prova de resíduo — parcial continua aberta, leitura falha não fecha", async () => {
+    const es = await import("../src/exitSafety.js");
+    const completo = es.decideCloseFromResidual({ ok: true, rawAmount: 0, decimals: 6, accounts: 0, attempts: 1, errors: [] });
+    assert.equal(completo.close, true);
+
+    const parcial = es.decideCloseFromResidual({ ok: true, rawAmount: 5, decimals: 6, accounts: 1, attempts: 1, errors: [] });
+    assert.equal(parcial.close, false);
+    assert.equal((parcial as any).kind, "partial");
+    assert.equal((parcial as any).remainingRaw, 5);
+
+    const poeira = es.decideCloseFromResidual({ ok: true, rawAmount: 5, decimals: 6, accounts: 1, attempts: 1, errors: [] }, 5);
+    assert.equal(poeira.close, true, "tolerância DECLARADA permite fechar (Token-2022 com transfer fee)");
+
+    const falhou = es.decideCloseFromResidual({ ok: false, rawAmount: 0, decimals: null, accounts: 0, attempts: 2, errors: ["x"] });
+    assert.equal(falhou.close, false, "não se apaga o que não se conseguiu verificar");
+    assert.equal((falhou as any).kind, "unverified");
+    assert.equal((falhou as any).remainingRaw, null, "resíduo desconhecido NÃO vira zero");
+  });
+
+  await test("classificação de posição: paper não assina; live sem evidência é NÃO PROVADA", async () => {
+    const es = await import("../src/exitSafety.js");
+    assert.equal(es.classifyManagedPosition({ mode: "paper" }).kind, "paper");
+    assert.equal(es.classifyManagedPosition({ mode: "shadow" }).kind, "paper");
+    assert.equal(es.classifyManagedPosition({ mode: "live", signature: "5abc..." }).kind, "live");
+    assert.equal(es.classifyManagedPosition({ mode: "live", entryLeg: { signature: "5abc..." } }).kind, "live");
+    const semAssinatura = es.classifyManagedPosition({ mode: "live" });
+    assert.equal(semAssinatura.kind, "unverified", "live sem prova de entrada não pode assinar saída");
+    const semModo = es.classifyManagedPosition({});
+    assert.equal(semModo.kind, "unverified", "posição herdada sem `mode` não é mais tratada como real");
+    assert.ok(/modo ausente/.test(semModo.reason), semModo.reason);
+  });
+
+  await test("livro de perda diária: só PnL de ciclo medido; ganho não abate; sem data fica de fora", async () => {
+    const es = await import("../src/exitSafety.js");
+    const ledger = es.createDailyLossLedger();
+    const dia = "2026-10-06";
+    const st = ledger.seed([
+      { id: "a", pnlNetSol: -0.002, pnlBasis: "round_trip_legs", closedAtIso: `${dia}T10:00:00.000Z` },
+      { id: "b", pnlNetSol: 0.01, pnlBasis: "round_trip_legs", closedAtIso: `${dia}T10:05:00.000Z` },
+      { id: "c", pnlNetSol: -0.5, pnlBasis: "exit_leg_only", closedAtIso: `${dia}T10:10:00.000Z` },
+      { id: "d", pnlNetSol: -0.3, pnlBasis: "round_trip_legs", time: "10:15:00.000" },
+    ], `${dia}T23:00:00.000Z`);
+    assert.equal(st.countedTrades, 2, "só os dois com ciclo medido E data entram");
+    assert.ok(Math.abs(st.realizedLossSol - 0.002) < 1e-12, `perda somada=${st.realizedLossSol}`);
+    assert.equal(st.ignoredGains, 1, "o ganho não abate a perda");
+    assert.equal(st.ignoredNotMeasured, 1, "`exit_leg_only` é receita de venda, não PnL");
+    assert.equal(st.undatedMeasured, 1, "medido sem data é DECLARADO, não somado");
+    assert.ok(/PISO verificado/.test(st.note), st.note);
+  });
+
+  await test("livro de perda: idempotente por id, rola no dia e 0 = sem teto", async () => {
+    const es = await import("../src/exitSafety.js");
+    const ledger = es.createDailyLossLedger();
+    const rec = { tradeId: "x", pnlNetSol: -0.01, pnlBasis: "round_trip_legs", closedAtIso: "2026-10-06T12:00:00.000Z" };
+    ledger.record(rec);
+    const duas = ledger.record(rec);
+    assert.ok(Math.abs(duas.realizedLossSol - 0.01) < 1e-12, "o MESMO trade não conta duas vezes");
+    assert.equal(ledger.exceeded(0.05, "2026-10-06T13:00:00.000Z"), false);
+    assert.equal(ledger.exceeded(0.01, "2026-10-06T13:00:00.000Z"), true, "teto atingido");
+    assert.equal(ledger.exceeded(0, "2026-10-06T13:00:00.000Z"), false, "0 = sem teto declarado");
+    const outroDia = ledger.state("2026-10-07T00:01:00.000Z");
+    assert.equal(outroDia.realizedLossSol, 0, "o dia rola");
+    assert.equal(outroDia.dayIso, "2026-10-07");
+  });
+
+  await test("gate do teto diário: motivo legível e ausência de teto declarada", async () => {
+    const es = await import("../src/exitSafety.js");
+    const estado = {
+      dayIso: "2026-10-06", realizedLossSol: 0.02, countedTrades: 3, conflictedTrades: 0,
+      ignoredNotMeasured: 0, ignoredGains: 0, undatedMeasured: 1, note: "",
+    } as any;
+    const semTeto = es.dailyLossGate(estado, 0);
+    assert.equal(semTeto.exceeded, false);
+    assert.ok(/sem limite diário declarado/.test(semTeto.reason));
+    const estourou = es.dailyLossGate(estado, 0.02);
+    assert.equal(estourou.exceeded, true);
+    assert.ok(/TETO ATINGIDO/.test(estourou.reason));
+    assert.ok(/sem data ficaram FORA/.test(estourou.reason), estourou.reason);
+    const dentro = es.dailyLossGate(estado, 0.05);
+    assert.equal(dentro.exceeded, false);
+    assert.ok(/dentro do teto/.test(dentro.reason));
+  });
+
+  await test("o servidor NÃO estima mais quantidade de venda e usa o módulo S12 nos dois caminhos", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const code = serverSrc
+      .split("\n")
+      .filter((l) => {
+        const t = l.trim();
+        return !(t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"));
+      })
+      .join("\n");
+    for (const proibido of [
+      "rawAmount = Math.floor(qtyFloat",
+      "Using local calculation",
+      "Using local balance calculation",
+      "fall back to calculated quantity",
+    ]) {
+      assert.ok(!code.includes(proibido), `o servidor voltou a ESTIMAR quantidade de venda: "${proibido}"`);
+    }
+    for (const obrigatorio of [
+      "decideExitFromBalance(",
+      "decideCloseFromResidual(",
+      "classifyManagedPosition(",
+      "readMintBalanceForDecision(",
+      "enforceDailyLossLimit(",
+      "enforceMaxOpenPositions(",
+      "MAX_DAILY_LOSS_SOL",
+    ]) {
+      assert.ok(code.includes(obrigatorio), `o caminho de saída perdeu "${obrigatorio}"`);
+    }
+    // Leitura fail-closed: 1 definição + 4 usos — saldo e resíduo em CADA um dos dois caminhos
+    // de saída (fechamento manual e saída autônoma). Se um deles perder a verificação, isto cai.
+    assert.equal(
+      code.split("readMintBalanceForDecision(").length - 1,
+      5,
+      "esperado: definição + (saldo e resíduo) × (manual, autônomo)"
+    );
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);
