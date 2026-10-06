@@ -25,6 +25,7 @@ import { EvidenceCenter } from "./components/EvidenceCenter";
 import { ProductionReadinessCenter } from "./components/ProductionReadinessCenter";
 import { MissionControl } from "./components/MissionControl";
 import { ObservabilityCenter } from "./components/ObservabilityCenter";
+import TruthBanner from "./components/TruthBanner";
 import { StatisticalValidationCenter } from "./components/StatisticalValidationCenter";
 import { SnipedTransaction } from "./types";
 import { Coins, ShieldCheck, Activity, LogOut, Globe, Layers, Cpu } from "lucide-react";
@@ -374,6 +375,16 @@ export default function App() {
     <div id="solana-sniper-app" className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none pb-12">
       {/* Decorative top grid lines */}
       <div className="absolute inset-0 bg-[linear-gradient(to_right,#0f172a_1px,transparent_1px),linear-gradient(to_bottom,#0f172a_1px,transparent_1px)] bg-[size:4rem_4rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] pointer-events-none z-0"></div>
+
+      {/*
+        BANNER DE VERDADE — acima de tudo e permanente.
+        Vários painéis abaixo exibem números aleatórios gerados no servidor. Sem esta
+        declaração, "inclusion rate" e "P95 de latência" seriam lidos como desempenho
+        medido. Recolhível, mas nunca oculto por completo.
+      */}
+      <div className="relative z-20">
+        <TruthBanner />
+      </div>
 
       {/* Header */}
       <header className="relative z-10 border-b border-slate-900 bg-slate-950/70 backdrop-blur-md px-6 py-4 flex flex-col md:flex-row items-center justify-between gap-4">

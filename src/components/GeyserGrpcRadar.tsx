@@ -31,6 +31,10 @@ interface GeyserEvent {
   jsonRpcLatencyMs: number;
   savedComputeUnits: number;
   rawProtobufHex: string;
+  /** true = veio de notificação do RPC; ausente/false = evento decorativo (MOCK/RNG). */
+  isRealOnChain?: boolean;
+  simulated?: boolean;
+  source?: string;
 }
 
 interface GeyserStreamConfig {
@@ -55,12 +59,17 @@ export function GeyserGrpcRadar() {
   const [streamActive, setStreamActive] = useState(true);
   const [events, setEvents] = useState<GeyserEvent[]>([]);
   const [selectedEvent, setSelectedEvent] = useState<GeyserEvent | null>(null);
+  /**
+   * Só campos que a API REALMENTE devolve. `systemLoad`, `activeChannels`,
+   * `shredStreamState` e `messagesPerSecond` saíram: eram números aleatórios do servidor
+   * (RNG) apresentados como telemetria de ingestão, e o endpoint passou a declará-los como
+   * NÃO MEDIDOS (ver /api/system-truth → painéis simulados).
+   */
   const [systemStats, setSystemStats] = useState({
-    currentSlot: 0,
-    systemLoad: 0,
-    activeChannels: 4,
-    shredStreamState: "CONNECTED",
-    messagesPerSecond: 1540
+    currentSlot: null as number | null,
+    currentSlotMeasured: false,
+    feedReal: 0,
+    feedSimulated: 0,
   });
 
   const [latencyHistory, setLatencyHistory] = useState<any[]>([]);
@@ -74,11 +83,10 @@ export function GeyserGrpcRadar() {
       const data = await res.json();
       
       setSystemStats({
-        currentSlot: data.currentSlot,
-        systemLoad: data.systemLoad,
-        activeChannels: data.activeChannels,
-        shredStreamState: data.shredStreamState,
-        messagesPerSecond: data.messagesPerSecond
+        currentSlot: typeof data.currentSlot === "number" ? data.currentSlot : null,
+        currentSlotMeasured: data.currentSlotMeasured === true,
+        feedReal: Number(data?.feed?.real ?? 0),
+        feedSimulated: Number(data?.feed?.simulated ?? 0),
       });
 
       // Update events list (keep max 10 to avoid memory bloating)
@@ -197,22 +205,21 @@ export function GeyserGrpcRadar() {
           <Radio className="w-5 h-5 text-cyan-400 animate-pulse" />
           <div>
             <h2 className="text-sm font-display font-bold text-slate-100 uppercase tracking-tight">Geyser gRPC Ingestão de Dados (Camada 5)</h2>
-            <span className="text-[9px] font-mono text-cyan-400 block uppercase tracking-wider">Sub-50ms Solana Realtime Radar System</span>
+            <span className="text-[9px] font-mono text-cyan-400 block uppercase tracking-wider">
+              Radar de lançamentos por logs WebSocket — os tempos medidos aparecem no painel, não aqui
+            </span>
           </div>
         </div>
 
         <div className="flex items-center gap-2">
-          <span className={`flex items-center gap-1.5 text-[9px] font-mono px-2 py-0.5 rounded border uppercase font-bold tracking-wider ${
-            systemStats.shredStreamState.includes("COLOCATED") || systemStats.shredStreamState.includes("CO-LOCATED")
-              ? "text-purple-400 bg-purple-500/10 border-purple-500/30 animate-pulse"
-              : "text-emerald-400 bg-emerald-500/10 border-emerald-500/20"
-          }`}>
-            <span className={`w-1.5 h-1.5 rounded-full ${
-              systemStats.shredStreamState.includes("COLOCATED") || systemStats.shredStreamState.includes("CO-LOCATED")
-                ? "bg-purple-400"
-                : "bg-emerald-400 animate-ping"
-            }`} />
-            {systemStats.shredStreamState}
+          {/*
+            * Este selo mostrava "CO-LOCATED (SHREDSTREAM ACTIVE)" — infraestrutura que não
+            * existe neste runtime. Agora diz o que a ingestão é: notificações de log via
+            * WebSocket RPC (logsSubscribe), mais lentas que gRPC/shreds pré-execução.
+            */}
+          <span className="flex items-center gap-1.5 text-[9px] font-mono px-2 py-0.5 rounded border uppercase font-bold tracking-wider text-cyan-400 bg-cyan-500/10 border-cyan-500/30">
+            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
+            logs WSS (shredstream não implementado)
           </span>
           <button
             onClick={() => setStreamActive(!streamActive)}
@@ -312,18 +319,18 @@ export function GeyserGrpcRadar() {
             </div>
           </div>
 
-          {/* Quick Realtime Stats */}
+          {/* Quick Realtime Stats — contagens do FEED, não telemetria de máquina inventada */}
           <div className="grid grid-cols-2 gap-3">
             <div className="bg-slate-950 p-3 rounded-lg border border-slate-850">
-              <span className="block text-[8px] font-mono text-slate-500 uppercase">Stream Rate</span>
-              <span className="text-sm font-mono font-bold text-slate-200 mt-1 block">
-                {systemStats.messagesPerSecond.toLocaleString()} <span className="text-[10px] text-slate-500 font-normal">msgs/s</span>
+              <span className="block text-[8px] font-mono text-slate-500 uppercase">Eventos reais recentes</span>
+              <span className="text-sm font-mono font-bold text-emerald-400 mt-1 block">
+                {systemStats.feedReal}
               </span>
             </div>
             <div className="bg-slate-950 p-3 rounded-lg border border-slate-850">
-              <span className="block text-[8px] font-mono text-slate-500 uppercase">System Ingestion Load</span>
-              <span className="text-sm font-mono font-bold text-cyan-400 mt-1 block">
-                {systemStats.systemLoad}%
+              <span className="block text-[8px] font-mono text-slate-500 uppercase">Eventos decorativos (mock)</span>
+              <span className="text-sm font-mono font-bold text-purple-400 mt-1 block">
+                {systemStats.feedSimulated}
               </span>
             </div>
           </div>
@@ -358,7 +365,11 @@ export function GeyserGrpcRadar() {
                 Live Ingestion Stream Feed
               </span>
               <span className="text-[9px] font-mono text-slate-500">
-                Slot: <span className="text-cyan-400">{systemStats.currentSlot}</span>
+                {/*
+                  * Slot NÃO MEDIDO aparece como "—" e não como 0/valor de relógio: o painel
+                  * não deve parecer medido quando nenhum RPC respondeu.
+                  */}
+                Slot: <span className="text-cyan-400">{systemStats.currentSlotMeasured ? systemStats.currentSlot : "— (não medido)"}</span>
               </span>
             </div>
 
@@ -387,6 +398,14 @@ export function GeyserGrpcRadar() {
                           <div className="flex items-center gap-1.5">
                             <span className="font-bold text-slate-100">{evt.mintName}</span>
                             <span className="text-[8px] bg-slate-950 px-1 py-0.5 rounded text-cyan-400 font-bold uppercase">{evt.type}</span>
+                            {evt.isRealOnChain !== true && (
+                              <span
+                                className="text-[8px] bg-purple-500/10 border border-purple-500/30 px-1 py-0.5 rounded text-purple-300 font-bold uppercase"
+                                title={evt.source ?? "Evento decorativo (RNG): nenhuma transação real corresponde"}
+                              >
+                                mock
+                              </span>
+                            )}
                           </div>
                           <span className="text-[8px] text-slate-500 truncate max-w-[150px] block mt-0.5">{evt.mint}</span>
                         </div>
@@ -498,17 +517,10 @@ export function GeyserGrpcRadar() {
 
       {/* Footer Details */}
       <div className="mt-4 pt-2.5 border-t border-slate-850 flex items-center justify-between text-[9px] font-mono text-slate-500 uppercase tracking-wider">
-        <span>Active gRPC Endpoint: <b className="text-cyan-400">{
-          systemStats.shredStreamState.includes("COLOCATED") || systemStats.shredStreamState.includes("CO-LOCATED")
-            ? "SHREDSTREAM CO-LOCATED (EQUINIX LD4)"
-            : getProviderLabel(config.provider)
-        }</b></span>
+        <span>Provedor configurado: <b className="text-cyan-400">{getProviderLabel(config.provider)}</b> — ingestão por <b className="text-cyan-400">logsSubscribe (WSS)</b></span>
         <span className="flex items-center gap-1">
-          <Zap className={`w-3.5 h-3.5 ${systemStats.shredStreamState.includes("COLOCATED") || systemStats.shredStreamState.includes("CO-LOCATED") ? "text-purple-400" : "text-cyan-400"}`} />
-          {systemStats.shredStreamState.includes("COLOCATED") || systemStats.shredStreamState.includes("CO-LOCATED")
-            ? "Pre-shred event ingest sub-1.2ms"
-            : "Pre-shred event ingest sub-50ms"
-          }
+          <Zap className="w-3.5 h-3.5 text-cyan-400" />
+          ShredStream/gRPC pré-execução: NÃO implementado (roadmap S7/S11)
         </span>
       </div>
     </div>

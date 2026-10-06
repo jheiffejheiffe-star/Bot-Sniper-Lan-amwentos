@@ -304,10 +304,15 @@ export function NetworkLatencyMonitor() {
                   </span>
                 )}
 
-                {node.id === "rpc-bare-metal-shred" && node.status === "healthy" && (
-                  <span className="absolute top-2.5 right-2.5 flex items-center gap-1 px-1.5 py-0.5 rounded bg-purple-500/15 border border-purple-500/30 text-[8px] font-mono font-bold text-purple-400 animate-pulse">
-                    <Server className="w-2.5 h-2.5 text-purple-400" />
-                    SHREDSTREAM
+                {/*
+                 * O selo anterior dizia "SHREDSTREAM" para um nó cujo id nem existe mais —
+                 * e mesmo que existisse, este painel não assina shreds. O selo agora descreve
+                 * a única coisa que o backend sabe: se há MEDIÇÃO de RTT para o nó.
+                 */}
+                {node.metricsSource === "unavailable" && (
+                  <span className="absolute top-2.5 right-2.5 flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-500/10 border border-slate-600/30 text-[8px] font-mono font-bold text-slate-400">
+                    <Server className="w-2.5 h-2.5 text-slate-400" />
+                    SEM MEDIÇÃO
                   </span>
                 )}
 

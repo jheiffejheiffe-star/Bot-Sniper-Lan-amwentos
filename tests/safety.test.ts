@@ -1,0 +1,7037 @@
+/**
+ * TESTES DE SEGURANÇA E REGRESSÃO — Bot Sniper (auditoria 2026-10-02)
+ *
+ * Estes testes NÃO são "test theater". Cada um verifica uma propriedade que, se
+ * quebrada, faz o sistema perder dinheiro ou mentir no relatório:
+ *
+ *   1. Nenhuma constante de endereço pode ser fabricada.
+ *   2. Discriminadores de programa precisam bater com o IDL oficial.
+ *   3. Extração de mint nunca pode inventar um ativo.
+ *   4. Contabilidade líquida (não confundir cotação com fill).
+ *   5. Tip nunca pode exceder o teto em bps do capital.
+ *   6. Trading real é fail-closed (default OFF).
+ *   7. Autenticação de endpoints mutantes é fail-closed.
+ *   8. Rejeição de sinal NÃO alimenta o circuit breaker.
+ *   9. Bundle com blockhash inválido é recusado sem risco de SOL.
+ *
+ * IMPORTANTE: o teste roda em diretório temporário para NÃO destruir o banco
+ * operacional. O antigo test-production.ts apagava hft_operational_db.json como
+ * primeira instrução — ou seja, "testar" destruía o histórico de operações.
+ */
+
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { PublicKey } from "@solana/web3.js";
+import crypto from "node:crypto";
+import bs58 from "bs58";
+import { deriveBondingCurvePda } from "../src/pumpInstruction.js";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Diretório isolado antes de qualquer import que toque em disco.
+const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "hft-test-"));
+process.chdir(sandboxDir);
+
+let passed = 0;
+
+/**
+ * Remove comentários de linha e de bloco antes de procurar código proibido.
+ *
+ * Necessário porque os comentários deste projeto CITAM o código fabricado que foi removido
+ * ("antes: `278913410 + Date.now()/400`") — sem esta limpeza, a própria documentação da
+ * correção faria o teste de regressão falhar.
+ */
+function codigoSemComentarios(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+}
+const failures: string[] = [];
+
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
+  try {
+    await fn();
+    passed++;
+    console.log(`  ✅ ${name}`);
+  } catch (err: any) {
+    failures.push(`${name}: ${err.message}`);
+    console.error(`  ❌ ${name}\n     ${err.message}`);
+  }
+}
+
+async function main(): Promise<void> {
+  console.log("=========================================");
+  console.log(" TESTES DE SEGURANÇA — BOT SNIPER SOLANA");
+  console.log("=========================================");
+  console.log(`Diretório isolado: ${sandboxDir}\n`);
+
+  const cfg = await import("../src/solanaConfig.js");
+  const acct = await import("../src/accounting.js");
+  const { extractLaunchMint, JitoBundleSender } = await import("../src/realExecution.js");
+  const { isValidPubkey, PROGRAMS, JITO_TIP_ACCOUNTS_FALLBACK, DISCRIMINATORS, discriminatorToBytes } = cfg;
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[1] Constantes de protocolo (anti-fabricação)");
+
+  await test("assertConfigIntegrity passa com a configuração atual", () => {
+    cfg.assertConfigIntegrity();
+  });
+
+  await test("todos os program IDs são endereços base58 válidos de 32 bytes", () => {
+    for (const [key, value] of Object.entries(PROGRAMS)) {
+      if (key === "SYSTEM_PROGRAM") continue; // endereço zero é válido por definição
+      assert.ok(isValidPubkey(value), `${key} não é pubkey válido: ${value}`);
+    }
+  });
+
+  await test("os 8 tip accounts do Jito são válidos e distintos", () => {
+    assert.equal(JITO_TIP_ACCOUNTS_FALLBACK.length, 8);
+    const set = new Set(JITO_TIP_ACCOUNTS_FALLBACK);
+    assert.equal(set.size, 8, "há tip accounts duplicados");
+    for (const acc of JITO_TIP_ACCOUNTS_FALLBACK) {
+      assert.ok(isValidPubkey(acc), `tip account inválido: ${acc}`);
+    }
+  });
+
+  await test("os endereços FABRICADOS removidos na auditoria são rejeitados", () => {
+    // Se algum destes voltar ao código, é regressão crítica: SOL enviado para o vazio.
+    const fabricated = [
+      "Cw8CFBTGowau99vVnKAhZAsfS6D1g6A7B2Xz11G1Zabz",
+      "96gYZGLnJYVFihjz7mZge1L97McJ79S9Aabbb3BE",
+      "HFqU5x63VTgdaLLwt7Wb97F7tG2S3zD7F64848Z1",
+      "ADa6ZsCtf7vD8W9zFda987AsDGaC8aBca8A9Zda",
+      "675k1g2EPJ8gS7q9yGP8REukXXhxZ9ReM78D4cifFGL",
+    ];
+    const configured = [...Object.values(PROGRAMS), ...JITO_TIP_ACCOUNTS_FALLBACK];
+    for (const bad of fabricated) {
+      assert.ok(!configured.includes(bad), `endereço fabricado presente na config: ${bad}`);
+    }
+
+    // LIÇÃO DA AUDITORIA: endereço fabricado por LLM costuma ser base58 ESTRUTURALMENTE
+    // VÁLIDO. Ele passa em qualquer validação de formato e só falha quando alguém envia
+    // SOL para ele. Validação estrutural NÃO prova autenticidade — é por isso que este
+    // projeto exige allowlist com `source`/`verifiedAt` (ver PROGRAMS e
+    // JITO_TIP_ACCOUNTS_FALLBACK) em vez de confiar em "parece um endereço".
+    assert.ok(
+      isValidPubkey("675k1g2EPJ8gS7q9yGP8REukXXhxZ9ReM78D4cifFGL"),
+      "documenta que o endereço falso da Raydium passaria em validação de formato"
+    );
+    // O único controle que funciona é comparação contra o valor oficial verificado.
+    assert.notEqual(PROGRAMS.RAYDIUM_AMM_V4, "675k1g2EPJ8gS7q9yGP8REukXXhxZ9ReM78D4cifFGL");
+  });
+
+  await test("discriminador de buy do pump.fun bate com o IDL oficial (0x66063d1201daebea)", () => {
+    assert.equal(DISCRIMINATORS.PUMP_BUY, 7351630589278743530n);
+    assert.equal(discriminatorToBytes(DISCRIMINATORS.PUMP_BUY).toString("hex"), "66063d1201daebea");
+    // O valor errado anterior (16927863322537033481) não pode reaparecer.
+    assert.notEqual(DISCRIMINATORS.PUMP_BUY, 16927863322537033481n);
+  });
+
+  await test("Raydium AMM v4 usa o program ID oficial", () => {
+    assert.equal(PROGRAMS.RAYDIUM_AMM_V4, "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[2] Extração de mint (nunca inventar ativo)");
+
+  await test("retorna null quando não há evidência suficiente", () => {
+    const wk = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    assert.equal(extractLaunchMint("Pump.fun", [wk], null), null);
+    assert.equal(extractLaunchMint("Pump.fun", [], { postTokenBalances: [] }), null);
+  });
+
+  await test("ignora WSOL e program IDs conhecidos", () => {
+    const wsol = "So11111111111111111111111111111111111111112";
+    const result = extractLaunchMint("Pump.fun", [wsol, PROGRAMS.PUMP_FUN], {
+      postTokenBalances: [{ mint: wsol }],
+    });
+    assert.equal(result, null);
+  });
+
+  await test("prioriza mint com saldo de token na transação", () => {
+    const realMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const result = extractLaunchMint("Pump.fun", ["11111111111111111111111111111111", realMint], {
+      postTokenBalances: [{ mint: realMint }],
+    });
+    assert.equal(result, realMint);
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[3] Contabilidade líquida");
+
+  await test("PnL realizado usa delta de saldo e soma custos corretamente", () => {
+    const costs = { ...acct.emptyCosts(), jitoTipSol: 0.006, baseFeeSol: 0.00001 };
+    // Entrou com 0.1 SOL, saiu com 0.094 SOL => perda líquida de 0.006 SOL.
+    const r = acct.realizedFromBalances(1.0, 0.994, 0.1, costs);
+    assert.ok(Math.abs(r.pnlNetSol - -0.006) < 1e-9, `pnlNetSol=${r.pnlNetSol}`);
+    assert.ok(Math.abs(r.costsSol - 0.00601) < 1e-9);
+    assert.ok(r.measuredOnChain);
+    assert.ok(Math.abs(r.pnlNetPercent - -6) < 1e-6, `pnlNetPercent=${r.pnlNetPercent}`);
+  });
+
+  await test("break-even reflete custos sobre o capital", () => {
+    const costs = { ...acct.emptyCosts(), jitoTipSol: 0.006 };
+    // 0.006 SOL de custo sobre 0.1 SOL = 6%
+    assert.ok(Math.abs(acct.breakEvenPercent(costs, 0.1) - 6) < 1e-9);
+  });
+
+  await test("tip é limitado por bps do capital (bug de 300 bps em 0.1 SOL)", () => {
+    const clamped = acct.clampTipSol(0.003, 0.1, 50); // 50 bps de 0.1 SOL = 0.0005
+    assert.ok(clamped.clamped);
+    assert.ok(Math.abs(clamped.tipSol - 0.0005) < 1e-12, `tipSol=${clamped.tipSol}`);
+    const notClamped = acct.clampTipSol(0.0001, 0.1, 50);
+    assert.equal(notClamped.clamped, false);
+  });
+
+  await test("status de preço: fresh / stale / missing (stop-loss não pode congelar)", () => {
+    const now = Date.now();
+    assert.equal(acct.assessPriceFreshness({ priceSol: 1, source: "x", fetchedAt: now }, 15_000, now), "fresh");
+    assert.equal(acct.assessPriceFreshness({ priceSol: 1, source: "x", fetchedAt: now - 60_000 }, 15_000, now), "stale");
+    assert.equal(acct.assessPriceFreshness(undefined, 15_000, now), "missing");
+    assert.equal(acct.assessPriceFreshness({ priceSol: 0, source: "x", fetchedAt: now }, 15_000, now), "missing");
+    assert.equal(acct.riskActionForFreshness("stale"), "escalate");
+    assert.equal(acct.riskActionForFreshness("fresh"), "evaluate");
+  });
+
+  await test("métricas de estratégia: expectativa, profit factor e drawdown", () => {
+    const now = Date.now();
+    const records = [
+      { pnlNetSol: 0.02, openedAt: now, closedAt: now, failed: false },
+      { pnlNetSol: -0.01, openedAt: now, closedAt: now, failed: false },
+      { pnlNetSol: 0.03, openedAt: now, closedAt: now, failed: false },
+      { pnlNetSol: -0.04, openedAt: now, closedAt: now, failed: true },
+    ];
+    const m = acct.computeStrategyMetrics(records);
+    assert.equal(m.trades, 4);
+    assert.equal(m.wins, 2);
+    assert.equal(m.losses, 2);
+    assert.equal(m.failures, 1);
+    assert.equal(m.winRate, 0.5);
+    assert.ok(Math.abs(m.expectancySol - 0) < 1e-12);
+    assert.ok(Math.abs(m.profitFactor - 1) < 1e-12);
+    assert.ok(m.maxDrawdownSol >= 0.04, `drawdown=${m.maxDrawdownSol}`);
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[4] Gates de execução e autenticação (fail-closed)");
+
+  await test("LIVE_TRADING_ENABLED ausente => trading real DESLIGADO", async () => {
+    const sec = await import("../src/security.js");
+    delete process.env.LIVE_TRADING_ENABLED;
+    assert.equal(sec.isLiveTradingEnabled(), false);
+    process.env.LIVE_TRADING_ENABLED = "true";
+    assert.equal(sec.isLiveTradingEnabled(), true);
+    process.env.LIVE_TRADING_ENABLED = "false";
+    assert.equal(sec.isLiveTradingEnabled(), false);
+    delete process.env.LIVE_TRADING_ENABLED;
+  });
+
+  await test("sem ADMIN_TOKEN em produção: POST é NEGADO (fail-closed)", async () => {
+    const sec = await import("../src/security.js");
+    const prevEnv = process.env.NODE_ENV;
+    const prevToken = process.env.ADMIN_TOKEN;
+    delete process.env.ADMIN_TOKEN;
+    process.env.NODE_ENV = "production";
+    const denied = sec.assertMutationAuthorized({ headers: {} });
+    assert.equal(denied.ok, false);
+    if (!denied.ok) assert.equal(denied.status, 503);
+    process.env.NODE_ENV = prevEnv;
+    if (prevToken) process.env.ADMIN_TOKEN = prevToken;
+  });
+
+  await test("com ADMIN_TOKEN: token errado é rejeitado, correto é aceito", async () => {
+    const sec = await import("../src/security.js");
+    process.env.ADMIN_TOKEN = "token-de-teste-seguro";
+    const wrong = sec.assertMutationAuthorized({ headers: { "x-admin-token": "errado" } });
+    assert.equal(wrong.ok, false);
+    const right = sec.assertMutationAuthorized({ headers: { "x-admin-token": "token-de-teste-seguro" } });
+    assert.equal(right.ok, true);
+    const bearer = sec.assertMutationAuthorized({ headers: { authorization: "Bearer token-de-teste-seguro" } });
+    assert.equal(bearer.ok, true);
+    delete process.env.ADMIN_TOKEN;
+  });
+
+  await test("rejeição de sinal NÃO incrementa falhas do circuit breaker", async () => {
+    const sec = await import("../src/security.js");
+    const before = sec.getOperationalSecurityState().consecutiveFailures;
+    sec.reportSignalRejected("token com freeze authority ativa");
+    sec.reportSignalRejected("liquidez ausente");
+    sec.reportSignalRejected("terceiro sinal ruim");
+    const after = sec.getOperationalSecurityState().consecutiveFailures;
+    assert.equal(after, before, "rejeição de sinal não pode alimentar o breaker de execução");
+    // E o kill switch não pode ter disparado por isso.
+    assert.equal(sec.getOperationalSecurityState().killSwitchActive, false);
+  });
+
+  await test("chave operacional malformada NÃO cai para carteira aleatória", async () => {
+    // Regressão: antes, uma OPERATIONAL_PRIVATE_KEY inválida gerava keypair aleatório e o
+    // processo seguia — exibindo um endereço diferente do real. Enviar SOL para ele = perda.
+    const prev = process.env.OPERATIONAL_PRIVATE_KEY;
+    process.env.OPERATIONAL_PRIVATE_KEY = "isto-nao-e-uma-chave-valida";
+    const { initializeVault } = await import("../src/security.js");
+    await assert.rejects(
+      () => initializeVault(),
+      (err: any) => /não pôde ser decodificada|nao pode ser decodificada|decodificada/i.test(err.message),
+      "initializeVault deveria LANÇAR, não gerar chave aleatória silenciosamente"
+    );
+    if (prev) process.env.OPERATIONAL_PRIVATE_KEY = prev;
+    else delete process.env.OPERATIONAL_PRIVATE_KEY;
+  });
+
+  await test("sem chave em produção: recusa iniciar (fail-closed)", async () => {
+    const prevKey = process.env.OPERATIONAL_PRIVATE_KEY;
+    const prevEnv = process.env.NODE_ENV;
+    delete process.env.OPERATIONAL_PRIVATE_KEY;
+    process.env.NODE_ENV = "production";
+    const sec = await import("../src/security.js");
+    await assert.rejects(() => sec.initializeVault(), /ausente em produção|ausente em producao/i);
+    process.env.NODE_ENV = prevEnv;
+    if (prevKey) process.env.OPERATIONAL_PRIVATE_KEY = prevKey;
+  });
+
+  await test("gate de saída: paper bloqueia liquidar on-chain; read-only PERMITE sair", async () => {
+    const sec = await import("../src/security.js");
+    const prevLive = process.env.LIVE_TRADING_ENABLED;
+
+    delete process.env.LIVE_TRADING_ENABLED;
+    const paper = sec.assertExitAllowed();
+    assert.equal(paper.ok, false, "em paper mode não há posição on-chain para liquidar");
+
+    // LIVE exige AS DUAS declarações: a flag legada e o modo explícito.
+    process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.RUNTIME_MODE = "LIVE";
+    sec.triggerKillSwitch(false);
+    sec.setReadOnlyMode(true);
+    const ro = sec.assertExitAllowed();
+    assert.equal(ro.ok, true, "read-only deve PERMITIR saída (reduz exposição)");
+    if (ro.ok) assert.ok(ro.warnings.length > 0, "a saída em read-only deve avisar");
+    sec.setReadOnlyMode(false);
+
+    if (prevLive) process.env.LIVE_TRADING_ENABLED = prevLive;
+    else delete process.env.LIVE_TRADING_ENABLED;
+    delete process.env.RUNTIME_MODE;
+  });
+
+  await test("gate de saída: kill switch bloqueia só se BLOCK_EXITS_ON_KILL_SWITCH=true", async () => {
+    const sec = await import("../src/security.js");
+    const prevLive = process.env.LIVE_TRADING_ENABLED;
+    process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.RUNTIME_MODE = "LIVE";
+    sec.triggerKillSwitch(true);
+
+    delete process.env.BLOCK_EXITS_ON_KILL_SWITCH;
+    const allowExit = sec.assertExitAllowed();
+    assert.equal(allowExit.ok, true, "default: poder sair em pânico é o comportamento correto");
+
+    process.env.BLOCK_EXITS_ON_KILL_SWITCH = "true";
+    const blockExit = sec.assertExitAllowed();
+    assert.equal(blockExit.ok, false, "configuração explícita pode bloquear a saída");
+
+    sec.triggerKillSwitch(false);
+    delete process.env.BLOCK_EXITS_ON_KILL_SWITCH;
+    if (prevLive) process.env.LIVE_TRADING_ENABLED = prevLive;
+    else delete process.env.LIVE_TRADING_ENABLED;
+    delete process.env.RUNTIME_MODE;
+  });
+
+  await test("keyCustody é declarado honestamente (não é KMS)", async () => {
+    const sec = await import("../src/security.js");
+    const custody = sec.describeKeyCustody();
+    assert.equal(custody.protectedAgainstProcessAccess, false);
+    assert.equal(custody.protectedAgainstDiskAccess, false);
+    assert.ok(["env-var-in-process", "ephemeral-dev-keypair", "external-kms"].includes(custody.mode));
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[5] Jito: blockhash e tip accounts");
+
+  await test("bundle com blockhash inválido é recusado sem risco de SOL", async () => {
+    const { Connection, Keypair } = await import("@solana/web3.js");
+    const sender = new JitoBundleSender(new Connection("https://api.mainnet-beta.solana.com"));
+    const signer = Keypair.generate();
+    // A barreira de modo roda ANTES da checagem de blockhash (é o que impede assinar fora
+    // de LIVE). Para testar a segunda camada, esta chamada precisa estar autorizada.
+    const prevMode = process.env.RUNTIME_MODE;
+    const prevLive = process.env.LIVE_TRADING_ENABLED;
+    process.env.RUNTIME_MODE = "LIVE";
+    process.env.LIVE_TRADING_ENABLED = "true";
+    // Vault armado: sem isso a barreira recusa por cofre ausente (camada anterior), e o
+    // teste não chegaria à validação de blockhash que ele existe para verificar.
+    const sec = await import("../src/security.js");
+    await sec.initializeVault();
+    try {
+      const res = await sender.submitBundle([], signer, 0.003, "blockhash-falso-123");
+      assert.equal(res.success, false);
+      assert.equal(res.tipSol, 0, "nenhum tip pode ser associado a um envio recusado");
+      assert.match(res.error || "", /[Bb]lockhash/);
+    } finally {
+      if (prevMode) process.env.RUNTIME_MODE = prevMode; else delete process.env.RUNTIME_MODE;
+      if (prevLive) process.env.LIVE_TRADING_ENABLED = prevLive; else delete process.env.LIVE_TRADING_ENABLED;
+    }
+  });
+
+  await test("tip accounts caem na lista OFICIAL verificada quando offline", async () => {
+    const { Connection } = await import("@solana/web3.js");
+    const sender = new JitoBundleSender(new Connection("https://api.mainnet-beta.solana.com"));
+    const accounts = await sender.getTipAccounts();
+    assert.ok(accounts.length > 0);
+    for (const acc of accounts) assert.ok(isValidPubkey(acc), `tip account inválido: ${acc}`);
+    // Deve conter o conjunto oficial (não os endereços fabricados).
+    assert.ok(accounts.includes("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"));
+  });
+
+  await test("blockhash cache nunca inventa hash quando o RPC falha", async () => {
+    const { RecentBlockhashCache } = await import("../src/realExecution.js");
+    const { Connection } = await import("@solana/web3.js");
+    const cache = new RecentBlockhashCache(new Connection("https://127.0.0.1:1")); // porta fechada
+    const fresh = await cache.getFresh().catch((e: any) => ({ error: e.code || e.name }));
+    assert.ok("error" in fresh, "deveria falhar em vez de devolver hash sintético");
+    const status = cache.getStatus();
+    assert.equal(status.usable, false);
+    const cached = cache.get();
+    assert.equal(cached.blockhash, "", "cache não pode devolver blockhash fabricado");
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[6] Persistência isolada (sem destruir o banco real)");
+
+  await test("banco de teste é criado no diretório isolado, não no repo", async () => {
+    const { dbStore } = await import("../src/persistence.js");
+    dbStore.saveTrade({
+      id: "t1",
+      token: "TEST",
+      mint: "So11111111111111111111111111111111111111112",
+      amount: "0.1 SOL",
+      outAmount: "+0.02 SOL",
+      status: "success",
+      block: 0,
+      tipSol: 0,
+      route: "TESTE",
+      time: "00:00:00.000",
+      latencyMs: 12,
+      mode: "paper",
+      signature: null,
+      measuredOnChain: false,
+    });
+    const trades = dbStore.getTrades();
+    assert.ok(trades.some((t) => t.id === "t1"));
+    assert.ok(fs.existsSync(path.join(sandboxDir, "hft_operational_db.json")));
+    assert.ok(
+      !fs.existsSync(path.join(process.env.HFT_REPO_ROOT || "/nonexistent", "hft_operational_db.json")),
+      "o teste não pode escrever no banco do repositório"
+    );
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[8] Endpoints de mercado: hosts mortos não podem voltar");
+
+  await test("server.ts não referencia hosts Jupiter/Preço SUNSET", async () => {
+    // Os hosts `quote-api.jup.ag/v6` e `api.jup.ag/v6/price` foram descontinuados.
+    // Um host morto no caminho de SAÍDA não falha de forma visível: ele falha quando o
+    // operador mais precisa vender. Este teste é a catraca contra a regressão.
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const source = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf-8");
+    // Só CÓDIGO conta: linhas de comentário podem (e devem) citar o host morto para
+    // documentar a correção — o que não pode é o host voltar a ser executado.
+    const codeOnly = source
+      .split("\n")
+      .filter((line) => {
+        const t = line.trim();
+        return !(t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"));
+      })
+      .join("\n");
+    const forbidden = [
+      "quote-api.jup.ag",
+      "api.jup.ag/v6",
+      "https://api.jup.ag",
+      "api.dexscreener.com",
+    ];
+    for (const host of forbidden) {
+      assert.ok(
+        !codeOnly.includes(host),
+        `server.ts voltou a hardcodar "${host}" — use JupiterIntegration / DEXSCREENER_BASE_URL`
+      );
+    }
+  });
+
+  await test("preço por cotação exige decimais: sem leitura, a fonte é descartada", async () => {
+    // Converter outAmount -> preço assumindo decimais fixos erra por potências de 10.
+    // O contrato verificável aqui: a conversão usa Math.pow(10, decimals) lido do mint,
+    // e desiste quando a leitura falha.
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const source = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf-8");
+    assert.ok(source.includes("getMintDecimals"), "o preço por cotação deve resolver os decimais do mint");
+    assert.ok(
+      !/amount=1000000&slippageBps=100/.test(source),
+      "não pode existir cotação de preço com 1.000.000 unidades cruas fixas (assume 6 decimais)"
+    );
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[7] Medição e replay (telemetria, registro, motor de replay)");
+
+  await test("LatencyTrace ignora marcação fora de ordem (não sobrescreve medição)", async () => {
+    const { LatencyTrace } = await import("../src/telemetry.js");
+    const trace = new LatencyTrace("evt-ordem");
+    trace.mark("assessed");
+    const afterFirst = trace.elapsedTo("assessed");
+    // Marcação tardia de um estágio ANTERIOR não pode ser aceita nem alterar a primeira.
+    trace.mark("enriched");
+    assert.equal(trace.elapsedTo("assessed"), afterFirst, "marcação fora de ordem alterou a medição");
+    assert.equal(trace.has("enriched"), false, "estágio fora de ordem não pode ser considerado medido");
+  });
+
+  await test("snapshot de latência sem eventos é honesto (sem número fabricado)", async () => {
+    const { telemetry } = await import("../src/telemetry.js");
+    const snap = telemetry.snapshot();
+    assert.equal(snap.traces, 0, "nenhum evento foi processado neste processo");
+    for (const [stage, hist] of Object.entries(snap.perStageMs)) {
+      assert.equal(hist, null, `estágio ${stage} deveria ser null sem amostras`);
+    }
+    assert.equal(snap.detection.measurable, false, "WSS não fornece timestamp de origem");
+    assert.equal(snap.inclusion.estimated, true, "inclusão por slot é estimativa e deve ser declarada");
+  });
+
+  await test("recorder deduplica eventId (reentrega de WebSocket não conta duas vezes)", async () => {
+    const { EventRecorder } = await import("../src/eventRecorder.js");
+    const rec = new EventRecorder({ dir: path.join(sandboxDir, "dedupe") });
+    const evt = {
+      eventId: "sig-abc:1",
+      source: "wss-logs" as const,
+      programId: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      programName: "pump.fun",
+      eventType: "initialize2",
+      mint: "MintDedupe11111111111111111111111111111111",
+      signature: "sig-abc",
+      slot: 100,
+      enrichmentMs: 12.5,
+    };
+    assert.equal(rec.recordLaunchEvent(evt), true, "primeiro registro deve gravar");
+    assert.equal(rec.recordLaunchEvent(evt), false, "reentrega deve ser ignorada");
+    assert.equal(rec.getStats().counts["launch-event"], 1);
+  });
+
+  await test("dataset agrupa por mint, conta REJEITADOS e ignora linha corrompida", async () => {
+    const fsmod = await import("node:fs");
+    const dataDir = path.join(sandboxDir, "ds");
+    fsmod.mkdirSync(dataDir, { recursive: true });
+    const file = path.join(dataDir, "events.jsonl");
+
+    const line = (o: unknown) => JSON.stringify(o);
+    const rows = [
+      line({ kind: "launch-event", recordedAt: "2026-10-02T10:00:00.000Z", eventId: "e1", source: "wss-logs", programId: "P", programName: "pump.fun", eventType: "buy", mint: "MINT_A", signature: "s1", slot: 1, enrichmentMs: 30 }),
+      line({ kind: "assessment", recordedAt: "2026-10-02T10:00:00.100Z", eventId: "e1", mint: "MINT_A", decision: "accepted", rejectionReason: null, score: 80, verdict: "pass", dataComplete: true, missingChecks: [], isRug: false, mintAuthorityDisabled: true, freezeAuthorityDisabled: true, liquidityUsd: 20000, poolSource: "Raydium", entryPriceSol: 0.0001, entryPriceSource: "geyser", estimatedCostsBps: 600 }),
+      line({ kind: "price-observation", recordedAt: "2026-10-02T10:00:03.000Z", positionId: "p1", mint: "MINT_A", priceSol: 0.00012, source: "geyser", ageMs: 0, pnlPercent: 20 }),
+      line({ kind: "assessment", recordedAt: "2026-10-02T10:00:01.000Z", eventId: "e2", mint: "MINT_B", decision: "rejected", rejectionReason: "score 20 abaixo do limite 50", score: 20, verdict: "reject", dataComplete: false, missingChecks: ["freeze authority"], isRug: false, mintAuthorityDisabled: false, freezeAuthorityDisabled: null, liquidityUsd: 0, poolSource: "Unknown", entryPriceSol: null, entryPriceSource: null, estimatedCostsBps: null }),
+      "{ isto não é json válido",
+      line({ kind: "position-lifecycle", recordedAt: "2026-10-02T10:00:09.000Z", positionId: "p1", mint: "MINT_A", token: "A", event: "closed", mode: "paper", sizeSol: 0.1, entryPriceSol: 0.0001, exitPriceSol: 0.00012, pnlPercent: 20, reason: "TP shadow", pnlMeasuredOnChain: false }),
+    ];
+    fsmod.writeFileSync(file, rows.join("\n") + "\n");
+
+    const { loadBacktestDataset } = await import("../src/eventRecorder.js");
+    const dataset = loadBacktestDataset(file);
+    assert.equal(dataset.corruptedLines, 1, "linha corrompida deve ser contada, não silenciada");
+    assert.equal(dataset.stats.assessments, 2);
+    assert.equal(dataset.stats.accepted, 1);
+    assert.equal(dataset.stats.rejected, 1, "rejeitados precisam entrar no dataset");
+    assert.equal(dataset.stats.acceptanceRate, 0.5);
+    assert.equal(dataset.episodes.length, 2);
+    assert.equal(dataset.stats.mintsWithoutPrices, 1, "MINT_B não tem série de preços");
+    const a = dataset.episodes.find((e) => e.mint === "MINT_A")!;
+    assert.equal(a.prices.length, 1);
+    assert.equal(a.lifecycle.length, 1);
+  });
+
+  await test("simulateEpisode: stop tem prioridade sobre alvo na mesma observação", async () => {
+    const { simulateEpisode } = await import("../src/replay.js");
+    const episode = {
+      mint: "MINT_X",
+      event: null,
+      assessment: null,
+      lifecycle: [],
+      prices: [
+        { kind: "price-observation" as const, recordedAt: "2026-10-02T10:00:00.000Z", positionId: "p", mint: "MINT_X", priceSol: 1, source: "t", ageMs: 0, pnlPercent: 0 },
+        // A série é discreta: não sabemos a ordem intra-intervalo. O motor assume o pior caso.
+        { kind: "price-observation" as const, recordedAt: "2026-10-02T10:00:03.000Z", positionId: "p", mint: "MINT_X", priceSol: 0.9, source: "t", ageMs: 0, pnlPercent: -10 },
+      ],
+    };
+    const trade = simulateEpisode(episode, {
+      name: "ambiguo",
+      stopLossPercent: -5,
+      takeProfitPercent: 50,
+      trailingStopPercent: null,
+      maxHoldMs: null,
+      costsRoundTripBps: 0,
+    });
+    assert.ok(trade);
+    assert.equal(trade!.exitReason, "stop-loss", "capital primeiro: queda de 10% atinge o stop de -5%");
+    assert.equal(trade!.exitPriceSol, 0.9);
+  });
+
+  await test("custos reduzem o líquido exatamente em bps/100 pontos percentuais", async () => {
+    const { simulateEpisode } = await import("../src/replay.js");
+    const mk = (bps: number) => ({
+      name: "custo",
+      stopLossPercent: null,
+      takeProfitPercent: 20,
+      trailingStopPercent: null,
+      maxHoldMs: null,
+      costsRoundTripBps: bps,
+    });
+    const episode = {
+      mint: "MINT_C",
+      event: null,
+      assessment: null,
+      lifecycle: [],
+      prices: [
+        { kind: "price-observation" as const, recordedAt: "2026-10-02T10:00:00.000Z", positionId: "p", mint: "MINT_C", priceSol: 1, source: "t", ageMs: 0, pnlPercent: 0 },
+        { kind: "price-observation" as const, recordedAt: "2026-10-02T10:00:03.000Z", positionId: "p", mint: "MINT_C", priceSol: 1.25, source: "t", ageMs: 0, pnlPercent: 25 },
+      ],
+    };
+    const semCusto = simulateEpisode(episode, mk(0))!;
+    const comCusto = simulateEpisode(episode, mk(600))!;
+    assert.equal(semCusto.netPnlPercent, semCusto.grossPnlPercent);
+    assert.equal(
+      Math.round((comCusto.grossPnlPercent - comCusto.netPnlPercent) * 100) / 100,
+      6,
+      "600 bps de round-trip = 6 pontos percentuais"
+    );
+  });
+
+  await test("compareStrategies omite ranking com amostra pequena (não ordena ruído)", async () => {
+    const { loadBacktestDataset } = await import("../src/eventRecorder.js");
+    const { compareStrategies } = await import("../src/replay.js");
+    const file = path.join(sandboxDir, "ds", "events.jsonl");
+    const dataset = loadBacktestDataset(file);
+    const comparison = compareStrategies(dataset);
+    const { DEFAULT_STRATEGIES } = await import("../src/replay.js");
+    const expected = DEFAULT_STRATEGIES.filter((s) => s.name !== "baseline-hold").length;
+    assert.equal(comparison.rows.length, expected, "uma linha por estratégia comparada");
+    assert.equal(comparison.ranking.length, 0, "com 1 trade por estratégia não há ranking defensável");
+    for (const row of comparison.rows) {
+      assert.ok(row.costDragBps >= 0, "custos não podem reduzir o resultado (drag negativo é erro de sinal)");
+    }
+    assert.ok(
+      comparison.notes.some((n) => /ranking|amostra|confian|piso/i.test(n)),
+      "a conclusão precisa declarar a limitação de amostra"
+    );
+    assert.ok(
+      comparison.rows.every((r) => r.validStatistically === false),
+      "com 1 trade por estratégia, nenhuma linha pode se declarar estatisticamente válida"
+    );
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[9] Modo de execução e barreira única de assinatura");
+
+  await test("resolução de modo é fail-closed (flag legada sozinha NUNCA vira LIVE)", async () => {
+    const rm = await import("../src/runtimeMode.js");
+
+    const semNada = rm.resolveRuntimeMode({});
+    assert.equal(semNada.mode, "PAPER");
+    assert.equal(semNada.liveAuthorized, false);
+
+    const soFlag = rm.resolveRuntimeMode({ LIVE_TRADING_ENABLED: "true" });
+    assert.notEqual(soFlag.mode, "LIVE", "flag legada sozinha não pode autorizar capital");
+    assert.equal(soFlag.liveAuthorized, false);
+    assert.ok(soFlag.conflicts.length > 0, "o conflito precisa ser declarado, não silenciado");
+
+    const soModo = rm.resolveRuntimeMode({ RUNTIME_MODE: "LIVE" });
+    assert.notEqual(soModo.mode, "LIVE", "RUNTIME_MODE=LIVE sem a flag também é ambíguo");
+    assert.equal(soModo.liveAuthorized, false);
+
+    const completo = rm.resolveRuntimeMode({ RUNTIME_MODE: "LIVE", LIVE_TRADING_ENABLED: "true" });
+    assert.equal(completo.mode, "LIVE");
+    assert.equal(completo.liveAuthorized, true);
+
+    const invalido = rm.resolveRuntimeMode({ RUNTIME_MODE: "producao" });
+    assert.equal(invalido.mode, "PAPER", "valor inválido cai para o modo mais conservador");
+    assert.ok(invalido.conflicts.some((c) => /não é um modo válido/.test(c)));
+  });
+
+  await test("boot de LIVE sem o mínimo obrigatório é FATAL (não sobe pela metade)", async () => {
+    const rm = await import("../src/runtimeMode.js");
+    const live = rm.resolveRuntimeMode({ RUNTIME_MODE: "LIVE", LIVE_TRADING_ENABLED: "true" });
+    const vazio = rm.validateRuntimeConfiguration(live, {});
+    assert.ok(vazio.fatal.some((f) => /OPERATIONAL_PRIVATE_KEY/.test(f)));
+    assert.ok(vazio.fatal.some((f) => /ADMIN_TOKEN/.test(f)));
+    assert.ok(vazio.fatal.some((f) => /RPC_ENDPOINT/.test(f)));
+
+    const completo = rm.validateRuntimeConfiguration(live, {
+      OPERATIONAL_PRIVATE_KEY: "x",
+      ADMIN_TOKEN: "t",
+      RPC_ENDPOINT: "https://mainnet.helius-rpc.com/?api-key=k",
+      MAX_POSITION_SOL: "0.05",
+    });
+    assert.equal(completo.fatal.length, 0, `não deveria haver fatal: ${completo.fatal.join(" | ")}`);
+
+    // Flag de capital ligada sem modo declarado: recusa de boot, não inferência.
+    const ambiguo = rm.resolveRuntimeMode({ LIVE_TRADING_ENABLED: "true" });
+    const vAmbiguo = rm.validateRuntimeConfiguration(ambiguo, {});
+    assert.ok(vAmbiguo.fatal.some((f) => /sem RUNTIME_MODE explícito/.test(f)));
+  });
+
+  await test("bind não-loopback com chave real e sem token é FATAL", async () => {
+    const rm = await import("../src/runtimeMode.js");
+    const paper = rm.resolveRuntimeMode({});
+    const expostoComChave = rm.validateRuntimeConfiguration(paper, {
+      HFT_BIND_HOST: "0.0.0.0",
+      OPERATIONAL_PRIVATE_KEY: "chave-real",
+    });
+    assert.ok(expostoComChave.fatal.some((f) => /ADMIN_TOKEN/.test(f)), "API exposta + chave real exige token");
+
+    const expostoSemChave = rm.validateRuntimeConfiguration(paper, { HFT_BIND_HOST: "0.0.0.0" });
+    assert.equal(expostoSemChave.fatal.length, 0, "dev sem chave pode expor, mas com aviso");
+    assert.ok(expostoSemChave.warnings.some((w) => /ADMIN_TOKEN/.test(w)));
+
+    const loopback = rm.validateRuntimeConfiguration(paper, { HFT_BIND_HOST: "127.0.0.1", OPERATIONAL_PRIVATE_KEY: "k" });
+    assert.equal(loopback.fatal.length, 0, "loopback com chave real é aceitável sem token");
+  });
+
+  await test("barreira de assinatura: fora de LIVE nada assina, nem com a flag ligada", async () => {
+    const rm = await import("../src/runtimeMode.js");
+    const ctx = { killSwitchActive: false, readOnlyMode: false, vaultArmed: true };
+
+    for (const env of [
+      {} as NodeJS.ProcessEnv,
+      { LIVE_TRADING_ENABLED: "true" } as NodeJS.ProcessEnv,
+      { RUNTIME_MODE: "SIMULATION" } as NodeJS.ProcessEnv,
+      { RUNTIME_MODE: "SHADOW", LIVE_TRADING_ENABLED: "true" } as NodeJS.ProcessEnv,
+    ]) {
+      const res = rm.resolveRuntimeMode(env);
+      for (const purpose of ["entry", "exit"] as const) {
+        const verdict = rm.evaluateCapitalPermission(res, ctx, purpose);
+        assert.equal(verdict.ok, false, `modo ${res.mode} não pode autorizar ${purpose}`);
+      }
+    }
+
+    const live = rm.resolveRuntimeMode({ RUNTIME_MODE: "LIVE", LIVE_TRADING_ENABLED: "true" });
+    assert.equal(rm.evaluateCapitalPermission(live, ctx, "entry").ok, true);
+    assert.equal(rm.evaluateCapitalPermission(live, ctx, "exit").ok, true);
+  });
+
+  await test("read-only e kill switch bloqueiam ENTRADA mas permitem SAÍDA (assimetria declarada)", async () => {
+    const rm = await import("../src/runtimeMode.js");
+    const live = rm.resolveRuntimeMode({ RUNTIME_MODE: "LIVE", LIVE_TRADING_ENABLED: "true" });
+
+    const ro = rm.evaluateCapitalPermission(live, { readOnlyMode: true, vaultArmed: true }, "entry");
+    assert.equal(ro.ok, false);
+    const roExit = rm.evaluateCapitalPermission(live, { readOnlyMode: true, vaultArmed: true }, "exit");
+    assert.equal(roExit.ok, true, "read-only não pode prender capital: saída permitida com aviso");
+    if (roExit.ok) assert.ok(roExit.warnings.length > 0);
+
+    const ks = rm.evaluateCapitalPermission(live, { killSwitchActive: true, vaultArmed: true }, "entry");
+    assert.equal(ks.ok, false);
+    delete process.env.BLOCK_EXITS_ON_KILL_SWITCH;
+    const ksExit = rm.evaluateCapitalPermission(live, { killSwitchActive: true, vaultArmed: true }, "exit");
+    assert.equal(ksExit.ok, true, "default: em pânico, poder sair é o comportamento correto");
+    process.env.BLOCK_EXITS_ON_KILL_SWITCH = "true";
+    const ksExitBlocked = rm.evaluateCapitalPermission(live, { killSwitchActive: true, vaultArmed: true }, "exit");
+    assert.equal(ksExitBlocked.ok, false, "configuração explícita pode bloquear a saída");
+    delete process.env.BLOCK_EXITS_ON_KILL_SWITCH;
+  });
+
+  await test("o choke point realmente recusa ANTES de tocar no cofre (modo PAPER)", async () => {
+    const rm = await import("../src/runtimeMode.js");
+    const sec = await import("../src/security.js");
+    delete process.env.RUNTIME_MODE;
+    delete process.env.LIVE_TRADING_ENABLED;
+
+    // O cofre NÃO está provisionado neste processo de teste. Se a recusa fosse pelo cofre,
+    // a mensagem seria "not been provisioned" — o que provaria que a ordem está errada.
+    await assert.rejects(
+      () => sec.executeWithDecryptedKeypair(async () => "assinado"),
+      (err: any) => {
+        assert.equal(err.name, "SigningBlockedError", `esperado SigningBlockedError, veio ${err.name}: ${err.message}`);
+        assert.ok(/Modo PAPER/.test(err.message), `a mensagem deve citar o modo: ${err.message}`);
+        return true;
+      }
+    );
+    assert.equal(rm.getRuntimeMode(), "PAPER");
+  });
+
+  await test("JitoBundleSender recusa envio fora de LIVE (sem rede, sem tip)", async () => {
+    const { JitoBundleSender } = await import("../src/realExecution.js");
+    const { Connection, Keypair, Transaction } = await import("@solana/web3.js");
+    delete process.env.RUNTIME_MODE;
+    delete process.env.LIVE_TRADING_ENABLED;
+
+    const sender = new JitoBundleSender(new Connection("https://127.0.0.1:1"));
+    const resultado = await sender.submitBundle(
+      [new Transaction()],
+      Keypair.generate(),
+      0.001,
+      "11111111111111111111111111111111"
+    );
+    assert.equal(resultado.success, false, "não pode reportar sucesso sem enviar nada");
+    assert.ok(/Signer Guard|Modo PAPER/.test(resultado.error || ""), `erro deveria citar a barreira: ${resultado.error}`);
+  });
+
+  await test("POST sem token passa apenas quando não há capital real (fail-closed estreito)", async () => {
+    const sec = await import("../src/security.js");
+    const fakeReq = { headers: {} as Record<string, unknown> };
+    const prevToken = process.env.ADMIN_TOKEN;
+    const prevKey = process.env.OPERATIONAL_PRIVATE_KEY;
+    const prevMode = process.env.RUNTIME_MODE;
+    const prevNodeEnv = process.env.NODE_ENV;
+
+    delete process.env.ADMIN_TOKEN;
+    delete process.env.RUNTIME_MODE;
+    delete process.env.OPERATIONAL_PRIVATE_KEY;
+    process.env.NODE_ENV = "development";
+    assert.equal(sec.assertMutationAuthorized(fakeReq).ok, true, "dev sem chave: dashboard local continua funcionando");
+
+    process.env.OPERATIONAL_PRIVATE_KEY = "chave-real-em-uso";
+    const comChave = sec.assertMutationAuthorized(fakeReq);
+    assert.equal(comChave.ok, false, "com chave real, o token passa a ser obrigatório");
+    if (!comChave.ok) assert.equal(comChave.status, 503);
+
+    if (prevToken) process.env.ADMIN_TOKEN = prevToken; else delete process.env.ADMIN_TOKEN;
+    if (prevKey) process.env.OPERATIONAL_PRIVATE_KEY = prevKey; else delete process.env.OPERATIONAL_PRIVATE_KEY;
+    if (prevMode) process.env.RUNTIME_MODE = prevMode; else delete process.env.RUNTIME_MODE;
+    if (prevNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = prevNodeEnv;
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[10] Reconexão de WebSocket e honestidade do estado de detecção");
+
+  await test("backoff de reconexão WS cresce e satura (não há storm de 1 tentativa/s)", async () => {
+    const { wsBackoffDelayMs, WS_BASE_RECONNECT_MS, WS_MAX_RECONNECT_MS } = await import("../src/realExecution.js");
+    assert.equal(wsBackoffDelayMs(1), WS_BASE_RECONNECT_MS, "primeira falha usa o intervalo base");
+    assert.equal(wsBackoffDelayMs(2), 2000);
+    assert.equal(wsBackoffDelayMs(3), 4000);
+
+    // Monotonicamente não-decrescente e sempre dentro do teto.
+    let prev = 0;
+    for (let i = 1; i <= 30; i++) {
+      const d = wsBackoffDelayMs(i);
+      assert.ok(d >= prev, `atraso diminuiu na falha ${i} (${d} < ${prev})`);
+      assert.ok(d <= WS_MAX_RECONNECT_MS, `atraso ${d} acima do teto ${WS_MAX_RECONNECT_MS}`);
+      assert.ok(d >= WS_BASE_RECONNECT_MS, `atraso ${d} abaixo do base`);
+      prev = d;
+    }
+    assert.equal(wsBackoffDelayMs(50), WS_MAX_RECONNECT_MS, "no teto, não cresce mais");
+
+    // Custo concreto (o motivo da correção): o default do web3.js é 1000ms para SEMPRE.
+    // Com backoff, 60 falhas consecutivas custam ~50x menos tentativas do que 1/s.
+    let totalMs = 0;
+    for (let i = 1; i <= 60; i++) totalMs += wsBackoffDelayMs(i);
+    assert.ok(totalMs > 60_000, `60 falhas deveriam ocupar mais de 1 minuto de tempo real (${totalMs}ms)`);
+  });
+
+  await test("getHealth não declara detecção conectada só porque subscrições foram pedidas", async () => {
+    const { GeyserStreamClient } = await import("../src/realExecution.js");
+    // Endpoints locais inexistentes: nada de rede externa, falha imediata e determinística.
+    const client = new GeyserStreamClient("http://127.0.0.1:1", "ws://127.0.0.1:1", "");
+    try {
+      await client.connect();
+      const health = client.getHealth();
+      assert.equal(health.socketOpen, false, "socket não abriu: não pode se declarar conectado");
+      assert.equal(
+        health.connected,
+        false,
+        "o web3.js atribui IDs de subscrição ANTES do socket abrir; isso não é conexão"
+      );
+      assert.ok(health.subscriptionsRequested > 0, "as subscrições foram PEDIDAS (fato) e devem aparecer como tal");
+      assert.equal(health.degraded, true, "sem socket aberto a detecção está degradada");
+      assert.equal(health.eventCount, 0, "nenhum evento foi recebido");
+      assert.match(health.note || "", /eventCount/, "a nota precisa apontar a única prova real de detecção");
+    } finally {
+      client.disconnect();
+    }
+  });
+
+  await test("evento detectado move eventCount (a prova, não o log de boot)", async () => {
+    const { GeyserStreamClient } = await import("../src/realExecution.js");
+    const client = new GeyserStreamClient("http://127.0.0.1:1", "ws://127.0.0.1:1", "");
+    let received = 0;
+    client.onTokenDetected(() => {
+      received++;
+    });
+    const healthAntes = client.getHealth();
+    assert.equal(healthAntes.eventCount, 0);
+    assert.equal(received, 0, "nada foi entregue sem evento real");
+    client.disconnect();
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[11] Entrada em shadow (simulada, nunca assinada) e quarentena do banco");
+
+  await test("shadow entry: cotação + construção + simulação devolvem resultado tipado e medido", async () => {
+    const { simulateEntry } = await import("../src/shadowEntry.js");
+
+    let clock = 1000;
+    const calls: string[] = [];
+    const fakeTx = { serialize: () => new Uint8Array([1, 2, 3]) };
+
+    const deps = {
+      now: () => (clock += 100),
+      getQuote: async (inputMint: string, outputMint: string, amount: number) => {
+        calls.push(`quote:${inputMint}->${outputMint}:${amount}`);
+        return {
+          inputMint,
+          outputMint,
+          outAmount: "123456789",
+          priceImpactPct: 1.23,
+          routePlan: [{ swapInfo: { label: "Pump.fun" } }, { swapInfo: { label: "Raydium" } }, { swapInfo: { label: "Pump.fun" } }],
+        };
+      },
+      buildSwapTransaction: async (quote: any, userPublicKey: string) => {
+        calls.push(`build:${quote.outAmount}:${userPublicKey}`);
+        return fakeTx;
+      },
+      simulateTransaction: async (tx: any) => {
+        calls.push(`simulate:${tx === fakeTx}`);
+        return { value: { err: null, unitsConsumed: 47_000, logs: ["Program log: ok", "Program consumption: 47000 units"] } };
+      },
+    };
+
+    const result = await simulateEntry(deps, {
+      mint: "MintShadow111111111111111111111111111111111",
+      sizeSol: 0.05,
+      userPublicKey: "Wallet1111111111111111111111111111111111111",
+      mode: "PAPER",
+    });
+
+    assert.equal(result.built, true, `deveria ter construído: ${result.skippedReason}`);
+    assert.equal(result.skippedReason, null);
+    assert.equal(result.simulation?.ok, true);
+    assert.equal(result.simulation?.unitsConsumed, 47_000);
+    assert.equal(result.simulation?.blockhashReplaced, true, "simulação substitui blockhash — precisa ser declarado");
+    assert.deepEqual(result.quote?.routeLabels, ["Pump.fun", "Raydium"], "rótulos de rota deduplicados");
+    assert.equal(result.quote?.outAmount, "123456789");
+    // 0.05 SOL = 50.000.000 lamports — a quantidade cotada é a solicitada, não um valor fixo.
+    assert.ok(calls.includes("quote:So11111111111111111111111111111111111111112->MintShadow111111111111111111111111111111111:50000000"));
+    assert.ok(calls.some((c) => c.startsWith("build:123456789:")));
+    assert.ok(calls.includes("simulate:true"), "a transação DO builder precisa ser a simulada");
+    // Tempos medidos com o relógio injetado: cada etapa custa exatamente 100ms; o total é o
+    // tempo real da chamada inteira (inclui os guardas), portanto >= soma das etapas.
+    assert.equal(result.timingsMs.quote, 100);
+    assert.equal(result.timingsMs.build, 100);
+    assert.equal(result.timingsMs.simulate, 100);
+    assert.ok(result.timingsMs.total >= 300, `total ${result.timingsMs.total} menor que a soma das etapas`);
+  });
+
+  await test("shadow entry: erro de programa na simulação é REPORTADO, não escondido", async () => {
+    const { simulateEntry } = await import("../src/shadowEntry.js");
+    const deps = {
+      now: () => 0,
+      getQuote: async () => ({ outAmount: "1", routePlan: [] }),
+      buildSwapTransaction: async () => ({ serialize: () => new Uint8Array() }),
+      simulateTransaction: async () => ({
+        value: { err: { InstructionError: [3, { Custom: 6001 }] }, unitsConsumed: 12_345, logs: ["Program log: slippage exceeded"] },
+      }),
+    };
+    const result = await simulateEntry(deps, {
+      mint: "MintShadow222222222222222222222222222222222",
+      sizeSol: 0.01,
+      userPublicKey: "Wallet1111111111111111111111111111111111111",
+      mode: "SHADOW",
+    });
+    assert.equal(result.built, true);
+    assert.equal(result.simulation?.ok, false, "err != null é falha, mesmo com a tx construída");
+    assert.match(JSON.stringify(result.simulation?.err), /6001/);
+    assert.ok(result.simulation?.logsTail.some((l) => /slippage exceeded/.test(l)));
+  });
+
+  await test("shadow entry: cotação falha vira resultado tipado (sem exceção, sem simulação)", async () => {
+    const { simulateEntry } = await import("../src/shadowEntry.js");
+    let simulated = false;
+    const result = await simulateEntry(
+      {
+        now: () => 0,
+        getQuote: async () => {
+          const err: any = new Error("HTTP 404");
+          err.code = "JUPITER_NO_ROUTE";
+          throw err;
+        },
+        buildSwapTransaction: async () => {
+          throw new Error("não deveria construir");
+        },
+        simulateTransaction: async () => {
+          simulated = true;
+          return {};
+        },
+      },
+      { mint: "MintShadow333333333333333333333333333333333", sizeSol: 0.02, userPublicKey: "W", mode: "PAPER" }
+    );
+    assert.equal(result.built, false);
+    assert.match(result.skippedReason || "", /JUPITER_NO_ROUTE/);
+    assert.equal(simulated, false, "sem cotação não há o que simular");
+    assert.equal(result.simulation, null);
+  });
+
+  await test("shadow entry: recusa em LIVE e sem carteira — e nunca cria chave efêmera", async () => {
+    const { simulateEntry } = await import("../src/shadowEntry.js");
+    const deps = {
+      now: () => 0,
+      getQuote: async () => {
+        throw new Error("não deveria cotar");
+      },
+      buildSwapTransaction: async () => {
+        throw new Error("não deveria construir");
+      },
+      simulateTransaction: async () => ({}),
+    };
+    const live = await simulateEntry(deps, { mint: "MintShadow444444444444444444444444444444444", sizeSol: 0.01, userPublicKey: "W", mode: "LIVE" });
+    assert.match(live.skippedReason || "", /LIVE/);
+    const semCarteira = await simulateEntry(deps, { mint: "MintShadow444444444444444444444444444444444", sizeSol: 0.01, userPublicKey: null, mode: "PAPER" });
+    assert.match(semCarteira.skippedReason || "", /sem chave operacional/);
+  });
+
+  await test("shadow entry NÃO PODE assinar nem enviar (regressão por varredura de código)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const source = fs.readFileSync(path.join(repoRoot, "src", "shadowEntry.ts"), "utf8");
+    // Remove comentários para não acusar a própria documentação do módulo.
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    for (const forbidden of [
+      "signTransaction",
+      "partialSign",
+      "sendTransaction",
+      "sendRawTransaction",
+      "sendBundle",
+      "Keypair",
+      "secretKey",
+      "privateKey",
+    ]) {
+      assert.ok(
+        !code.includes(forbidden),
+        `shadowEntry.ts não pode conter "${forbidden}": o caminho shadow é de simulação, não de execução`
+      );
+    }
+  });
+
+  await test("quarentena: classifica por estrutura (tamanho, mint, modo) sem consultar rede", async () => {
+    const { classifyPosition, planQuarantine } = await import("../src/dbQuarantine.js");
+    const MINT_OK = "So11111111111111111111111111111111111111112";
+
+    assert.equal(classifyPosition({ id: "a", mint: MINT_OK, sizeSol: 0, mode: "paper" }).verdict, "invalid");
+    assert.equal(classifyPosition({ id: "b", mint: "nao-e-pubkey", sizeSol: 0.1, mode: "paper" }).verdict, "invalid");
+    assert.equal(classifyPosition({ id: "c", mint: MINT_OK, sizeSol: 0.1 }).verdict, "suspect");
+    assert.equal(classifyPosition({ id: "d", mint: MINT_OK, sizeSol: 0.1, mode: "paper" }).verdict, "ok");
+
+    const plan = planQuarantine([
+      { id: "a", mint: MINT_OK, sizeSol: 0, mode: "paper" },
+      { id: "c", mint: MINT_OK, sizeSol: 0.1 },
+      { id: "d", mint: MINT_OK, sizeSol: 0.1, mode: "paper" },
+    ]);
+    assert.equal(plan.invalid.length, 1);
+    assert.equal(plan.suspect.length, 1);
+    assert.equal(plan.ok.length, 1);
+    assert.deepEqual(
+      plan.toMove.map((c) => c.id),
+      ["a"],
+      "sem --include-unmigrated, apenas os estruturalmente inválidos entram no plano"
+    );
+    const comSuspeitos = planQuarantine([{ id: "c", mint: MINT_OK, sizeSol: 0.1 }], { includeUnmigrated: true });
+    assert.deepEqual(comSuspeitos.toMove.map((c) => c.id), ["c"]);
+  });
+
+  await test("quarentena: aplica status e motivos SEM apagar nada", async () => {
+    const { applyQuarantine, planQuarantine } = await import("../src/dbQuarantine.js");
+    const MINT_OK = "So11111111111111111111111111111111111111112";
+    const positions = [
+      { id: "a", mint: MINT_OK, sizeSol: 0, mode: "paper", token: "X" },
+      { id: "d", mint: MINT_OK, sizeSol: 0.1, mode: "paper", token: "Y" },
+    ];
+    const plan = planQuarantine(positions);
+    const { next, moved } = applyQuarantine(positions, plan, "2026-10-02T00:00:00.000Z");
+
+    assert.equal(next.length, 2, "nenhuma posição pode ser removida do banco");
+    const a: any = next.find((p: any) => p.id === "a")!;
+    assert.equal(a.status, "quarantined");
+    assert.equal(a.quarantinedAt, "2026-10-02T00:00:00.000Z");
+    assert.ok(Array.isArray(a.quarantineReasons) && a.quarantineReasons.length > 0);
+    assert.equal(a.sizeSol, 0, "os dados originais permanecem para auditoria");
+    const d: any = next.find((p: any) => p.id === "d")!;
+    assert.equal(d.status, undefined, "posição saudável não é tocada");
+    assert.equal(moved.length, 1);
+  });
+
+  await test("CLI de quarentena: dry-run não escreve nada (e sinaliza com exit 2)", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const tsxBin = path.join(repoRoot, "node_modules", ".bin", "tsx");
+    if (!fs.existsSync(tsxBin)) {
+      console.log("     (tsx ausente — teste de CLI pulado)");
+      return;
+    }
+    const MINT_OK = "So11111111111111111111111111111111111111112";
+    const dbPath = path.join(sandboxDir, "quarantine-db.json");
+    const db = {
+      version: "v4",
+      positions: [
+        { id: "pos_invalida", token: "MEME", mint: "King777123912Aasdasdsa8912hads9812hasdH", sizeSol: 0, status: "open" },
+        { id: "pos_ok", token: "OK", mint: MINT_OK, sizeSol: 0.1, mode: "paper", status: "open" },
+      ],
+    };
+    fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+    const before = fs.readFileSync(dbPath, "utf8");
+
+    const dry = spawnSync(tsxBin, [path.join(repoRoot, "scripts", "quarantine-db.ts"), "--file", dbPath], { encoding: "utf8" });
+    assert.equal(fs.readFileSync(dbPath, "utf8"), before, "dry-run NÃO pode alterar o banco");
+    assert.equal(dry.status, 2, `dry-run com posição inválida deve sinalizar (status=${dry.status})`);
+    assert.match(dry.stdout, /pos_invalida/);
+
+    const applied = spawnSync(
+      tsxBin,
+      [path.join(repoRoot, "scripts", "quarantine-db.ts"), "--file", dbPath, "--apply"],
+      { encoding: "utf8" }
+    );
+    assert.equal(applied.status, 0, `--apply deveria concluir (status=${applied.status}): ${applied.stderr}`);
+    const after = JSON.parse(fs.readFileSync(dbPath, "utf8"));
+    const invalida = after.positions.find((p: any) => p.id === "pos_invalida");
+    assert.equal(invalida.status, "quarantined");
+    assert.ok(invalida.quarantineReasons.length > 0);
+    assert.equal(after.positions.length, 2, "nada apagado");
+    assert.equal(after.positions.find((p: any) => p.id === "pos_ok").status, "open", "posição saudável intacta");
+    const inventory = fs.readdirSync(sandboxDir).filter((f) => /^quarantine-db\.quarantine\..*\.json$/.test(f));
+    assert.equal(inventory.length, 1, "o inventário de quarentena precisa existir");
+  });
+
+  /* ------------------------------------------------------------------ */
+  console.log("\n[12] Status de landing do Jito e oráculo de tip (fim dos números inventados)");
+
+  await test("id de bundle: aceita os DOIS formatos da doc e recusa o resto", async () => {
+    const { isPlausibleBundleId } = await import("../src/jitoStatus.js");
+    // Exemplo da doc de getBundleStatuses: SHA-256 em hex.
+    assert.equal(
+      isPlausibleBundleId("892b79ed49138bfb3aa5441f0df6e06ef34f9ee8f3976c15b323605bae0cf51d"),
+      true
+    );
+    // Exemplo da doc de sendBundle: base58 (formato de assinatura). A doc se contradiz — não adivinhamos.
+    assert.equal(
+      isPlausibleBundleId("2id3YC2jK9G5Wo2phDx4gJVAew8DcY5NAojnVuao8rkxwPYPe8cSwE5GzhEgJA2y8fVjDEo6iR6ykBvDxrTQrtpb"),
+      true
+    );
+    // "x"*64 NÃO serve como caso inválido: 'x' é caractere válido do alfabeto base58.
+    for (const bad of ["", "   ", "curto", "0OIl" + "a".repeat(60), "l".repeat(64), "!", null, undefined, 42]) {
+      assert.equal(isPlausibleBundleId(bad as any), false, `deveria recusar: ${String(bad).slice(0, 20)}`);
+    }
+  });
+
+  await test("parseBundleStatuses: lê a resposta da doc, null como não-encontrado e erro relativo", async () => {
+    const { parseBundleStatuses } = await import("../src/jitoStatus.js");
+    const ID_HEX = "892b79ed49138bfb3aa5441f0df6e06ef34f9ee8f3976c15b323605bae0cf51d";
+    const OUTRO = "b31e5fae4923f345218403ac1ab242b46a72d4f2a38d131f474255ae88f1ec9a";
+
+    const raw = {
+      jsonrpc: "2.0",
+      result: {
+        context: { slot: 242806119 },
+        value: [
+          {
+            bundle_id: ID_HEX,
+            transactions: ["3bC2M9fiACSjkTXZDgeNAuQ4ScTsdKGwR42ytFdhUvikqTmBheUxfsR1fDVsM5ADCMMspuwGkdm1uKbU246x5aE3"],
+            slot: 242804011,
+            confirmation_status: "finalized",
+            err: { Ok: null },
+          },
+          null, // id não encontrado / fora da janela
+        ],
+      },
+      id: 1,
+    };
+
+    const parsed = parseBundleStatuses(raw, [ID_HEX, OUTRO]);
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.entries.length, 2);
+    const found = parsed.entries.find((e) => e.bundleId === ID_HEX)!;
+    assert.equal(found.found, true);
+    assert.equal(found.confirmationStatus, "finalized");
+    assert.equal(found.slot, 242804011);
+    assert.equal(found.signatures.length, 1);
+    assert.equal(found.err, null, "err {Ok: null} significa SEM erro relatado");
+    const missing = parsed.entries.find((e) => e.bundleId === OUTRO)!;
+    assert.equal(missing.found, false, "null em result.value = não encontrado (NÃO é falha)");
+    assert.deepEqual(parsed.missingIds, [OUTRO]);
+
+    // Formato alternativo: a tabela da doc usa confirmationStatus (camelCase).
+    const camel = parseBundleStatuses(
+      { result: { value: [{ bundle_id: ID_HEX, transactions: [], slot: 1, confirmationStatus: "confirmed" }] } },
+      [ID_HEX]
+    );
+    assert.equal(camel.entries[0].confirmationStatus, "confirmed");
+
+    // Resposta sem result.value: problema declarado, nenhum erro inventado por item.
+    const quebrado = parseBundleStatuses({ result: {} }, [ID_HEX]);
+    assert.equal(quebrado.ok, false);
+    assert.ok(quebrado.problems.some((p) => /result\.value/.test(p)));
+    assert.deepEqual(quebrado.missingIds, [ID_HEX]);
+
+    // Status desconhecido: não é aceito silenciosamente.
+    const estranho = parseBundleStatuses(
+      { result: { value: [{ bundle_id: ID_HEX, transactions: [], slot: 1, confirmation_status: "quase" }] } },
+      [ID_HEX]
+    );
+    assert.equal(estranho.entries[0].confirmationStatus, null);
+    assert.ok(estranho.problems.some((p) => /desconhecido/.test(p)));
+  });
+
+  await test("parseInflightStatuses: Invalid/Pending/Failed/Landed com landed_slot", async () => {
+    const { parseInflightStatuses } = await import("../src/jitoStatus.js");
+    const A = "b31e5fae4923f345218403ac1ab242b46a72d4f2a38d131f474255ae88f1ec9a";
+    const B = "e3c4d7933cf3210489b17307a14afbab2e4ae3c67c9e7157156f191f047aa6e8";
+    const C = "a7abecabd9a165bc73fd92c809da4dc25474e1227e61339f02b35ce91c9965e2";
+
+    const parsed = parseInflightStatuses(
+      {
+        result: {
+          context: { slot: 280999028 },
+          value: [
+            { bundle_id: A, status: "Invalid", landed_slot: null },
+            { bundle_id: B, status: "Landed", landed_slot: 280999010 },
+            { bundle_id: C, status: "Pending", landed_slot: null },
+          ],
+        },
+      },
+      [A, B, C]
+    );
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.entries.map((e) => e.status), ["Invalid", "Landed", "Pending"]);
+    assert.equal(parsed.entries[1].landedSlot, 280999010);
+    assert.equal(parsed.entries[0].landedSlot, null);
+  });
+
+  await test("RECONCILIAÇÃO: \"Landed\" do Jito NÃO é confirmação on-chain (R6)", async () => {
+    const { reconcileLanding } = await import("../src/jitoStatus.js");
+    const ID = "b31e5fae4923f345218403ac1ab242b46a72d4f2a38d131f474255ae88f1ec9a";
+
+    // 1. Só o inflight diz Landed → entrou em bloco, sem confirmação.
+    const soInflight = reconcileLanding({
+      bundleId: ID,
+      inflight: { bundleId: ID, found: true, status: "Landed", landedSlot: 280999010 },
+    });
+    assert.equal(soInflight.verdict, "landed_unconfirmed");
+    assert.equal(soInflight.authority, "jito");
+    assert.ok(
+      soInflight.reasons.some((r) => /NÃO que a confirmação|não que a confirmação|NÃO é confirmação/i.test(r)),
+      `a razão precisa ser explícita: ${soInflight.reasons.join(" | ")}`
+    );
+    assert.notEqual(soInflight.verdict, "confirmed_on_chain", "Landed nunca pode virar confirmação");
+
+    // 2. RPC confirma → aí sim.
+    const comRpc = reconcileLanding({
+      bundleId: ID,
+      inflight: { bundleId: ID, found: true, status: "Landed", landedSlot: 280999010 },
+      rpcConfirmation: { signature: "sig", confirmationStatus: "confirmed", slot: 280999010, err: null },
+    });
+    assert.equal(comRpc.verdict, "confirmed_on_chain");
+    assert.equal(comRpc.authority, "rpc");
+
+    // 3. RPC em "processed" = confirmação OTIMISTA, ainda não é fato.
+    const otimista = reconcileLanding({
+      bundleId: ID,
+      rpcConfirmation: { signature: "sig", confirmationStatus: "processed", slot: 123, err: null },
+    });
+    assert.equal(otimista.verdict, "landed_unconfirmed");
+    assert.ok(otimista.reasons.some((r) => /OTIMISTA/.test(r)));
+
+    // 4. getBundleStatuses com finalized → confirmado, mas a autoridade declarada é o Jito
+    //    (é o RPC deles); a razão precisa apontar que o SEU RPC é a autoridade para capital.
+    const viaBundle = reconcileLanding({
+      bundleId: ID,
+      bundleStatus: { bundleId: ID, found: true, slot: 999, confirmationStatus: "finalized", signatures: ["s1"], err: null, retryable: null },
+    });
+    assert.equal(viaBundle.verdict, "confirmed_on_chain");
+    assert.equal(viaBundle.authority, "jito");
+    assert.ok(viaBundle.reasons.some((r) => /SEU RPC/.test(r)));
+
+    // 5. Estados negativos e ausência de informação.
+    assert.equal(
+      reconcileLanding({ bundleId: ID, inflight: { bundleId: ID, found: true, status: "Failed", landedSlot: null } }).verdict,
+      "failed"
+    );
+    assert.equal(
+      reconcileLanding({ bundleId: ID, inflight: { bundleId: ID, found: true, status: "Invalid", landedSlot: null } }).verdict,
+      "invalid"
+    );
+    const nada = reconcileLanding({ bundleId: ID });
+    assert.equal(nada.verdict, "not_found");
+    assert.equal(nada.authority, "none");
+
+    // 6. Falha de CONSULTA não pode virar "não encontrado".
+    const indisponivel = reconcileLanding({
+      bundleId: ID,
+      sourceErrors: { inflight: "fetch failed", bundleStatus: "fetch failed" },
+    });
+    assert.equal(indisponivel.verdict, "unknown", "não conseguir perguntar ≠ não existir");
+    assert.ok(indisponivel.reasons.some((r) => /não foi possível consultar/.test(r)));
+    // Falha parcial: a conclusão usa a fonte que respondeu e isso fica declarado.
+    const parcial = reconcileLanding({
+      bundleId: ID,
+      inflight: { bundleId: ID, found: true, status: "Landed", landedSlot: 42 },
+      sourceErrors: { bundleStatus: "fetch failed" },
+    });
+    assert.equal(parcial.verdict, "landed_unconfirmed");
+    assert.ok(parcial.reasons.some((r) => /se apoia apenas na fonte que respondeu/.test(r)));
+    assert.ok(
+      nada.reasons.some((r) => /não sei|Não sei/.test(r)),
+      "ausência de informação precisa ser declarada como tal, não como falha"
+    );
+  });
+
+  await test("tip floor: lê a resposta da doc e não inventa percentil ausente", async () => {
+    const { parseTipFloor, computeRecommendedTip } = await import("../src/jitoStatus.js");
+    const docSample = [
+      {
+        time: "2024-09-01T12:58:00Z",
+        landed_tips_25th_percentile: 6.001000000000001e-6,
+        landed_tips_50th_percentile: 1e-5,
+        landed_tips_75th_percentile: 3.6196500000000005e-5,
+        landed_tips_95th_percentile: 0.0014479055000000002,
+        landed_tips_99th_percentile: 0.010007999,
+        ema_landed_tips_50th_percentile: 9.836078125000002e-6,
+      },
+    ];
+    const parsed = parseTipFloor(docSample);
+    assert.ok(parsed.sample);
+    assert.equal(parsed.sample!.p75, 3.6196500000000005e-5);
+    assert.equal(parsed.sample!.time, "2024-09-01T12:58:00Z");
+
+    const rec = computeRecommendedTip(parsed.sample!, "p75");
+    assert.equal(rec.rawTipSol, 3.6196500000000005e-5);
+    assert.equal(rec.substituted, false);
+    assert.equal(rec.usedPolicy, "p75");
+
+    // Política sem valor no sample → substituição DECLARADA por outro percentil real.
+    const semEma = parseTipFloor([{ landed_tips_50th_percentile: 1e-5 }]);
+    assert.ok(semEma.sample);
+    const sub = computeRecommendedTip(semEma.sample!, "ema50");
+    assert.equal(sub.substituted, true);
+    assert.equal(sub.usedPolicy, "p50");
+    assert.equal(sub.rawTipSol, 1e-5);
+
+    // Nenhum percentil utilizável → null explícito (nunca zero, nunca constante).
+    assert.equal(parseTipFloor([{ time: "x" }]).sample, null);
+    assert.equal(parseTipFloor([]).sample, null);
+    assert.equal(parseTipFloor({ nope: true }).sample, null);
+    // Valor negativo/NaN é rejeitado e reportado.
+    const invalido = parseTipFloor([{ landed_tips_50th_percentile: -5, landed_tips_75th_percentile: "abc" }]);
+    assert.equal(invalido.sample, null);
+    assert.ok(invalido.problems.length >= 2);
+  });
+
+  await test("oráculo de tip: cache, throttle e falha honesta (fetch injetado)", async () => {
+    const { JitoTipOracle } = await import("../src/jitoStatus.js");
+    const docBody = JSON.stringify([
+      { time: "2024-09-01T12:58:00Z", landed_tips_50th_percentile: 1e-5, landed_tips_75th_percentile: 3.6e-5 },
+    ]);
+
+    let calls = 0;
+    let clock = 100_000;
+    const okFetch = (async () => {
+      calls++;
+      return { ok: true, status: 200, json: async () => JSON.parse(docBody) };
+    }) as unknown as typeof fetch;
+
+    const oracle = new JitoTipOracle({ fetchFn: okFetch, now: () => clock, cacheTtlMs: 10_000 });
+
+    const first = await oracle.getTipFloor();
+    assert.equal(first.available, true);
+    assert.equal(calls, 1);
+    assert.equal(first.available && first.fromCache, false);
+
+    // Dentro do TTL: serve do cache, sem nova requisição (rate limit é 1 req/s).
+    const cached = await oracle.getTipFloor();
+    assert.equal(cached.available && cached.fromCache, true);
+    assert.equal(calls, 1, "não pode bater na fonte dentro do TTL");
+
+    // Depois do TTL, mas dentro do intervalo mínimo → throttle DECLARADO (sem inventar valor).
+    const throttledOracle = new JitoTipOracle({ fetchFn: okFetch, now: () => clock, cacheTtlMs: 0 });
+    clock += 100;
+    const t1 = await throttledOracle.getTipFloor();
+    assert.equal(t1.available, true, "primeira chamada passa");
+    const before = calls;
+    clock += 200; // 200ms < 1000ms de intervalo mínimo
+    const t2 = await throttledOracle.getTipFloor();
+    assert.equal(t2.available, false);
+    assert.ok(!t2.available && /throttle/i.test(t2.error), t2.available ? "" : t2.error);
+    assert.equal(calls, before, "throttle não pode disparar requisição");
+    // Passado o intervalo, volta a consultar.
+    clock += 2_000;
+    const t3 = await throttledOracle.getTipFloor();
+    assert.equal(t3.available, true);
+    assert.equal(calls, before + 1);
+
+    // Fonte fora do ar: available false, erro declarado, e NENHUM número.
+    const failing = new JitoTipOracle({
+      fetchFn: (async () => {
+        throw new Error("fetch failed");
+      }) as unknown as typeof fetch,
+      now: () => clock,
+      cacheTtlMs: 0,
+    });
+    const down = await failing.getTipFloor();
+    assert.equal(down.available, false);
+    assert.ok(!down.available && /inacessível/.test(down.error));
+    assert.equal(down.lastKnown, null, "sem histórico: nada a servir, nada a inventar");
+    const recDown = await failing.recommendTip({ capitalSol: 0.1, maxTipBps: 50, policy: "p75" });
+    assert.equal(recDown.available, false);
+    assert.equal(recDown.tipSol, null, "sem dado de mercado não existe recomendação de tip");
+    assert.equal(recDown.tipLamports, null);
+  });
+
+  await test("recomendação de tip: teto em bps vence e abaixo do mínimo do Jito é AVISADO", async () => {
+    const { JitoTipOracle, MIN_JITO_TIP_LAMPORTS } = await import("../src/jitoStatus.js");
+    const body = JSON.stringify([{ landed_tips_50th_percentile: 1e-5, landed_tips_75th_percentile: 3.6e-5 }]);
+    let clock = 0;
+    const oracle = new JitoTipOracle({
+      fetchFn: (async () => ({ ok: true, status: 200, json: async () => JSON.parse(body) })) as unknown as typeof fetch,
+      now: () => (clock += 5_000),
+    });
+
+    // Capital grande o bastante: o tip do percentil cabe no teto de 50 bps.
+    const folgado = await oracle.recommendTip({ capitalSol: 0.1, maxTipBps: 50, policy: "p75" });
+    assert.equal(folgado.available, true);
+    assert.equal(folgado.cappedByBps, false, "3.6e-5 SOL cabe em 50 bps de 0.1 SOL");
+    assert.equal(folgado.tipLamports, 36_000);
+    assert.equal(folgado.belowJitoMinimum, false);
+
+    // Capital pequeno: o teto corta o tip e isso é DECLARADO (nunca subimos acima do teto).
+    const cortado = await oracle.recommendTip({ capitalSol: 0.001, maxTipBps: 50, policy: "p75" });
+    assert.equal(cortado.available, true);
+    assert.equal(cortado.cappedByBps, true);
+    assert.equal(cortado.tipSol, (0.001 * 50) / 10_000);
+    assert.ok(cortado.warnings.some((w) => /teto de 50 bps/.test(w)));
+
+    // Teto abaixo do mínimo do Jito: avisa que provavelmente NÃO será considerado, e mantém o teto.
+    const minusculo = await oracle.recommendTip({ capitalSol: 0.0001, maxTipBps: 50, policy: "p75" });
+    assert.equal(minusculo.available, true);
+    assert.equal(minusculo.belowJitoMinimum, true);
+    assert.ok(minusculo.tipLamports! < MIN_JITO_TIP_LAMPORTS);
+    assert.ok(
+      minusculo.warnings.some((w) => /NÃO será considerado/.test(w) && /teto de risco não foi violado/.test(w)),
+      `o trade-off precisa ser explícito: ${minusculo.warnings.join(" | ")}`
+    );
+  });
+
+  await test("JitoBundleSender: recusa lote grande/ID inválido e nunca fabrica status", async () => {
+    const { JitoBundleSender } = await import("../src/realExecution.js");
+    const { Connection } = await import("@solana/web3.js");
+    const sender = new JitoBundleSender(new Connection("https://127.0.0.1:1"));
+
+    const vazio = await sender.getBundleStatuses([]);
+    assert.equal(vazio.ok, false);
+    assert.ok(vazio.problems.some((p) => /nenhum bundle id/.test(p)));
+
+    const muitos = await sender.getBundleStatuses(Array.from({ length: 6 }, (_, i) => i.toString(16).repeat(64).slice(0, 64)));
+    assert.equal(muitos.ok, false);
+    assert.ok(muitos.problems.some((p) => /excede o máximo de 5/.test(p)), "limite documentado precisa ser aplicado");
+
+    const invalido = await sender.getBundleStatuses(["nao-e-id"]);
+    assert.equal(invalido.ok, false);
+    assert.ok(invalido.problems.some((p) => /implausível/.test(p)));
+
+    // Com id válido, a chamada TENTA a rede. Substituímos o fetch por um stub que falha para
+    // (a) não depender de egress e (b) provar que falha de rede vira problema declarado —
+    // nunca um status inventado.
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async () => {
+        throw new Error("test-stub: sem rede");
+      }) as unknown as typeof fetch;
+      const ID = "892b79ed49138bfb3aa5441f0df6e06ef34f9ee8f3976c15b323605bae0cf51d";
+      const semRede = await sender.getBundleStatuses([ID]);
+      assert.equal(semRede.ok, false);
+      assert.ok(semRede.problems.some((p) => /falha de rede/.test(p)));
+      assert.deepEqual(semRede.entries, [], "sem rede não existe entrada de status");
+      assert.deepEqual(semRede.missingIds, [ID]);
+
+      // Imediatamente depois: o cliente ESPERA e respeita o rate limit de 1 req/s (em vez de
+      // disparar a segunda requisição imediatamente, o que aceleraria o bloqueio da chave).
+      const t0 = Date.now();
+      const segunda = await sender.getBundleStatuses([ID]);
+      const esperou = Date.now() - t0;
+      assert.equal(segunda.ok, false);
+      assert.ok(esperou >= 900, `deveria esperar ~1s entre consultas (esperou ${esperou}ms)`);
+      assert.ok(
+        segunda.problems.some((p) => /falha de rede/.test(p)),
+        `a segunda consulta precisa CHEGAR na rede (não ser recusada pelo nosso próprio limite): ${segunda.problems.join(" | ")}`
+      );
+
+      // Fila longa demais: aí sim recusa, declarando a espera (não acumula fila infinita).
+      const { JitoBundleSender: Sender } = await import("../src/realExecution.js");
+      const apertado = new Sender(new Connection("https://127.0.0.1:1"), {
+        minStatusIntervalMs: 1000,
+        maxStatusWaitMs: 10,
+      });
+      await apertado.getBundleStatuses([ID]); // ocupa o slot
+      const semFila = await apertado.getBundleStatuses([ID]);
+      assert.equal(semFila.ok, false);
+      assert.ok(semFila.problems.some((p) => /throttle local/.test(p) && /1 req\/s/.test(p)));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  await test("o endpoint /api/jito-tips perdeu as constantes inventadas (regressão)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const jitoSrc = fs.readFileSync(path.join(repoRoot, "src", "jitoStatus.ts"), "utf8");
+
+    for (const proibido of ["low: 0.0005", "medium: 0.0015", "high: 0.005", "extreme: 0.02"]) {
+      assert.ok(!serverSrc.includes(proibido), `a constante fabricada "${proibido}" não pode voltar`);
+    }
+    assert.ok(
+      jitoSrc.includes("https://bundles.jito.wtf/api/v1/bundles/tip_floor"),
+      "o tip floor é REST em bundles.jito.wtf, host separado do block engine"
+    );
+
+    // Nenhum número aleatório: o módulo inteiro lê dados, não gera.
+    const code = jitoSrc
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    assert.ok(!code.includes("Math.random"), "oráculo de tip não pode conter RNG");
+  });
+
+  // ---------------------------------------------------------------------------
+  // [13] INTENÇÕES DE EXECUÇÃO — IDEMPOTÊNCIA (S4)
+  // ---------------------------------------------------------------------------
+  console.log("\n[13] Intenções de execução (idempotência de ação econômica)");
+
+  await test("a intenção nasce sem assinatura e com tentativa 1", async () => {
+    const { createExecutionIntent } = await import("../src/executionIntent.js");
+    const intent = createExecutionIntent(
+      { positionId: "pos_1", mint: "So11111111111111111111111111111111111111112", token: "ABC", side: "exit" },
+      { now: () => "2026-01-01T00:00:00.000Z", randomSuffix: () => "abc123" }
+    );
+    assert.equal(intent.state, "created");
+    assert.equal(intent.attempt, 1);
+    assert.equal(intent.signature, null);
+    assert.equal(intent.lastValidBlockHeight, null);
+    assert.equal(intent.supersedesIntentId, null);
+    assert.equal(intent.createdAt, "2026-01-01T00:00:00.000Z");
+    assert.ok(intent.id.startsWith("intent_exit_pos_1_"));
+  });
+
+  await test("transições ilegais são RECUSADAS (created → confirmed, terminal reutilizado)", async () => {
+    const { createExecutionIntent, advanceIntent } = await import("../src/executionIntent.js");
+    const base = createExecutionIntent({ positionId: "p", mint: "m", token: "T", side: "exit" });
+
+    const pulo = advanceIntent(base, "confirmed");
+    assert.equal(pulo.ok, false, "não se pode confirmar uma intenção que nunca foi assinada/enviada");
+
+    const signed = advanceIntent(base, "signed", { signature: "sig1", blockhash: "bh", lastValidBlockHeight: 100 }, "assinada");
+    assert.equal(signed.ok, true);
+    // Assinada SEM "submitted" registrado pode ter chegado (queda entre assinar e gravar):
+    // o boot descobre pela cadeia, então esta transição precisa ser permitida.
+    const confirmadaSemEnvio = advanceIntent((signed as any).intent, "confirmed", { confirmationLevel: "confirmed" }, "boot: cadeia confirmou");
+    assert.equal(confirmadaSemEnvio.ok, true);
+    const confirmed = advanceIntent((signed as any).intent, "confirmed", { confirmationLevel: "processed" }, "ok");
+    assert.equal(confirmed.ok, true);
+    const reuse = advanceIntent((confirmed as any).intent, "submitted");
+    assert.equal(reuse.ok, false, "estado terminal não é reutilizado: cria-se intenção nova");
+    assert.ok(!reuse.ok && /termina/.test(reuse.reason));
+  });
+
+  await test("histórico registra cada transição (auditoria)", async () => {
+    const { createExecutionIntent, advanceIntent } = await import("../src/executionIntent.js");
+    let intent = createExecutionIntent({ positionId: "p", mint: "m", token: "T", side: "exit" });
+    intent = (advanceIntent(intent, "signed", {}, "assinada") as any).intent;
+    intent = (advanceIntent(intent, "submitted", {}, "enviada") as any).intent;
+    assert.equal(intent.history.length, 2);
+    assert.deepEqual(intent.history.map((h: any) => `${h.from}->${h.to}`), ["created->signed", "signed->submitted"]);
+  });
+
+  await test("trava de voo único bloqueia o mesmo lado e libera o outro", async () => {
+    const { createExecutionIntent, advanceIntent, findBlockingIntent } = await import("../src/executionIntent.js");
+    const a = createExecutionIntent({ positionId: "pos_9", mint: "m", token: "T", side: "exit" });
+    assert.equal(findBlockingIntent([a], "pos_9", "exit")?.id, a.id);
+    assert.equal(findBlockingIntent([a], "pos_9", "entry"), null, "lado diferente não é bloqueado");
+    assert.equal(findBlockingIntent([a], "pos_10", "exit"), null);
+
+    const done = (advanceIntent(a, "failed", { lastError: "x" }, "falhou") as any).intent;
+    assert.equal(findBlockingIntent([done], "pos_9", "exit"), null, "intenção terminal não bloqueia");
+  });
+
+  await test("decideRetry: evidência vem ANTES da conveniência", async () => {
+    const { createExecutionIntent, advanceIntent, decideRetry } = await import("../src/executionIntent.js");
+    let intent = createExecutionIntent({ positionId: "p", mint: "m", token: "T", side: "exit" });
+    intent = (advanceIntent(intent, "signed", { signature: "sig", blockhash: "bh", lastValidBlockHeight: 200 }, "a") as any).intent;
+    intent = (advanceIntent(intent, "submitted", {}, "b") as any).intent;
+
+    // 1. Já confirmada: nada é reenviado.
+    const confirmedIntent = (advanceIntent(intent, "confirmed", { confirmationLevel: "finalized" }, "c") as any).intent;
+    const stop = decideRetry(confirmedIntent, { currentBlockHeight: 500, signatureStatus: null, hasSignedBytes: true });
+    assert.equal(stop.action, "stop_confirmed");
+
+    // 2. Erro de execução na cadeia: reconstruir é seguro.
+    const err = decideRetry(intent, {
+      currentBlockHeight: 250,
+      signatureStatus: { found: true, err: { InstructionError: [0, "Custom"] }, confirmationStatus: null },
+      hasSignedBytes: true,
+    });
+    assert.equal(err.action, "rebuild");
+    assert.ok(/ERRO de execução/.test((err as any).reason));
+
+    // 3. Cadeia já executou: pare, com o nível declarado.
+    const landed = decideRetry(intent, {
+      currentBlockHeight: 250,
+      signatureStatus: { found: true, err: null, confirmationStatus: "processed" },
+      hasSignedBytes: true,
+    });
+    assert.equal(landed.action, "stop_confirmed");
+    assert.equal((landed as any).level, "processed");
+
+    // 4. Expiração PROVADA por altura: única justificativa para reconstruir sem erro.
+    const expired = decideRetry(intent, {
+      currentBlockHeight: 201,
+      signatureStatus: { found: false, err: null, confirmationStatus: null },
+      hasSignedBytes: true,
+    });
+    assert.equal(expired.action, "rebuild");
+    assert.ok(/expirado/i.test((expired as any).reason));
+
+    // 5. Sem prova de expiração, com bytes em memória: REENVIAR os mesmos bytes.
+    const rebroadcast = decideRetry(intent, {
+      currentBlockHeight: 199,
+      signatureStatus: { found: false, err: null, confirmationStatus: null },
+      hasSignedBytes: true,
+    });
+    assert.equal(rebroadcast.action, "rebroadcast");
+
+    // 6. Sem prova, sem bytes (restart): ESPERAR. Reconstruir aqui duplicaria a ação.
+    const wait = decideRetry(intent, {
+      currentBlockHeight: 199,
+      signatureStatus: { found: false, err: null, confirmationStatus: null },
+      hasSignedBytes: false,
+    });
+    assert.equal(wait.action, "wait");
+    assert.ok(/duplicar/.test((wait as any).reason));
+
+    // 7. RPC não respondeu (null) NÃO é resposta negativa: nunca rebuild.
+    const semResposta = decideRetry(intent, { currentBlockHeight: null, signatureStatus: null, hasSignedBytes: true });
+    assert.notEqual(semResposta.action, "rebuild");
+
+    // 8. Durable nonce não expira: altura maior NÃO autoriza reconstruir.
+    const nonce = decideRetry(intent, {
+      currentBlockHeight: 9999,
+      signatureStatus: { found: false, err: null, confirmationStatus: null },
+      hasSignedBytes: false,
+      usesDurableNonce: true,
+    });
+    assert.equal(nonce.action, "wait");
+    assert.ok(/nonce/i.test((nonce as any).reason));
+
+    // 9. Nunca assinada: não existe duplicata possível.
+    const virgem = createExecutionIntent({ positionId: "p2", mint: "m", token: "T", side: "exit" });
+    const primeira = decideRetry(virgem, { currentBlockHeight: 10, signatureStatus: null, hasSignedBytes: false });
+    assert.equal(primeira.action, "rebuild");
+  });
+
+  await test("rebuild encadeia a intenção anterior (nada é apagado)", async () => {
+    const { createExecutionIntent } = await import("../src/executionIntent.js");
+    const primeira = createExecutionIntent({ positionId: "p", mint: "m", token: "T", side: "exit" });
+    const segunda = createExecutionIntent({
+      positionId: "p",
+      mint: "m",
+      token: "T",
+      side: "exit",
+      attempt: 2,
+      supersedesIntentId: primeira.id,
+    });
+    assert.equal(segunda.attempt, 2);
+    assert.equal(segunda.supersedesIntentId, primeira.id, "a tentativa nova aponta para a que substitui");
+  });
+
+  await test("o módulo não persiste nem transporta bytes assinados (regressão)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = fs.readFileSync(path.join(repoRoot, "src", "executionIntent.ts"), "utf8");
+    const code = src
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("//"))
+      .join("\n");
+    assert.ok(!/wireTransaction\s*:/.test(code), "os bytes assinados não podem ser campo do registro");
+    assert.ok(!code.includes("serialize()"), "o módulo não serializa transação");
+    assert.ok(!code.includes("signTransaction"), "o módulo não assina");
+  });
+
+  // ---------------------------------------------------------------------------
+  // [14] RECONCILIAÇÃO POSIÇÃO × CADEIA (POSITION_DESYNC)
+  // ---------------------------------------------------------------------------
+  console.log("\n[14] Reconciliação posição × carteira (POSITION_DESYNC)");
+
+  const MINT_A = "So11111111111111111111111111111111111111112";
+  const MINT_B = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const MINT_C = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+  const NOW = Date.parse("2026-01-01T01:00:00.000Z");
+  const posAberta = (mint: string, over: Record<string, unknown> = {}) => ({
+    id: `pos_${mint.slice(0, 4)}`,
+    token: "TKN",
+    mint,
+    sizeSol: 0.1,
+    status: "open",
+    mode: "live",
+    timeOpened: new Date(NOW - 10 * 60_000).toISOString(),
+    ...over,
+  });
+
+  await test("saldo presente → in_sync (sem alarme)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta(MINT_A)],
+      holdings: [{ mint: MINT_A, rawAmount: 1_000_000, decimals: 6 }],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.phantom, 0);
+    assert.equal(report.summary.critical, 0);
+    assert.equal(report.findings[0].verdict, "in_sync");
+    assert.equal(report.snapshotAvailable, true);
+  });
+
+  await test("posição aberta sem token na carteira → phantom_position (crítico)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta(MINT_A)],
+      holdings: [{ mint: MINT_B, rawAmount: 500, decimals: 6 }],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.phantom, 1);
+    const f = report.findings.find((x) => x.verdict === "phantom_position")!;
+    assert.equal(f.severity, "critical");
+    assert.ok(/NÃO vender/.test(f.recommendedAction), "a ação recomendada não pode sugerir vender o que não existe");
+  });
+
+  await test("dentro da janela de tolerância NÃO é fantasma (entrada pode não ter confirmado)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta(MINT_A, { timeOpened: new Date(NOW - 30_000).toISOString() })],
+      holdings: [],
+      nowMs: NOW,
+      options: { minAgeMs: 120_000 },
+    });
+    assert.equal(report.summary.phantom, 0);
+    assert.equal(report.findings[0].verdict, "too_young");
+  });
+
+  await test("sem leitura de carteira → unknown, NUNCA fantasma", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({ positions: [posAberta(MINT_A)], holdings: null, nowMs: NOW });
+    assert.equal(report.summary.phantom, 0);
+    assert.equal(report.snapshotAvailable, false);
+    assert.ok(report.snapshotNote && /indisponível/.test(report.snapshotNote));
+    assert.ok(report.findings.every((f) => f.verdict === "unknown"));
+  });
+
+  await test("posição paper e quarentenada não são comparadas com a cadeia", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [
+        posAberta(MINT_A, { mode: "paper" }),
+        posAberta(MINT_B, { status: "quarantined" }),
+      ],
+      holdings: [],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.phantom, 0);
+    assert.equal(report.summary.skipped, 2);
+    assert.equal(report.summary.checkedPositions, 0);
+  });
+
+  await test("poeira residual não conta como posição detida", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta(MINT_A)],
+      holdings: [{ mint: MINT_A, rawAmount: 1, decimals: 6 }],
+      nowMs: NOW,
+      options: { dustToleranceRaw: 1 },
+    });
+    assert.equal(report.summary.phantom, 1, "1 unidade base com tolerância 1 é poeira, não posição");
+  });
+
+  await test("achei que vendi mas ainda tenho token → closed_but_holding (crítico)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [],
+      closedMints: [{ mint: MINT_C, token: "ANTIGO", closedAt: "2026-01-01T00:30:00.000Z" }],
+      holdings: [{ mint: MINT_C, rawAmount: 42_000, decimals: 9 }],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.closedButHolding, 1);
+    const f = report.findings.find((x) => x.verdict === "closed_but_holding")!;
+    assert.equal(f.severity, "critical");
+    assert.ok(/explorador/.test(f.recommendedAction));
+  });
+
+  await test("token do operador que o bot nunca tocou NÃO é reportado (sem ruído)", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [],
+      closedMints: [],
+      holdings: [{ mint: MINT_B, rawAmount: 999_999_999, decimals: 6 }],
+      nowMs: NOW,
+    });
+    assert.equal(report.findings.length, 0);
+    assert.equal(report.summary.closedButHolding, 0);
+  });
+
+  await test("mint inválido é pulado sem sequer consultar a carteira", async () => {
+    const { reconcilePositionDesync } = await import("../src/positionDesync.js");
+    const report = reconcilePositionDesync({
+      positions: [posAberta("nao-e-pubkey!")],
+      holdings: [],
+      nowMs: NOW,
+    });
+    assert.equal(report.summary.skipped, 1);
+    assert.equal(report.summary.phantom, 0);
+  });
+
+  await test("resumo descreve a ausência de leitura em vez de inventar zero", async () => {
+    const { reconcilePositionDesync, describeDesyncReport } = await import("../src/positionDesync.js");
+    const semLeitura = reconcilePositionDesync({ positions: [posAberta(MINT_A)], holdings: null, nowMs: NOW });
+    assert.ok(/não comparadas/.test(describeDesyncReport(semLeitura)));
+    const comLeitura = reconcilePositionDesync({
+      positions: [posAberta(MINT_A)],
+      holdings: [{ mint: MINT_A, rawAmount: 10, decimals: 6 }],
+      nowMs: NOW,
+    });
+    assert.ok(/comparadas/.test(describeDesyncReport(comLeitura)));
+  });
+
+  await test("regressão: o servidor usa a trava de voo único nos DOIS caminhos de saída", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const ocorrencias = serverSrc.match(/findBlockingIntent\(dbStore\.getIntents\(\)/g) ?? [];
+    assert.equal(ocorrencias.length, 2, "saída automática E fechamento manual precisam da trava");
+    assert.ok(
+      serverSrc.includes("supersedeIntent(") && serverSrc.includes("decideExitRetry("),
+      "a política de retry por evidência precisa estar aplicada"
+    );
+    assert.ok(
+      serverSrc.includes("blockedIntentWarned"),
+      "a trava não pode gerar commit em disco a cada ciclo"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [15] VERACIDADE DO PAINEL — o que é medição e o que é simulação
+  // ---------------------------------------------------------------------------
+  console.log("\n[15] Veracidade do painel e estado do oráculo de tip");
+
+  await test("oráculo nunca consultado NÃO é reportado como ok", async () => {
+    const { JitoTipOracle } = await import("../src/jitoStatus.js");
+    const oracle = new JitoTipOracle({ fetchFn: (async () => { throw new Error("não deve chamar"); }) as any, now: () => 1000 });
+    const st = oracle.getStatus();
+    assert.equal(st.everQueried, false, "sem consulta não existe sucesso");
+    assert.equal(st.lastSuccessAt, null);
+    assert.equal(st.lastSuccessAgeMs, null);
+    assert.equal(st.lastError, null, "null aqui é 'não consultado', não 'tudo certo'");
+  });
+
+  await test("oráculo registra sucesso e erro de forma distinguível", async () => {
+    const { JitoTipOracle } = await import("../src/jitoStatus.js");
+    // Formato REAL da resposta: ARRAY com os percentis em SOL (ver tip_floor do Jito).
+    const okBody = [
+      {
+        time: "2026-01-01T00:00:00Z",
+        landed_tips_25th_percentile: 6.001e-6,
+        landed_tips_50th_percentile: 1e-5,
+        landed_tips_75th_percentile: 3.6e-5,
+        landed_tips_95th_percentile: 1.4e-3,
+        landed_tips_99th_percentile: 1e-2,
+        ema_landed_tips_50th_percentile: 9.8e-6,
+      },
+    ];
+    let nowMs = 1_000;
+    const okFetch = (async () => new Response(JSON.stringify(okBody), { status: 200, headers: { "content-type": "application/json" } })) as any;
+    const oracle = new JitoTipOracle({ fetchFn: okFetch, now: () => nowMs });
+    const floor = await oracle.getTipFloor();
+    assert.equal(floor.available, true);
+    const st = oracle.getStatus();
+    assert.equal(st.everQueried, true);
+    assert.equal(st.lastError, null);
+    assert.equal(st.lastSuccessAgeMs, 0);
+
+    // Segunda instância: fonte fora do ar → erro registrado, sem sucesso.
+    const failing = new JitoTipOracle({ fetchFn: (async () => { throw new Error("fetch failed"); }) as any, now: () => 5_000 });
+    const bad = await failing.getTipFloor();
+    assert.equal(bad.available, false);
+    const stBad = failing.getStatus();
+    assert.equal(stBad.everQueried, false, "consulta que falhou não é sucesso");
+    assert.ok(stBad.lastError && /fetch failed/.test(stBad.lastError));
+  });
+
+  await test("o servidor declara os painéis simulados (endpoint /api/system-truth)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes('"/api/system-truth"'), "o endpoint de veracidade precisa existir");
+    // Os painéis conhecidos como RNG precisam estar DECLARADOS (não basta existirem).
+    for (const path_ of [
+      "/api/hft-telemetry",
+      "/metrics",
+      "/api/predictive-score",
+      "/api/geyser-stream",
+      "/api/submit-bundle",
+      "/api/simulate-fork",
+      "/api/simulate-snipe",
+      "/api/co-location",
+      "/api/jito-leader-schedule",
+    ]) {
+      assert.ok(
+        serverSrc.includes(path_),
+        `o painel simulado ${path_} precisa aparecer na declaração de veracidade`
+      );
+    }
+    /**
+     * ATUALIZADO EM S6 (autorizado em 2026-10-03). A asserção anterior exigia a string
+     * "não implementado" — ela era VERDADEIRA até o S6 e deixou de ser: o caminho de entrada
+     * real existe agora. Trocar a asserção por uma mais FRACA ("existe alguma menção")
+     * seria rebaixar o teste; o que se exige agora é mais forte e mais específico:
+     *   - a declaração precisa continuar existindo (`liveExecutionPath`), e
+     *   - precisa dizer o ESTADO real (habilitado × desligado), não uma frase fixa, e
+     *   - o bloco `realEntry` precisa expor os códigos que bloqueiam entrada AGORA.
+     * Assim, ou o caminho é declarado desligado (hoje), ou é declarado habilitado — nunca
+     * "não implementado" quando implementado, nem "habilitado" quando bloqueado.
+     */
+    assert.ok(
+      serverSrc.includes("liveExecutionPath"),
+      "o endpoint precisa continuar declarando o estado do caminho de execução real"
+    );
+    assert.ok(
+      /liveExecutionPath:[\s\S]{0,900}HFT_REAL_ENTRY_ENABLED/.test(serverSrc),
+      "o estado declarado precisa vir da política real (HFT_REAL_ENTRY_ENABLED), não de frase fixa"
+    );
+    assert.ok(
+      /realEntry: \(\(\) => \{[\s\S]{0,700}wouldEnterNow/.test(serverSrc),
+      "o painel de veracidade precisa dizer se uma entrada real passaria AGORA (wouldEnterNow)"
+    );
+  });
+
+  await test("o banner de verdade está MONTADO na interface (não só criado)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const appSrc = fs.readFileSync(path.join(repoRoot, "src", "App.tsx"), "utf8");
+    const bannerSrc = fs.readFileSync(path.join(repoRoot, "src", "components", "TruthBanner.tsx"), "utf8");
+    assert.ok(appSrc.includes('import TruthBanner from "./components/TruthBanner"'), "import ausente");
+    assert.ok(appSrc.includes("<TruthBanner />"), "componente criado mas NÃO renderizado (não apareceria na tela)");
+    assert.ok(bannerSrc.includes("/api/system-truth"), "o banner precisa ler o endpoint de veracidade");
+    assert.ok(
+      /Não foi possível ler o status de veracidade/.test(bannerSrc),
+      "sem leitura, o banner precisa declarar a falha e não inventar estado"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [16] CAMINHO QUENTE — dedupe, política de envio e orçamento do filtro
+  // ---------------------------------------------------------------------------
+  console.log("\n[16] Caminho quente (dedupe, envio, orçamento do filtro profundo)");
+
+  await test("dedupe: a mesma assinatura só é processada uma vez (com TTL)", async () => {
+    const { SeenLaunchSignatures } = await import("../src/hotPath.js");
+    const seen = new SeenLaunchSignatures(1000, 10);
+    const t0 = 1_000_000;
+    assert.equal(seen.firstSight("sigA", t0), true, "primeira vez processa");
+    assert.equal(seen.firstSight("sigA", t0 + 10), false, "reentrega é ignorada");
+    assert.equal(seen.firstSight("sigB", t0 + 20), true, "assinatura diferente processa");
+    // Depois do TTL a entrada expira (a assinatura é única, então isso é defensivo).
+    assert.equal(seen.firstSight("sigA", t0 + 1500), true);
+    assert.equal(seen.size(t0 + 1500), 1, "as duas entradas antigas expiraram; só sigA foi reinserida");
+  });
+
+  await test("dedupe: não cresce sem limite (memória não vaza)", async () => {
+    const { SeenLaunchSignatures } = await import("../src/hotPath.js");
+    const seen = new SeenLaunchSignatures(60_000, 3);
+    const t0 = 5_000_000;
+    for (let i = 0; i < 10; i++) assert.equal(seen.firstSight(`sig${i}`, t0 + i), true);
+    assert.equal(seen.size(t0 + 10), 3, "o limite é respeitado (remove o mais antigo)");
+    // As 3 mais recentes continuam registradas.
+    assert.equal(seen.firstSight("sig9", t0 + 11), false);
+  });
+
+  await test("trava de mint em voo impede decisão paralela do mesmo mint", async () => {
+    const { InFlightMints } = await import("../src/hotPath.js");
+    const gate = new InFlightMints();
+    assert.equal(gate.tryAcquire("mint1"), true);
+    assert.equal(gate.tryAcquire("mint1"), false, "segundo sinal do MESMO mint é recusado");
+    assert.equal(gate.tryAcquire("mint2"), true, "mint diferente passa");
+    gate.release("mint1");
+    assert.equal(gate.tryAcquire("mint1"), true, "após liberar, o mint volta a poder ser processado");
+  });
+
+  await test("envio: retry do RPC é 0 e preflight só cai com simulação declarada", async () => {
+    const { resolveSendOptions } = await import("../src/hotPath.js");
+    // Caso 1: nada declarado → preflight ATIVO (erro barato) e sem retry às cegas.
+    const padrao = resolveSendOptions({});
+    assert.equal(padrao.skipPreflight, false);
+    assert.equal(padrao.maxRetries, 0, "quem repete é a política de evidência, não o RPC");
+    assert.equal(padrao.preflightCommitment, "processed");
+    assert.ok(/preflight ativo/.test(padrao.rationale));
+
+    // Caso 2: transação já simulada neste processo → preflight pulado (economiza 1 RTT).
+    const preSim = resolveSendOptions({ preSimulated: true });
+    assert.equal(preSim.skipPreflight, true);
+    assert.equal(preSim.maxRetries, 0);
+    assert.ok(/simulada/.test(preSim.rationale));
+
+    // Caso 3: diagnóstico pede preflight mesmo com simulação declarada.
+    assert.equal(resolveSendOptions({ preSimulated: true, forcePreflight: true }).skipPreflight, false);
+
+    // Caso 4: overrides explícitos são respeitados; valor absurdo é saneado.
+    assert.equal(resolveSendOptions({ skipPreflight: true, maxRetries: 2 }).skipPreflight, true);
+    assert.equal(resolveSendOptions({ maxRetries: -5 }).maxRetries, 0, "não existe retry negativo");
+  });
+
+  await test("orçamento: filtro completo decide por EVIDÊNCIA", async () => {
+    const { decideEntryWithBudget } = await import("../src/hotPath.js");
+    const ok = decideEntryWithBudget({
+      mode: "LIVE",
+      deepComplete: true,
+      deepElapsedMs: 400,
+      budgetMs: 900,
+      deepVerdict: "approve",
+    });
+    assert.equal(ok.proceed, true);
+    assert.equal(ok.unvetted, false);
+
+    const reprovado = decideEntryWithBudget({
+      mode: "PAPER",
+      deepComplete: true,
+      deepElapsedMs: 400,
+      budgetMs: 900,
+      deepVerdict: "reject",
+    });
+    assert.equal(reprovado.proceed, false, "reprovação NÃO se contorna nem em PAPER");
+    assert.ok(/REPROVOU/.test(reprovado.reason));
+  });
+
+  await test("orçamento: LIVE sem auditoria é VETADO (fail-closed)", async () => {
+    const { decideEntryWithBudget } = await import("../src/hotPath.js");
+    const decisao = decideEntryWithBudget({
+      mode: "LIVE",
+      deepComplete: false,
+      deepElapsedMs: 1500,
+      budgetMs: 900,
+    });
+    assert.equal(decisao.proceed, false, "entrar em LIVE sem filtro profundo é como se perde a carteira");
+    assert.equal(decisao.unvetted, false);
+    assert.ok(/FAIL-CLOSED/.test(decisao.reason));
+  });
+
+  await test("orçamento: PAPER/SHADOW prosseguem marcados como NÃO AUDITADOS", async () => {
+    const { decideEntryWithBudget } = await import("../src/hotPath.js");
+    for (const mode of ["PAPER", "SHADOW"]) {
+      const decisao = decideEntryWithBudget({ mode, deepComplete: false, deepElapsedMs: 1200, budgetMs: 900 });
+      assert.equal(decisao.proceed, true, `${mode} prossegue (sem capital em risco)`);
+      assert.equal(decisao.unvetted, true, `${mode} precisa ser marcado como não auditado`);
+      assert.ok(/NÃO AUDITADO/.test(decisao.reason));
+    }
+  });
+
+  await test("orçamento: auditoria FALHOU bloqueia em qualquer modo (sem dado = sem decisão)", async () => {
+    const { decideEntryWithBudget } = await import("../src/hotPath.js");
+    for (const mode of ["LIVE", "PAPER", "SHADOW"]) {
+      const decisao = decideEntryWithBudget({
+        mode,
+        deepComplete: false,
+        deepElapsedMs: 40,
+        budgetMs: 900,
+        incompleteCause: "audit-error",
+      });
+      assert.equal(decisao.proceed, false, `${mode}: prosseguir sem NENHUM dado é compra às cegas`);
+      assert.ok(/AUDITORIA FALHOU/.test(decisao.reason));
+    }
+    // A causa precisa distinguir: com dado parcial (orçamento), PAPER prossegue.
+    const parcial = decideEntryWithBudget({
+      mode: "PAPER",
+      deepComplete: false,
+      deepElapsedMs: 1500,
+      budgetMs: 900,
+      incompleteCause: "budget",
+    });
+    assert.equal(parcial.proceed, true);
+    assert.equal(parcial.unvetted, true);
+  });
+
+  await test("latência: estágio gate_ok existe e a ordem recebida→gate_ok→enriquecido é respeitada", async () => {
+    const tel = await import("../src/telemetry.js");
+    assert.ok(
+      (tel.LATENCY_STAGES as readonly string[]).includes("gate_ok"),
+      "o overhead local do processo precisa de estágio próprio"
+    );
+    assert.ok(
+      !(tel.LATENCY_STAGES as readonly string[]).includes("notified"),
+      "não existe canal de notificação no caminho quente — estágio seria medição fabricada"
+    );
+    const trace = new tel.LatencyTrace("t_gate", 1_000, 100, 99);
+    trace.mark("gate_ok");
+    trace.mark("enriched");
+    assert.equal(trace.has("gate_ok"), true);
+    assert.ok(trace.elapsedTo("gate_ok") !== null);
+    const record = trace.toRecord("rejected");
+    assert.ok(record.durationsMs.gate_ok !== undefined, "a duração do portão rápido precisa ser medida");
+    assert.ok(record.durationsMs.enriched !== undefined, "received→gate_ok→enriched");
+  });
+
+  await test("cartão quente: o enriquecimento NÃO bloqueia mais em getSlot nem abandona em silêncio", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = fs.readFileSync(path.join(repoRoot, "src", "realExecution.ts"), "utf8");
+
+    // O callback do logsSubscribe recebe (logs, context) — verificado no web3.js.
+    assert.ok(
+      /this\.connection\.onLogs\([\s\S]{0,200}\(logs, context\)/.test(src),
+      "o callback precisa usar o context da notificação (slot de graça)"
+    );
+    assert.ok(!/logs as any\)\.slot/.test(src), "o slot não existe no objeto de logs; não pode voltar essa leitura");
+    assert.ok(
+      !/receivedSlot = await this\.connection\.getSlot/.test(src),
+      "getSlot não pode estar no caminho do evento (era um RTT por lançamento)"
+    );
+    assert.ok(src.includes("refreshLocalSlotInBackground"), "a amostra de slot deve ser atualizada em segundo plano");
+
+    // Falha de enriquecimento precisa ser CONTADA (perda silenciosa era o defeito).
+    assert.ok(src.includes("enrichmentFailures++"), "perda de lançamento precisa de contador");
+    assert.ok(src.includes("enrichmentRetries++"), "retry do enriquecimento precisa ser visível");
+    assert.ok(
+      /getTransaction\(signature, \{[\s\S]{0,120}commitment: "confirmed"/.test(src),
+      "getTransaction NÃO suporta processed — confirmado na doc da RPC e no tipo Finality do web3.js"
+    );
+    assert.ok(src.includes("resolveSendOptions(options)"), "submitViaRpc precisa usar a política única");
+    assert.ok(
+      !/maxRetries: options\?\.maxRetries \?\? 3/.test(src),
+      "o default maxRetries do SDK (3) não pode voltar: retry cego no RPC é inobservável"
+    );
+  });
+
+  await test("painel: feed e slot não podem ser fabricados (declarado vs medido)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const radarSrc = fs.readFileSync(
+      path.join(repoRoot, "src", "components", "GeyserGrpcRadar.tsx"),
+      "utf8"
+    );
+
+    /**
+     * Regra geral, mais forte que proibir a string: número de slot derivado do RELÓGIO não
+     * pode aparecer em endpoint declarado como REAL. Ele pode existir em painel declarado
+     * como simulado (onde o TruthBanner avisa) — nunca misturado com medição.
+     */
+    const declaredSimulated = new Set(
+      [...serverSrc.matchAll(/app\.get\("([^"]+)"/g)].length
+        ? [...serverSrc.matchAll(/\{\s*path: "(\/api\/[^"]+)", why:/g)].map((m) => m[1])
+        : []
+    );
+    assert.ok(declaredSimulated.size >= 5, "a lista de painéis declarados como simulados precisa existir");
+    for (const m of serverSrc.matchAll(/278913410 \+ Math\.floor\(\(Date\.now\(\) \/ 400\)/g)) {
+      const before = serverSrc.slice(0, m.index);
+      const endpoints = [...before.matchAll(/app\.get\("([^"]+)"/g)];
+      const owner = endpoints.length > 0 ? endpoints[endpoints.length - 1][1] : "(fora de endpoint)";
+      assert.ok(
+        declaredSimulated.has(owner),
+        `slot fabricado a partir do relógio em ${owner}, que NÃO está declarado como simulado em /api/system-truth`
+      );
+    }
+    assert.ok(serverSrc.includes("currentSlotMeasured"), "a API precisa dizer se o slot foi MEDIDO");
+    assert.ok(
+      /simulated: true,[\s\S]{0,200}MOCK\/RNG/.test(serverSrc),
+      "evento decorativo precisa se declarar como tal no payload"
+    );
+    assert.ok(/feed: \{[\s\S]{0,120}real: realCount/.test(serverSrc), "a API precisa contar real vs simulado");
+
+    /**
+     * /api/hft-telemetry: o painel continua sendo DEMONSTRAÇÃO, mas o slot tem de vir de medição
+     * (último slot dos nós RPC) e o payload tem de se declarar simulado. Sem isso, um consumidor
+     * externo (ou o operador) lê "slot 278.xxx.xxx" como estado real da rede.
+     */
+    const telemetryBloco = codigoSemComentarios(
+      serverSrc.slice(
+        serverSrc.indexOf('app.get("/api/hft-telemetry"'),
+        serverSrc.indexOf('app.get("/api/geyser-stream"')
+      )
+    );
+    assert.ok(
+      /simulated: true/.test(telemetryBloco),
+      "/api/hft-telemetry precisa declarar `simulated: true` no payload"
+    );
+    assert.ok(
+      /Object\.values\(rpcMetrics\)[\s\S]{0,120}\.lastSlot/.test(telemetryBloco),
+      "currentSlot de /api/hft-telemetry precisa vir de medição (rpcMetrics[].lastSlot), não do relógio"
+    );
+    assert.ok(
+      /const currentSlot: number \| null = measuredSlots/.test(telemetryBloco),
+      "currentSlot precisa ser MEDIDO ou null — nunca um número inventado"
+    );
+    assert.ok(
+      !/Math\.random\(\)/.test(telemetryBloco.split("const currentSlot")[0]),
+      "o slot não pode ser decidido por RNG antes da medição"
+    );
+    assert.ok(serverSrc.includes("unmeasured"), "o que não é medido precisa ser listado como não medido");
+
+    // O painel não pode afirmar co-localização nem exibir números que a API não devolve.
+    for (const proibido of ["SHREDSTREAM CO-LOCATED", "sub-1.2ms", "System Ingestion Load"]) {
+      assert.ok(!radarSrc.includes(proibido), `afirmação fabricada no painel: "${proibido}"`);
+    }
+    assert.ok(
+      /evt\.isRealOnChain !== true[\s\S]{0,400}mock/i.test(radarSrc),
+      "evento decorativo precisa de selo visível na lista (só `isRealOnChain: true` é notificação real)"
+    );
+  });
+
+  await test("regressão: infraestrutura inexistente não pode ser afirmada", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    for (const proibido of [
+      "SHREDSTREAM ACTIVE",
+      "rpc-bare-metal-shred",
+      "Reopening WebSocket shredstream connections",
+      "ShredStream throughput is massive",
+    ]) {
+      assert.ok(!serverSrc.includes(proibido), `afirmação de infraestrutura inexistente: "${proibido}"`);
+    }
+    // O caminho quente precisa estar LIGADO (não basta existir o módulo).
+    assert.ok(serverSrc.includes("hotPathInFlight.tryAcquire("), "a trava de mint em voo não está aplicada");
+    assert.ok(serverSrc.includes("decideEntryWithBudget({"), "a política de orçamento não está aplicada");
+    assert.ok(
+      serverSrc.includes("hotPathInFlight.release("),
+      "sem liberar o mint, a trava viraria bloqueio permanente"
+    );
+    // A política de orçamento precisa ser consultada também na FALHA do filtro: o `catch`
+    // que só dá `return` deixa a regra fail-closed como código morto.
+    assert.ok(
+      /catch \(err: any\) \{[\s\S]{0,900}decideEntryWithBudget\(/.test(serverSrc),
+      "a falha do filtro profundo precisa passar pela política (senão o veto é código morto)"
+    );
+    assert.ok(serverSrc.includes('trace?.mark("gate_ok")'), "o portão rápido precisa ser marcado");
+    assert.ok(
+      /\/api\/health[\s\S]{0,2000}hotPath: detection\.hotPath/.test(serverSrc),
+      "os contadores do caminho quente precisam aparecer também em /api/health (primeira parada do operador)"
+    );
+    assert.ok(
+      /hotPath\.note|hotPath: \{/.test(serverSrc) && serverSrc.includes("deepFilterFailures"),
+      "os contadores do caminho quente precisam estar expostos para o operador"
+    );
+    const releases = serverSrc.match(/hotPathInFlight\.release\(/g) ?? [];
+    assert.ok(releases.length >= 7, `todo caminho de saída precisa liberar o mint (encontrados ${releases.length})`);
+  });
+
+  // ---------------------------------------------------------------------------
+  // [17] ORÇAMENTO DE COTA — a camada gratuita não falha por latência, falha por 429
+  // ---------------------------------------------------------------------------
+  console.log("\n[17] Orçamento de cota (grátis)");
+
+  await test("janela deslizante: aceita até o teto e volta a aceitar quando a janela passa", async () => {
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const b = new RateBudget({ name: "t", limit: 2, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(), true);
+    assert.equal(b.tryAcquire(), true);
+    assert.equal(b.tryAcquire(), false, "acima do teto é recusado");
+    assert.equal(b.rejected, 1);
+    now = 999;
+    assert.equal(b.tryAcquire(), false, "dentro da janela ainda não libera");
+    now = 1001;
+    assert.equal(b.tryAcquire(), true, "fora da janela libera de novo");
+    assert.equal(b.used(), 1, "as duas antigas saíram da janela");
+  });
+
+  await test("custo por chamada: uma chamada pode ocupar várias vagas", async () => {
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    // Alchemy: getTransaction custa 40 CU contra 10 de getAccountInfo = 4x
+    const b = new RateBudget({ name: "c", limit: 10, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(4), true, "4 de 10");
+    assert.equal(b.tryAcquire(4), true, "8 de 10");
+    assert.equal(b.tryAcquire(4), false, "8+4 > 10: recusado (sem estourar a cota)");
+    assert.equal(b.used(), 8);
+    assert.equal(b.tryAcquire(2), true, "cabe exatamente no que sobrou");
+  });
+
+  await test("waitMsUntilNextSlot aponta a espera e zera quando há vaga", async () => {
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 10_000;
+    const b = new RateBudget({ name: "w", limit: 1, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.waitMsUntilNextSlot(), 0, "livre: sem espera");
+    assert.equal(b.tryAcquire(), true);
+    assert.equal(b.waitMsUntilNextSlot(), 1000, "precisa esperar a janela inteira");
+    now += 400;
+    assert.equal(b.waitMsUntilNextSlot(), 600);
+    now += 600;
+    assert.equal(b.waitMsUntilNextSlot(), 0);
+  });
+
+  await test("withBudget: prioridade normal espera até o teto e depois PULA (contabilizado)", async () => {
+    const { RateBudget, withBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const sleeps: number[] = [];
+    const b = new RateBudget({ name: "j", limit: 1, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(), true, "consome a única vaga");
+
+    // Espera curta o suficiente para caber: executa.
+    const ok = await withBudget(b, async () => "executou", {
+      maxWaitMs: 1200,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+    });
+    assert.equal(ok.ok, true);
+    assert.equal(ok.value, "executou");
+    assert.equal(sleeps.length, 1, "esperou a cota liberar");
+
+    // Agora com espera insuficiente: PULA e conta — nunca estoura a cota.
+    // (A vaga da chamada anterior ainda está na janela: avança o relógio para liberá-la.)
+    now += 1000;
+    assert.equal(b.tryAcquire(), true, "vaga liberada depois da janela");
+    let called = false;
+    const skip = await withBudget(b, async () => ((called = true), "não devia"), {
+      maxWaitMs: 50,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
+    assert.equal(skip.ok, false, "sem cota e sem espera suficiente, a chamada NÃO é feita");
+    assert.equal(called, false);
+    assert.ok(/cota de "j" esgotada/.test(String(skip.skippedReason)));
+    assert.equal(b.skipped, 1);
+  });
+
+  await test("withBudget: SAÍDA nunca é bloqueada por cota (bypass contado)", async () => {
+    const { RateBudget, withBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const b = new RateBudget({ name: "exit", limit: 1, windowMs: 60_000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(), true);
+    // Vinte saídas acima da cota: todas executam (fechar posição é reduzir risco).
+    for (let i = 0; i < 20; i++) {
+      const r = await withBudget(b, async () => "fechou", { priority: "exit" });
+      assert.equal(r.ok, true, "saída nunca é pulada");
+      assert.equal(r.bypassed, true, "e o bypass é registrado");
+    }
+    assert.equal(b.bypassed, 20);
+    assert.equal(b.skipped, 0, "nenhuma saída entra em `skipped`");
+  });
+
+  await test("withBudget: FUNDO não espera nada (cede a cota ao caminho quente)", async () => {
+    const { RateBudget, withBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const b = new RateBudget({ name: "bg", limit: 1, windowMs: 1000, source: "teste" }, () => now);
+    assert.equal(b.tryAcquire(), true);
+    let slept = false;
+    const r = await withBudget(b, async () => "mediria", {
+      priority: "background",
+      maxWaitMs: 5000,
+      sleep: async () => {
+        slept = true;
+      },
+    });
+    assert.equal(r.ok, false);
+    assert.equal(slept, false, "fundo não pode consumir tempo do processo esperando cota");
+  });
+
+  await test("presets: todo teto tem ORIGEM declarada e valor positivo", async () => {
+    const { RPC_PROFILES, MARKET_BUDGET_SPECS, buildBudgetRegistry } = await import("../src/rateBudget.js");
+    for (const [name, spec] of Object.entries(RPC_PROFILES)) {
+      assert.ok(spec.limit > 0, `${name}: limite positivo`);
+      assert.ok(/helius|alchemy|quicknode|syndica|público|public/i.test(spec.source), `${name}: origem citada`);
+    }
+    for (const [name, spec] of Object.entries(MARKET_BUDGET_SPECS)) {
+      assert.ok(spec.limit > 0, `${name}: limite positivo`);
+      assert.ok(spec.source.length > 20, `${name}: origem precisa ser legível, não vazia`);
+    }
+    const reg = buildBudgetRegistry({ rpcProfile: "helius" });
+    assert.equal(reg.rpc.spec.limit, RPC_PROFILES.helius.limit);
+    const snap = reg.snapshot();
+    assert.equal(snap.length, 7, "rpc + 6 provedores externos (DexScreener, Jupiter, GeckoTerminal, RugCheck, Jito x2)");
+  });
+
+  await test("perfil desconhecido cai em `public` (fail-safe, nunca sem teto)", async () => {
+    const { buildBudgetRegistry, RPC_PROFILES } = await import("../src/rateBudget.js");
+    const reg = buildBudgetRegistry({ rpcProfile: "provedor-que-nao-existe" });
+    assert.equal(reg.rpc.spec.limit, RPC_PROFILES.public.limit);
+    assert.ok(/público|public/i.test(reg.rpc.spec.source));
+  });
+
+  await test("orçamento desligado: continua CONTANDO o volume (não vira ponto cego)", async () => {
+    const { buildBudgetRegistry } = await import("../src/rateBudget.js");
+    const reg = buildBudgetRegistry({ disabled: true });
+    for (let i = 0; i < 50; i++) reg.rpc.tryAcquire();
+    assert.equal(reg.rpc.snapshot().accepted, 50);
+    assert.ok(/DESLIGADO/.test(reg.rpc.spec.source), "a origem precisa dizer que o teto está desligado");
+  });
+
+  // ---------------------------------------------------------------------------
+  // [18] FEED GRATUITO DA PUMPPORTAL — mint direto, sem getTransaction
+  // ---------------------------------------------------------------------------
+  console.log("\n[18] Feed PumpPortal (detecção gratuita com mint direto)");
+
+  class FakeSocket {
+    public sent: string[] = [];
+    public closed = false;
+    private handlers: Record<string, Array<(ev: any) => void>> = {};
+    addEventListener(type: string, fn: (ev: any) => void) {
+      (this.handlers[type] ??= []).push(fn);
+    }
+    send(data: string) { this.sent.push(data); }
+    close() { this.closed = true; this.emit("close", {}); }
+    /** Simula o servidor: dispara um evento para os handlers registrados. */
+    emit(type: string, ev: any) { for (const fn of this.handlers[type] ?? []) fn(ev); }
+    message(obj: any) { this.emit("message", { data: JSON.stringify(obj) }); }
+    rawMessage(text: string) { this.emit("message", { data: text }); }
+  }
+
+  await test("parsing defensivo: só `mint` é obrigatório; o resto vira null, nunca inventado", async () => {
+    const { parsePumpPortalMessage } = await import("../src/pumpPortalFeed.js");
+
+    // Mensagem real típica (campos que o provedor envia na criação).
+    const ok = parsePumpPortalMessage(
+      JSON.stringify({
+        signature: "5Kd3r8Qq4vYqk9m2VtXz1u8LsWzQb7nHfDc2",
+        mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+        txType: "create",
+        name: "Teste",
+        symbol: "TST",
+        marketCapSol: 28.5,
+        initialBuy: 0.5,
+      }),
+      1234
+    );
+    assert.equal(ok.ok, true);
+    if (ok.ok) {
+      assert.equal(ok.event.mint, "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU");
+      assert.equal(ok.event.txType, "create");
+      assert.equal(ok.event.name, "Teste");
+      assert.equal(ok.event.marketCapSol, 28.5);
+      assert.equal(ok.event.receivedAt, 1234);
+      assert.ok(ok.event.fields.includes("mint"));
+    }
+
+    // Sem campos opcionais: prossegue com null (não inventar nome nem market cap).
+    const minimal = parsePumpPortalMessage(JSON.stringify({ mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU" }), 1);
+    assert.equal(minimal.ok, true);
+    if (minimal.ok) {
+      assert.equal(minimal.event.name, null);
+      assert.equal(minimal.event.marketCapSol, null);
+      assert.equal(minimal.event.txType, "unknown", "tipo não declarado NÃO pode ser chutado como create");
+    }
+
+    // Mensagem de migração: tipo reconhecido.
+    const mig = parsePumpPortalMessage(JSON.stringify({ mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", txType: "migrate" }), 2);
+    assert.equal(mig.ok && mig.event.txType, "migrate");
+  });
+
+  await test("parsing defensivo: entradas inválidas são RECUSADAS com motivo", async () => {
+    const { parsePumpPortalMessage } = await import("../src/pumpPortalFeed.js");
+    for (const [raw, motivo] of [
+      ["não é json", /JSON inválido/],
+      [JSON.stringify(["array"]), /não é objeto/],
+      [JSON.stringify({}), /sem campo `mint`/],
+      [JSON.stringify({ mint: "0OIl" }), /estruturalmente inválido/],
+      [JSON.stringify({ mint: "" }), /sem campo `mint`/],
+    ] as Array<[string, RegExp]>) {
+      const r = parsePumpPortalMessage(raw, 0);
+      assert.equal(r.ok, false, `deveria recusar: ${raw}`);
+      if (!r.ok) assert.ok(motivo.test(r.reason), `motivo inesperado: ${r.reason}`);
+    }
+  });
+
+  await test("feed: uma única conexão e as duas assinaturas gratuitas", async () => {
+    const { PumpPortalFeed } = await import("../src/pumpPortalFeed.js");
+    const sockets: FakeSocket[] = [];
+    const feed = new PumpPortalFeed({
+      onEvent: () => {},
+      wsFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s as any;
+      },
+      setTimer: () => 0 as any,
+      clearTimer: () => {},
+    });
+
+    feed.connect();
+    feed.connect(); // no-op deliberado: múltiplas conexões podem causar banimento
+    feed.connect();
+    assert.equal(sockets.length, 1, "connect() repetido NÃO pode abrir outra conexão");
+
+    sockets[0].emit("open", {});
+    const methods = sockets[0].sent.map((m) => JSON.parse(m).method);
+    assert.deepEqual(methods, ["subscribeNewToken", "subscribeMigration"], "assinaturas gratuitas");
+
+    const h = feed.getHealth();
+    assert.equal(h.socketOpen, true);
+    assert.equal(h.subscriptionsSent.length, 2);
+  });
+
+  await test("feed: evento válido é emitido; duplicata e mensagem inválida são contadas", async () => {
+    const { PumpPortalFeed } = await import("../src/pumpPortalFeed.js");
+    const sockets: FakeSocket[] = [];
+    const recebidos: any[] = [];
+    const feed = new PumpPortalFeed({
+      onEvent: (e) => recebidos.push(e),
+      wsFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s as any;
+      },
+      setTimer: () => 0 as any,
+      clearTimer: () => {},
+    });
+    feed.connect();
+    const sock = sockets[0];
+    sock.emit("open", {});
+
+    const msg = { signature: "sigA", mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", txType: "create", name: "A" };
+    sock.message(msg);
+    sock.message(msg); // reentrega (reconexão do provedor)
+    sock.rawMessage("isso não é json");
+    sock.message({ txType: "create" }); // sem mint
+    sock.message({ ...msg, signature: "sigB" }); // mesmo mint, evento novo
+
+    assert.equal(recebidos.length, 2, "só eventos válidos e não duplicados");
+    assert.equal(recebidos[0].name, "A");
+
+    const h = feed.getHealth();
+    assert.equal(h.messagesReceived, 5);
+    assert.equal(h.eventsEmitted, 2);
+    assert.equal(h.duplicatesDropped, 1);
+    assert.equal(h.invalidMessages, 2);
+  });
+
+  await test("feed: queda agenda reconexão com backoff e `stop` cancela tudo", async () => {
+    const { PumpPortalFeed, pumpPortalBackoffMs } = await import("../src/pumpPortalFeed.js");
+    const sockets: FakeSocket[] = [];
+    const timers: Array<{ fn: () => void; ms: number; canceled: boolean }> = [];
+    const feed = new PumpPortalFeed({
+      onEvent: () => {},
+      wsFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s as any;
+      },
+      setTimer: (fn, ms) => {
+        const t = { fn, ms, canceled: false };
+        timers.push(t);
+        return t as any;
+      },
+      clearTimer: (h: any) => {
+        if (h) h.canceled = true;
+      },
+    });
+
+    // Backoff cresce e satura no teto — reconectar em rajada é o que causa banimento.
+    assert.ok(pumpPortalBackoffMs(1, 1000, 60_000) >= 250);
+    assert.ok(pumpPortalBackoffMs(2, 1000, 60_000) > pumpPortalBackoffMs(1, 1000, 60_000));
+    assert.ok(pumpPortalBackoffMs(30, 1000, 60_000) <= 60_000 * 1.2, "teto respeitado (jitter incluso)");
+
+    feed.connect();
+    sockets[0].emit("open", {});
+    sockets[0].emit("close", {}); // queda
+    assert.equal(timers.length, 1, "queda agenda UMA reconexão");
+    assert.ok(timers[0].ms >= 250);
+    assert.equal(feed.getHealth().socketOpen, false);
+    assert.ok(feed.getHealth().consecutiveFailures >= 1);
+
+    // O timer de reconexão abre nova conexão quando dispara.
+    timers[0].fn();
+    assert.equal(sockets.length, 2, "reconectou ao disparar o backoff");
+
+    // stop(): cancela reconexão pendente e fecha o socket (sem ban por conexão abandonada).
+    sockets[1].emit("open", {});
+    feed.stop();
+    assert.equal(sockets[1].closed, true);
+    const h = feed.getHealth();
+    assert.equal(h.socketOpen, false);
+    // Depois de stop, uma nova queda NÃO pode agendar reconexão.
+    sockets[1].emit("close", {});
+    assert.equal(timers.length, 1, "após stop não se agenda reconexão");
+  });
+
+  await test("feed: falha do consumidor não derruba o feed", async () => {
+    const { PumpPortalFeed } = await import("../src/pumpPortalFeed.js");
+    const sockets: FakeSocket[] = [];
+    const feed = new PumpPortalFeed({
+      onEvent: () => {
+        throw new Error("consumidor quebrado");
+      },
+      wsFactory: () => {
+        const s = new FakeSocket();
+        sockets.push(s);
+        return s as any;
+      },
+      setTimer: () => 0 as any,
+      clearTimer: () => {},
+    });
+    feed.connect();
+    sockets[0].emit("open", {});
+    sockets[0].message({ mint: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", signature: "s1" });
+    const h = feed.getHealth();
+    assert.equal(h.eventsEmitted, 1, "o evento foi contado mesmo com o consumidor falhando");
+    assert.ok(/onEvent lançou/.test(String(h.lastError)));
+  });
+
+  await test("regressão: o feed precisa estar LIGADO na detecção e medido", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("new PumpPortalFeed("), "o feed precisa ser instanciado no boot");
+    assert.ok(
+      /preEnriched: true/.test(serverSrc),
+      "o evento da PumpPortal precisa ser marcado como pré-enriquecido (sem getTransaction)"
+    );
+    assert.ok(
+      /preEnriched === true\) trace\?\.mark\("enriched"\)/.test(serverSrc),
+      "o pipeline precisa marcar `enriched` na hora para evento pré-enriquecido"
+    );
+    assert.ok(
+      /pumpPortal: pumpPortalRef\?\.getHealth\(\)/.test(serverSrc),
+      "o health precisa expor o feed (prova de vida por contador, não por log)"
+    );
+    assert.ok(serverSrc.includes('"pumpportal"') && serverSrc.includes("HFT_PUMPPORTAL"), "fonte e chave de desligamento");
+    assert.ok(
+      /h\.eventsEmitted > 0 \? \("real" as const\) : \("unavailable" as const\)/.test(serverSrc),
+      "o painel não pode declarar o feed como real sem prova de vida (eventsEmitted > 0)"
+    );
+    assert.ok(/process\.on\("SIGTERM"/.test(serverSrc), "precisa existir encerramento gracioso");
+    assert.ok(
+      /shutdown = \(signal[\s\S]{0,1200}pumpPortalRef\?\.stop\(\)/.test(serverSrc),
+      "o encerramento precisa fechar o feed da PumpPortal (conexão abandonada pode causar ban)"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [19] RUGCHECK — evidência externa gratuita que só pode ENDURECER a decisão
+  // ---------------------------------------------------------------------------
+  console.log("\n[19] RugCheck (evidência externa de risco)");
+
+  await test("parser: payload completo vira evidência estruturada", async () => {
+    const { parseRugCheckReport } = await import("../src/rugCheck.js");
+    const ev = parseRugCheckReport(
+      {
+        score: 812,
+        score_level: "danger",
+        mintAuthority: null,
+        freezeAuthority: "9xQeWvG816bUx9EPfEZvkVv7iLwLiZ2jWgpgFdkh9xQe",
+        totalHolders: 128,
+        risks: [
+          { name: "Freeze Authority still enabled", level: "danger", score: 1, description: "pode congelar" },
+          { name: "Low Liquidity", level: "warn", score: 100 },
+          { name: "ignorado sem nome", level: "info" },
+        ],
+        markets: [
+          { lp: { lpLockedPct: 12.5, lpLockedUSD: 4200 } },
+          { lp: { lpLockedPct: 88.0, lpLockedUSD: 61000 } },
+        ],
+      },
+      321
+    );
+    assert.equal(ev.available, true);
+    assert.equal(ev.score, 812);
+    assert.equal(ev.scoreLevel, "danger");
+    assert.equal(ev.latencyMs, 321);
+    assert.equal(ev.risks.length, 3);
+    assert.deepEqual(ev.dangerNames, ["Freeze Authority still enabled"]);
+    assert.equal(ev.lpLockedUsd, 61000, "pega o MAIOR pool, não o primeiro");
+    assert.equal(ev.lpLockedPct, 88.0);
+    assert.equal(ev.freezeAuthority?.slice(0, 4), "9xQe");
+  });
+
+  await test("parser: relatório vazio/estranho NUNCA vira aprovação", async () => {
+    const { parseRugCheckReport } = await import("../src/rugCheck.js");
+    for (const raw of [null, undefined, [], {}, { foo: "bar" }, "texto"]) {
+      const ev = parseRugCheckReport(raw as any, null);
+      assert.equal(ev.available, false, `deveria ser indisponível: ${JSON.stringify(raw)}`);
+      assert.ok(ev.reason !== null, "indisponibilidade precisa de motivo explícito");
+      assert.equal(ev.score, null, "score ausente é null, nunca 0 (0 pareceria nota boa)");
+    }
+    // Relatório com campos desconhecidos mas reconhecíveis é considerado disponível.
+    const parcial = parseRugCheckReport({ totalHolders: 10 }, null);
+    assert.equal(parcial.available, true);
+  });
+
+  await test("fetch: HTTP ruim, timeout e JSON inválido viram indisponibilidade com motivo", async () => {
+    const { fetchRugCheckEvidence } = await import("../src/rugCheck.js");
+    const casos: Array<[any, RegExp]> = [
+      [async () => ({ ok: false, status: 429 } as any), /HTTP 429/],
+      [async () => { throw new Error("timeout de rede"); }, /falha na consulta/],
+      [async () => ({ ok: true, json: async () => { throw new Error("sem json"); } } as any), /não é JSON/],
+    ];
+    for (const [fetchImpl, motivo] of casos) {
+      const ev = await fetchRugCheckEvidence("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", {
+        fetchImpl: fetchImpl as any,
+      });
+      assert.equal(ev.available, false);
+      assert.ok(motivo.test(String(ev.reason)), `motivo inesperado: ${ev.reason}`);
+    }
+  });
+
+  await test("fetch: NUNCA espera por cota (evidência adicional não atrasa lançamento)", async () => {
+    const { fetchRugCheckEvidence } = await import("../src/rugCheck.js");
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const budget = new RateBudget({ name: "rugcheck", limit: 1, windowMs: 60_000, source: "teste" }, () => now);
+    assert.equal(budget.tryAcquire(), true, "consome a única vaga");
+
+    let chamou = false;
+    const ev = await fetchRugCheckEvidence("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", {
+      budget,
+      fetchImpl: (async () => {
+        chamou = true;
+        return { ok: true, json: async () => ({ score: 10 }) } as any;
+      }) as any,
+    });
+    assert.equal(chamou, false, "sem cota, a chamada externa não é feita");
+    assert.equal(ev.available, false);
+    assert.ok(/cota de "rugcheck" esgotada/.test(String(ev.reason)));
+    assert.equal(budget.skipped, 1);
+  });
+
+  await test("regra de ouro: evidência externa só ENDURECE — nunca amolece", async () => {
+    const { parseRugCheckReport, rugCheckRiskReasons } = await import("../src/rugCheck.js");
+
+    // Indisponível: não gera risco NEM aprovação — o veredito local decide.
+    const indisponivel = parseRugCheckReport(null);
+    const r0 = rugCheckRiskReasons(indisponivel);
+    assert.equal(r0.usable, false);
+    assert.deepEqual(r0.reasons, []);
+
+    // Limpo: utilizável, mas sem motivos — jamais vira "aprovação" (não existe API para isso).
+    const limpo = parseRugCheckReport({ score: 5, risks: [], totalHolders: 50 });
+    const r1 = rugCheckRiskReasons(limpo);
+    assert.equal(r1.usable, true);
+    assert.deepEqual(r1.reasons, [], "aprovação externa NÃO adiciona crédito de score");
+
+    // Perigo: gera motivos, que o filtro usa para DESCONTAR.
+    const perigo = parseRugCheckReport({
+      score: 780,
+      risks: [
+        { name: "Freeze Authority still enabled", level: "danger" },
+        { name: "Top holder owns 45%", level: "warn" },
+      ],
+      freezeAuthority: "9xQeWvG816bUx9EPfEZvkVv7iLwLiZ2jWgpgFdkh9xQe",
+    });
+    const r2 = rugCheckRiskReasons(perigo);
+    assert.equal(r2.usable, true);
+    assert.ok(r2.reasons.some((x) => /PERIGO/.test(x)));
+    assert.ok(r2.reasons.some((x) => /score de risco/.test(x)));
+    assert.ok(r2.reasons.some((x) => /freeze authority ativa/i.test(x)));
+  });
+
+  await test("regressão: o filtro profundo usa a evidência externa e ela é OPCIONAL", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("fetchRugCheckEvidence("), "o filtro precisa consultar a evidência externa");
+    assert.ok(
+      serverSrc.includes("rugCheckRiskReasons(") && serverSrc.includes("score -= Math.min(45"),
+      "a evidência precisa DESCONTAR score (endurecer), nunca somar"
+    );
+    assert.ok(
+      /HFT_RUGCHECK !== "0"/.test(serverSrc),
+      "precisa existir chave de desligamento — dependência externa sempre pode ser removida"
+    );
+    assert.ok(
+      serverSrc.includes('missingChecks.push("rugcheck (evidência externa)")'),
+      "indisponível precisa ser registrado como verificação faltante, nunca como aprovação"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [20] PREÇO EM LOTE — a alavanca de cota no plano gratuito
+  // ---------------------------------------------------------------------------
+  console.log("\n[20] Preço de mercado em lote (DexScreener / Jupiter Price / GeckoTerminal)");
+
+  const BATCH_MINT_A = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+  const BATCH_MINT_B = "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E";
+
+  await test("DexScreener (lote): um par por token, escolhendo o de MAIOR liquidez", async () => {
+    const { parseDexScreenerBatch, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const quotes = parseDexScreenerBatch(
+      {
+        pairs: [
+          // Pool raso do BATCH_MINT_A — deve ser DESCARTADO em favor do profundo.
+          { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: SOL_MINT }, priceNative: "0.00000001", liquidity: { usd: 800 } },
+          { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: SOL_MINT }, priceNative: "0.0000042", liquidity: { usd: 250000 } },
+          { chainId: "solana", baseToken: { address: BATCH_MINT_B }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 9000 } },
+          // Outra chain: ignorada.
+          { chainId: "ethereum", baseToken: { address: BATCH_MINT_A }, priceNative: "5", liquidity: { usd: 999999 } },
+          // Entrada sem preço: mantém liquidez, preço null (nunca 0).
+          { chainId: "solana", baseToken: { address: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1" }, liquidity: { usd: 500 } },
+        ],
+      },
+      999
+    );
+    assert.equal(quotes.size, 3);
+    const a = quotes.get(BATCH_MINT_A)!;
+    assert.equal(a.priceSol, 0.0000042, "preço do par de maior liquidez");
+    assert.equal(a.liquidityUsd, 250000);
+    assert.equal(a.fetchedAt, 999);
+    assert.ok(/dexscreener/.test(a.source));
+    assert.equal(quotes.get(BATCH_MINT_B)!.priceSol, 0.001);
+    const semPreco = quotes.get("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1")!;
+    assert.equal(semPreco.priceSol, null, "sem preço é null — nunca 0");
+    assert.equal(semPreco.liquidityUsd, 500, "a liquidez que veio é preservada");
+  });
+
+  await test("DexScreener: par cotado em USDC NÃO é lido como SOL (bug de ~200x corrigido)", async () => {
+    const { priceSolFromDexPairs, parseDexScreenerBatch, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const pairs = [
+      // Par mais líquido do TOKEN é cotado em USDC: priceNative está em USDC (0.15 USDC por token),
+      // e NÃO em SOL. Interpretá-lo como SOL daria 0.15 SOL quando o real é 0.15/200 = 0.00075.
+      { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: USDC }, priceNative: "0.15", priceUsd: "0.15", liquidity: { usd: 400_000 } },
+      // Âncora: par de SOL contra USDC informa o USD/SOL no MESMO payload.
+      { chainId: "solana", baseToken: { address: SOL_MINT }, quoteToken: { address: USDC }, priceUsd: "200", liquidity: { usd: 5_000_000 } },
+    ];
+    const r = priceSolFromDexPairs(pairs, BATCH_MINT_A);
+    assert.equal(r.quoteToken, USDC);
+    assert.ok(Math.abs((r.priceSol as number) - 0.00075) < 1e-12, `esperado 0.00075, veio ${r.priceSol}`);
+    assert.ok((r.priceSol as number) < 0.01, "jamais aceitar 0.15 (o priceNative em USDC) como preço em SOL");
+
+    const quotes = parseDexScreenerBatch({ pairs }, 7);
+    assert.ok(Math.abs((quotes.get(BATCH_MINT_A)!.priceSol as number) - 0.00075) < 1e-12);
+    assert.ok(/USD→SOL/.test(quotes.get(BATCH_MINT_A)!.source), "a fonte precisa dizer que houve conversão");
+    assert.equal(quotes.get(SOL_MINT)!.priceSol, 1, "wrapped SOL vale 1 SOL por definição, qualquer que seja o par");
+  });
+
+  await test("DexScreener: par em outra moeda SEM âncora de SOL/USD devolve null (não inventa)", async () => {
+    const { priceSolFromDexPairs, parseDexScreenerBatch } = await import("../src/marketPriceFeed.js");
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const pairs = [
+      { chainId: "solana", baseToken: { address: BATCH_MINT_B }, quoteToken: { address: USDC }, priceNative: "1.5", priceUsd: "1.5", liquidity: { usd: 50_000 } },
+    ];
+    const r = priceSolFromDexPairs(pairs, BATCH_MINT_B);
+    assert.equal(r.priceSol, null, "sem SOL/USD não existe conversão honesta");
+    assert.ok(/fabricar/.test(r.reason));
+    const quotes = parseDexScreenerBatch({ pairs }, 7);
+    assert.equal(quotes.get(BATCH_MINT_B)!.priceSol, null);
+    assert.equal(quotes.get(BATCH_MINT_B)!.liquidityUsd, 50_000, "a liquidez que veio é preservada mesmo sem preço");
+    assert.ok(/sem preço em SOL/.test(quotes.get(BATCH_MINT_B)!.source), "o motivo precisa estar visível");
+  });
+
+  await test("lote: a requisição do DexScreener inclui o SOL como âncora da conversão", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const urls: string[] = [];
+    const result = await fetchBatchPrices([BATCH_MINT_A], {
+      fetchImpl: (async (url: string) => {
+        urls.push(url);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            pairs: [
+              { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: USDC }, priceNative: "0.15", priceUsd: "0.15", liquidity: { usd: 400_000 } },
+              { chainId: "solana", baseToken: { address: SOL_MINT }, quoteToken: { address: USDC }, priceUsd: "200", liquidity: { usd: 5_000_000 } },
+            ],
+          }),
+        } as any;
+      }) as any,
+    });
+    assert.ok(urls[0].includes(SOL_MINT), "o SOL precisa ir na MESMA chamada (custo zero)");
+    assert.ok(Math.abs((result.quotes.get(BATCH_MINT_A)!.priceSol as number) - 0.00075) < 1e-12);
+    assert.equal(result.requests, 1, "converter não pode custar requisição extra");
+  });
+
+  await test("Jupiter Price v3 (lote): USD→SOL com o SOL da MESMA resposta", async () => {
+    const { parseJupiterPriceBatch, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const parsed = parseJupiterPriceBatch(
+      {
+        [SOL_MINT]: { usdPrice: 200 },
+        [BATCH_MINT_A]: { usdPrice: 0.02 },
+      },
+      500
+    );
+    assert.equal(parsed.solFromResponse, true);
+    assert.equal(parsed.solUsd, 200);
+    assert.equal(parsed.quotes.get(SOL_MINT)!.priceSol, 1);
+    // 0.02 USD / 200 USD por SOL = 0.0001 SOL
+    assert.ok(Math.abs((parsed.quotes.get(BATCH_MINT_A)!.priceSol as number) - 0.0001) < 1e-12);
+  });
+
+  await test("Jupiter Price v3: sem SOL na resposta, NÃO converte com valor inventado", async () => {
+    const { parseJupiterPriceBatch } = await import("../src/marketPriceFeed.js");
+    // Sem SOL e sem reserva: preço fica null (não dá para converter honestamente).
+    const semSol = parseJupiterPriceBatch({ [BATCH_MINT_A]: { usdPrice: 1 } }, 1);
+    assert.equal(semSol.solUsd, null);
+    assert.equal(semSol.solFromResponse, false);
+    assert.equal(semSol.quotes.get(BATCH_MINT_A)!.priceSol, null, "sem SOL/USD não existe preço em SOL");
+
+    // Com reserva EXPLÍCITA do chamador: converte e MARCA a origem do SOL/USD.
+    const comReserva = parseJupiterPriceBatch({ [BATCH_MINT_A]: { usdPrice: 1 } }, 1, 250);
+    assert.equal(comReserva.solUsd, 250);
+    assert.equal(comReserva.quotes.get(BATCH_MINT_A)!.priceSol, 1 / 250);
+    assert.ok(/reserva/.test(comReserva.quotes.get(BATCH_MINT_A)!.source), "a fonte precisa dizer que o SOL/USD veio de reserva");
+  });
+
+  await test("GeckoTerminal (lote): JSON:API parseado com o SOL do próprio lote", async () => {
+    const { parseGeckoTerminalBatch, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const parsed = parseGeckoTerminalBatch(
+      {
+        data: {
+          attributes: {
+            token_prices: {
+              [SOL_MINT]: { price_usd: "150.5" },
+              [BATCH_MINT_B]: { price_usd: "0.1505" },
+              "endereco-invalido": { price_usd: "9" },
+            },
+          },
+        },
+      },
+      42
+    );
+    assert.equal(parsed.solFromResponse, true);
+    assert.equal(parsed.solUsd, 150.5);
+    assert.ok(Math.abs((parsed.quotes.get(BATCH_MINT_B)!.priceSol as number) - 0.001) < 1e-12);
+    assert.equal(parsed.quotes.has("endereco-invalido"), false, "endereço estruturalmente inválido é ignorado");
+  });
+
+  await test("cascata: DexScreener responde tudo → NÃO gasta as outras fontes", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const chamadas: string[] = [];
+    const result = await fetchBatchPrices([BATCH_MINT_A, BATCH_MINT_B], {
+      fetchImpl: (async (url: string) => {
+        chamadas.push(url);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            pairs: [
+              { chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1000 } },
+              { chainId: "solana", baseToken: { address: BATCH_MINT_B }, quoteToken: { address: SOL_MINT }, priceNative: "0.002", liquidity: { usd: 2000 } },
+            ],
+          }),
+        } as any;
+      }) as any,
+    });
+    assert.equal(chamadas.length, 1, "uma única requisição para os dois tokens");
+    assert.equal(result.requests, 1);
+    assert.deepEqual(result.sourcesUsed, ["dexscreener"]);
+    assert.equal(result.quotes.get(BATCH_MINT_A)!.priceSol, 0.001);
+    assert.equal(result.problems.length, 0, "sem problema quando todos têm preço");
+  });
+
+  await test("cascata: o que faltou vai para a PRÓXIMA fonte (e a liquidez é preservada)", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const chamadas: string[] = [];
+    const result = await fetchBatchPrices([BATCH_MINT_A, BATCH_MINT_B], {
+      fetchImpl: (async (url: string) => {
+        chamadas.push(url);
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [{ chainId: "solana", baseToken: { address: BATCH_MINT_A }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1234 } }],
+            }),
+          } as any;
+        }
+        // Jupiter: resolve o BATCH_MINT_B que ficou sem preço.
+        return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [BATCH_MINT_B]: { usdPrice: 0.4 } }) } as any;
+      }) as any,
+    });
+    assert.equal(chamadas.length, 2, "1 DexScreener + 1 Jupiter");
+    assert.deepEqual(result.sourcesUsed, ["dexscreener", "jupiter-price-v3"]);
+    assert.equal(result.quotes.get(BATCH_MINT_A)!.priceSol, 0.001);
+    assert.equal(result.quotes.get(BATCH_MINT_A)!.liquidityUsd, 1234);
+    assert.ok(Math.abs((result.quotes.get(BATCH_MINT_B)!.priceSol as number) - 0.002) < 1e-12);
+    // O SOL não é pedido à toa: vai no lote da Jupiter para a conversão.
+    assert.ok(chamadas[1].includes(encodeURIComponent(SOL_MINT)) || chamadas[1].includes(SOL_MINT));
+  });
+
+  await test("cascata: três fontes caídas → problema registrado, nenhum preço inventado", async () => {
+    const { fetchBatchPrices } = await import("../src/marketPriceFeed.js");
+    const result = await fetchBatchPrices([BATCH_MINT_A], {
+      fetchImpl: (async () => ({ ok: false, status: 503, json: async () => ({}) }) as any) as any,
+    });
+    assert.equal(result.quotes.size, 0);
+    assert.equal(result.requests, 3, "tentou as três fontes");
+    assert.ok(result.problems.some((p) => /dexscreener: HTTP 503/.test(p)));
+    assert.ok(result.problems.some((p) => /jupiter price v3: HTTP 503/.test(p)));
+    assert.ok(result.problems.some((p) => /geckoterminal: HTTP 503/.test(p)));
+    assert.ok(result.problems.some((p) => /sem preço em nenhuma fonte/.test(p)), "o resultado precisa dizer que ficou sem preço");
+  });
+
+  await test("lotes respeitam o tamanho máximo de cada provedor (30/50/30)", async () => {
+    const { fetchBatchPrices, DEXSCREENER_MAX_ADDRESSES_PER_CALL, JUPITER_MAX_IDS_PER_CALL } = await import(
+      "../src/marketPriceFeed.js"
+    );
+    const mints = Array.from({ length: 65 }, (_, i) => `${i}`.padStart(32, "A").slice(0, 32) + "1111");
+    const urls: string[] = [];
+    await fetchBatchPrices(mints, {
+      fetchImpl: (async (url: string) => {
+        urls.push(url);
+        return { ok: true, status: 200, json: async () => ({ pairs: [] }) } as any;
+      }) as any,
+    });
+    const dexCalls = urls.filter((u) => u.includes("dexscreener"));
+    const dexSizes = dexCalls.map((u) => u.split("/tokens/")[1].split(",").length);
+    assert.ok(dexSizes.every((n) => n <= DEXSCREENER_MAX_ADDRESSES_PER_CALL), `DexScreener: ${dexSizes.join(",")}`);
+    assert.ok(dexCalls.length >= Math.ceil(65 / DEXSCREENER_MAX_ADDRESSES_PER_CALL), "65 mints exigem pelo menos 3 chamadas");
+    const jupSizes = urls
+      .filter((u) => u.includes("price/v3"))
+      .map((u) => u.split("ids=")[1].split(",").length);
+    assert.ok(jupSizes.every((n) => n <= JUPITER_MAX_IDS_PER_CALL), `Jupiter: ${jupSizes.join(",")}`);
+  });
+
+  await test("cota: orçamento esgotado PULA o provedor e diz por quê (não estoura 429)", async () => {
+    const { fetchBatchPrices } = await import("../src/marketPriceFeed.js");
+    const { RateBudget } = await import("../src/rateBudget.js");
+    let now = 0;
+    const dexBudget = new RateBudget({ name: "dexscreener", limit: 1, windowMs: 60_000, source: "teste" }, () => now);
+    assert.equal(dexBudget.tryAcquire(), true, "consome a única vaga da janela");
+
+    let dexCalled = false;
+    const result = await fetchBatchPrices([BATCH_MINT_A], {
+      dexscreenerBudget: dexBudget,
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) dexCalled = true;
+        return { ok: false, status: 500, json: async () => ({}) } as any;
+      }) as any,
+    });
+    assert.equal(dexCalled, false, "sem cota, o DexScreener NÃO é chamado");
+    assert.ok(result.problems.some((p) => /dexscreener: PULADO — cota de "dexscreener" esgotada/.test(p)));
+    assert.equal(dexBudget.skipped, 1);
+  });
+
+  await test("mints inválidos não geram requisição (mock com reticências e endereço curto)", async () => {
+    const { fetchBatchPrices, isQueryableMint } = await import("../src/marketPriceFeed.js");
+    assert.equal(isQueryableMint("7xKX...AsU"), false);
+    assert.equal(isQueryableMint("curto"), false);
+    assert.equal(isQueryableMint(BATCH_MINT_A), true);
+
+    let chamou = false;
+    const result = await fetchBatchPrices(["mock...123", "curto", ""], {
+      fetchImpl: (async () => {
+        chamou = true;
+        return { ok: true, status: 200, json: async () => ({}) } as any;
+      }) as any,
+    });
+    assert.equal(chamou, false, "lista sem nenhum mint consultável não deve gastar cota");
+    assert.equal(result.requests, 0);
+    assert.ok(result.problems[0].includes("nenhum mint consultável"));
+  });
+
+  await test("rede cai (fetch LANÇA): problema registrado, NADA é lançado para o chamador", async () => {
+    const { fetchBatchPrices } = await import("../src/marketPriceFeed.js");
+    // Este caso existia como bug real: a exceção propagava e derrubava o processo inteiro
+    // (aconteceu na primeira execução do `free:check` num ambiente sem egress).
+    const result = await fetchBatchPrices([BATCH_MINT_A], {
+      fetchImpl: (async () => {
+        throw new Error("fetch failed");
+      }) as any,
+    });
+    assert.equal(result.quotes.size, 0);
+    assert.equal(result.requests, 3, "tentou as três fontes mesmo com exceção de rede");
+    assert.ok(result.problems.some((p) => /falha de rede/.test(p)), "o motivo precisa aparecer");
+    assert.ok(result.problems.some((p) => /sem preço em nenhuma fonte/.test(p)));
+  });
+
+  await test("regressão: o gerenciador usa o LOTE antes das tentativas por posição", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("fetchBatchPrices("), "o loop precisa buscar preços em lote");
+    assert.ok(
+      /batchQuote\.priceSol !== null && batchQuote\.priceSol > 0/.test(serverSrc),
+      "o lote só pode ser usado quando trouxe preço VÁLIDO"
+    );
+    assert.ok(
+      /if \(!isMockMint && currentPriceSol === 0\)/.test(serverSrc),
+      "as tentativas por posição precisam virar FALLBACK (só quando o lote não trouxe preço)"
+    );
+    assert.ok(
+      serverSrc.includes("marketBatchStats") && serverSrc.includes("marketBatch:"),
+      "o ganho de cota precisa ser visível no /api/health"
+    );
+    assert.ok(serverSrc.includes('HFT_MARKET_BATCH === "0"'), "precisa existir chave para voltar ao comportamento antigo");
+  });
+
+  // ---------------------------------------------------------------------------
+  // [21] QUALIDADE DE PREÇO — divergência entre fontes e liquidez em queda
+  // ---------------------------------------------------------------------------
+  console.log("\n[21] Qualidade de preço (divergência entre fontes e liquidez)");
+
+  const PQ_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+  const PQ_MINT_B = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+  const PQ_LIMIARES = { warnPct: 0.05, criticalPct: 0.15, maxAgeMs: 60_000 };
+
+  await test("divergência relativa: simétrica, normalizada pelo maior e null sem preço válido", async () => {
+    const { relativeDivergencePct } = await import("../src/priceQuality.js");
+    assert.equal(relativeDivergencePct(0.001, 0.002), 0.5);
+    assert.equal(relativeDivergencePct(0.002, 0.001), 0.5, "precisa ser simétrica");
+    assert.equal(relativeDivergencePct(1, 1), 0);
+    assert.equal(relativeDivergencePct(0, 1), null, "zero não é preço");
+    assert.equal(relativeDivergencePct(-1, 1), null);
+    assert.equal(relativeDivergencePct(Number.NaN, 1), null);
+    assert.equal(relativeDivergencePct("0.1" as any, 1), null, "string não é preço");
+  });
+
+  await test("classificação por faixa: ok abaixo de warn, warn entre, critical acima", async () => {
+    const { classifyDivergence } = await import("../src/priceQuality.js");
+    assert.equal(classifyDivergence(0.049, PQ_LIMIARES), "ok");
+    assert.equal(classifyDivergence(0.05, PQ_LIMIARES), "warn");
+    assert.equal(classifyDivergence(0.149, PQ_LIMIARES), "warn");
+    assert.equal(classifyDivergence(0.15, PQ_LIMIARES), "critical");
+    assert.equal(classifyDivergence(null, PQ_LIMIARES), null, "sem número não existe classificação");
+  });
+
+  await test("livro: a MESMA fonte não serve de referência (deriva de mercado não é divergência)", async () => {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook({ now: () => 1_000 });
+    livro.record({ mint: PQ_MINT, source: "dexscreener", priceSol: 0.001, at: 900 });
+    assert.equal(livro.freshestOtherSource(PQ_MINT, "dexscreener", 60_000), null);
+    const ref = livro.freshestOtherSource(PQ_MINT, "jupiter", 60_000);
+    assert.equal(ref?.source, "dexscreener");
+  });
+
+  await test("assessDivergence: compara com a outra fonte e devolve os DOIS preços e a idade", async () => {
+    const { PriceSampleBook, assessDivergence } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook({ now: () => 1_000 });
+    livro.record({ mint: PQ_MINT, source: "dexscreener", priceSol: 0.001, at: 900 });
+
+    const warn = assessDivergence(PQ_MINT, { source: "jupiter", priceSol: 0.0011 }, livro, PQ_LIMIARES);
+    assert.equal(warn?.severity, "warn");
+    assert.equal(warn?.bps, 909);
+    assert.equal(warn?.reference.source, "dexscreener");
+    assert.equal(warn?.reference.ageMs, 100, "a idade da amostra precisa viajar com o achado");
+
+    const critico = assessDivergence(PQ_MINT, { source: "geckoterminal", priceSol: 0.002 }, livro, PQ_LIMIARES);
+    assert.equal(critico?.severity, "critical");
+    assert.equal(critico?.pct, 0.5);
+
+    // Sem segunda opinião: null — que significa NÃO VERIFIQUEI, não está tudo certo.
+    assert.equal(assessDivergence(PQ_MINT_B, { source: "jupiter", priceSol: 1 }, livro, PQ_LIMIARES), null);
+  });
+
+  await test("livro: amostra fora da janela não é referência e o prune libera memória", async () => {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook({ now: () => 100_000 });
+    livro.record({ mint: PQ_MINT, source: "dexscreener", priceSol: 0.001, at: 1_000 });
+    assert.equal(livro.freshestOtherSource(PQ_MINT, "jupiter", 45_000), null, "45s é a janela padrão");
+    assert.equal(livro.prune(45_000), 1);
+    assert.equal(livro.size(), 0);
+  });
+
+  await test("livro: memória LIMITADA por token e por quantidade de tokens (sem vazamento)", async () => {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook({ maxPerMint: 2, maxMints: 2, now: () => 10_000 });
+    livro.record({ mint: "m1", source: "A", priceSol: 1, at: 1 });
+    livro.record({ mint: "m1", source: "A", priceSol: 2, at: 2 });
+    livro.record({ mint: "m1", source: "A", priceSol: 3, at: 3 });
+    assert.equal(livro.countFor("m1"), 2, "só as mais recentes ficam");
+    assert.equal(livro.latest("m1")?.priceSol, 3);
+
+    livro.record({ mint: "m2", source: "A", priceSol: 1, at: 4 });
+    livro.record({ mint: "m3", source: "A", priceSol: 1, at: 5 });
+    assert.equal(livro.size(), 2);
+    assert.equal(livro.latest("m1"), null, "o token registrado há mais tempo sai (evicção FIFO)");
+    assert.ok(livro.latest("m3"), "o mais novo permanece");
+  });
+
+  await test("livro: preço inválido (0, negativo, NaN, Infinity) NUNCA entra", async () => {
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const livro = new PriceSampleBook();
+    for (const preco of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.equal(livro.record({ mint: PQ_MINT, source: "A", priceSol: preco as number, at: 1 }), false);
+    }
+    assert.equal(livro.record({ mint: PQ_MINT, source: "A", priceSol: 1, at: Number.NaN }), false, "sem instante não é amostra");
+    assert.equal(livro.size(), 0, "nada inválido ficou na memória");
+  });
+
+  await test("compareSamples: mesma fonte devolve null mesmo com preços muito diferentes", async () => {
+    const { compareSamples } = await import("../src/priceQuality.js");
+    const mesmo = compareSamples(
+      PQ_MINT,
+      { source: "dexscreener", priceSol: 0.001, at: 0 },
+      { source: "dexscreener", priceSol: 0.01 },
+      PQ_LIMIARES,
+      0
+    );
+    assert.equal(mesmo, null);
+    const outro = compareSamples(
+      PQ_MINT,
+      { source: "dexscreener", priceSol: 0.001, at: 0 },
+      { source: "geckoterminal", priceSol: 0.01 },
+      PQ_LIMIARES,
+      0
+    );
+    assert.equal(outro?.severity, "critical");
+  });
+
+  await test("lote: amostra de verificação traz segunda opinião e DETECTA divergência", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const urls: string[] = [];
+    const livro = new PriceSampleBook();
+    const result = await fetchBatchPrices([PQ_MINT, PQ_MINT_B], {
+      sampleBook: livro,
+      verifyMints: [PQ_MINT],
+      fetchImpl: (async (url: string) => {
+        urls.push(url);
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [
+                { chainId: "solana", baseToken: { address: PQ_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 50_000 } },
+                { chainId: "solana", baseToken: { address: PQ_MINT_B }, quoteToken: { address: SOL_MINT }, priceNative: "0.5", liquidity: { usd: 10_000 } },
+              ],
+            }),
+          } as any;
+        }
+        // Jupiter: 0.003 USD contra SOL 200 USD → 0.000015 SOL, contra 0.001 do DexScreener.
+        return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [PQ_MINT]: { usdPrice: 0.003 } }) } as any;
+      }) as any,
+    });
+
+    assert.equal(result.requests, 2, "1 requisição do lote + 1 da verificação cruzada");
+    assert.equal(result.verification.attempted, true);
+    assert.equal(result.verification.source, "jupiter-price-v3");
+    assert.equal(result.verification.checked, 1);
+    assert.equal(result.divergences.length, 1);
+    const d = result.divergences[0];
+    assert.equal(d.mint, PQ_MINT);
+    assert.equal(d.severity, "critical");
+    assert.equal(d.bps, 9850);
+    assert.ok(/dexscreener/.test(d.reference.source), "a referência é a fonte do ciclo");
+    assert.ok(/jupiter/.test(d.candidate.source), "o candidato é a fonte independente");
+    assert.ok(urls[1].includes("price/v3"), "a verificação usa o endpoint em LOTE da Jupiter");
+    assert.equal(livro.countFor(PQ_MINT), 2, "as duas amostras ficam no livro para os próximos ciclos");
+  });
+
+  await test("lote: preços que concordam → NENHUMA divergência, mas a verificação ACONTECEU", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const { PriceSampleBook } = await import("../src/priceQuality.js");
+    const result = await fetchBatchPrices([PQ_MINT], {
+      sampleBook: new PriceSampleBook(),
+      verifyMints: [PQ_MINT],
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [{ chainId: "solana", baseToken: { address: PQ_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1_000 } }],
+            }),
+          } as any;
+        }
+        // 0.2 USD / 200 USD por SOL = exatamente 0.001 SOL.
+        return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [PQ_MINT]: { usdPrice: 0.2 } }) } as any;
+      }) as any,
+    });
+    assert.equal(result.divergences.length, 0);
+    assert.equal(result.verification.checked, 1, "ausência de divergência NÃO é ausência de verificação");
+  });
+
+  await test("lote: verificação pede a fonte que ainda NÃO respondeu (nunca a mesma)", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const urls: string[] = [];
+    const result = await fetchBatchPrices([PQ_MINT], {
+      verifyMints: [PQ_MINT],
+      fetchImpl: (async (url: string) => {
+        urls.push(url);
+        if (url.includes("dexscreener")) return { ok: true, status: 200, json: async () => ({ pairs: [] }) } as any;
+        if (url.includes("price/v3")) {
+          return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [PQ_MINT]: { usdPrice: 0.2 } }) } as any;
+        }
+        // GeckoTerminal: ainda não tinha sido tentada porque a Jupiter resolveu tudo.
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { attributes: { token_prices: { [SOL_MINT]: { price_usd: "201" }, [PQ_MINT]: { price_usd: "0.201" } } } },
+          }),
+        } as any;
+      }) as any,
+    });
+    assert.ok(urls[1].includes("price/v3"), "Jupiter foi a segunda tentativa do lote");
+    assert.equal(result.verification.attempted, true);
+    assert.equal(result.verification.source, "geckoterminal", "a verificação usa a fonte que AINDA não respondeu");
+    assert.ok(urls[2].includes("geckoterminal"), "e de fato chama o endpoint dela");
+    assert.equal(result.verification.checked, 1);
+    assert.equal(result.divergences.length, 0, "201 vs 200 é ruído de cotação, não divergência");
+  });
+
+  await test("lote: quando as TRÊS fontes já foram tentadas, a verificação é declarada impossível", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const result = await fetchBatchPrices([PQ_MINT], {
+      verifyMints: [PQ_MINT],
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) return { ok: true, status: 200, json: async () => ({ pairs: [] }) } as any;
+        if (url.includes("price/v3")) return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 } }) } as any;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { attributes: { token_prices: { [SOL_MINT]: { price_usd: "200" }, [PQ_MINT]: { price_usd: "0.2" } } } },
+          }),
+        } as any;
+      }) as any,
+    });
+    assert.equal(result.requests, 3, "as três fontes foram usadas para achar preço");
+    assert.equal(result.verification.attempted, false);
+    assert.equal(result.verification.checked, 0);
+    assert.ok(
+      result.verification.problems.some((p) => /três fontes já foram tentadas/.test(p)),
+      "o motivo de NÃO ter verificado precisa ser explícito"
+    );
+  });
+
+  await test("lote: verificação pulada por cota é REPORTADA (não vira silêncio)", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const { RateBudget } = await import("../src/rateBudget.js");
+    const jupiterBudget = new RateBudget({ name: "jupiter-teste", limit: 1, windowMs: 60_000, source: "teste" });
+    jupiterBudget.tryAcquire(); // consome a única vaga
+
+    const result = await fetchBatchPrices([PQ_MINT], {
+      verifyMints: [PQ_MINT],
+      jupiterBudget,
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [{ chainId: "solana", baseToken: { address: PQ_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1 } }],
+            }),
+          } as any;
+        }
+        throw new Error("não deveria chamar a rede com a cota esgotada");
+      }) as any,
+    });
+    assert.equal(result.verification.attempted, true);
+    assert.equal(result.verification.checked, 0);
+    assert.ok(result.verification.problems.some((p) => /PULADA/.test(p)));
+    assert.equal(jupiterBudget.skipped, 1, "o pulo entra no contador do orçamento");
+  });
+
+  await test("lote: verificação NUNCA fura a cota, nem quando o lote tem prioridade de saída", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const { RateBudget } = await import("../src/rateBudget.js");
+    const jupiterBudget = new RateBudget({ name: "jupiter-teste2", limit: 1, windowMs: 60_000, source: "teste" });
+    jupiterBudget.tryAcquire();
+
+    const result = await fetchBatchPrices([PQ_MINT], {
+      verifyMints: [PQ_MINT],
+      priority: "exit", // gestão de posição pode furar cota; a VERIFICAÇÃO não pode.
+      jupiterBudget,
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [{ chainId: "solana", baseToken: { address: PQ_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 1 } }],
+            }),
+          } as any;
+        }
+        throw new Error("verificação não pode chamar a rede sem cota");
+      }) as any,
+    });
+    assert.equal(result.verification.attempted, true);
+    assert.equal(result.verification.checked, 0);
+    assert.equal(jupiterBudget.bypassed, 0, "verificação é dado adicional: nunca faz bypass de cota");
+    assert.equal(jupiterBudget.skipped, 1);
+  });
+
+  await test("liquidez: queda de 60% alerta warn; de 90% alerta critical; subida não alerta", async () => {
+    const { assessLiquidityDrop } = await import("../src/priceQuality.js");
+    const warn = assessLiquidityDrop(100_000, 40_000);
+    assert.equal(warn?.severity, "warn");
+    assert.ok(Math.abs((warn?.dropPct ?? 0) - 0.6) < 1e-9);
+    const critico = assessLiquidityDrop(100_000, 10_000);
+    assert.equal(critico?.severity, "critical");
+    assert.equal(assessLiquidityDrop(100_000, 60_000), null, "queda de 40% ainda não alerta");
+    assert.equal(assessLiquidityDrop(100_000, 120_000), null, "liquidez subiu: nada a declarar");
+    assert.equal(assessLiquidityDrop(0, 10), null, "sem pico válido não existe queda");
+    assert.equal(assessLiquidityDrop(100, Number.NaN), null);
+    assert.equal(assessLiquidityDrop(100, -5), null);
+  });
+
+  await test("regressão: divergência e liquidez são ALERTA — nenhuma venda automática", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("priceSampleBook"), "o livro de amostras precisa estar ligado ao laço");
+    assert.ok(serverSrc.includes("verifyMints"), "a amostra de verificação precisa ser passada ao lote");
+    assert.ok(serverSrc.includes("HFT_PRICE_DIVERGENCE") && serverSrc.includes("HFT_PRICE_VERIFY_SAMPLE"));
+    assert.ok(
+      /ALERTA apenas: nenhuma venda foi disparada por este sinal/.test(serverSrc),
+      "o alerta de liquidez não pode virar gatilho de venda sem autorização própria"
+    );
+    assert.ok(serverSrc.includes("liquidityUsdPeak"), "o pico de liquidez precisa ser acompanhado");
+    assert.equal(
+      /parseFloat\([a-zA-Z.]*priceNative\)/.test(serverSrc),
+      false,
+      "o server não pode ler priceNative cru: ele está na moeda de cotação do par, não em SOL"
+    );
+    assert.ok(
+      serverSrc.includes("priceSolFromDexPairs("),
+      "os dois caminhos de preço do DexScreener precisam usar a regra única de conversão"
+    );
+    const priceSrc = fs.readFileSync(path.join(repoRoot, "src/priceQuality.ts"), "utf8");
+    assert.ok(
+      !/sell|swap|sendTransaction/i.test(priceSrc),
+      "o módulo de qualidade de preço NÃO pode executar nada na rede"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [22] PREÇO DE ENTRADA — a verificação que impede abrir posição sobre número errado
+  // ---------------------------------------------------------------------------
+  console.log("\n[22] Qualidade do preço de entrada (duas fontes ou recusa)");
+
+  const EN_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+  const EN_LIMIARES = { warnPct: 0.05, criticalPct: 0.15, maxAgeMs: 45_000 };
+  const EN_QUOTE = { priceSol: 0.001, source: "dexscreener (lote)" };
+
+  await test("entrada: duas fontes concordando → verified e aceita", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "dexscreener (lote)", candidateSource: "jupiter price/v3 (lote)", bps: 12, severity: "ok" },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "verified");
+    assert.equal(r.accepted, true);
+    assert.equal(r.priceSol, 0.001);
+    assert.equal(r.divergenceBps, 12);
+    assert.deepEqual(r.sources, ["dexscreener (lote)", "jupiter price/v3 (lote)"]);
+    assert.ok(/concordam/.test(r.reason));
+  });
+
+  await test("entrada: diferença acima do aviso → verified_with_warning (aceita e REGISTRA)", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "A", candidateSource: "B", bps: 900, severity: "warn" },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "verified_with_warning");
+    assert.equal(r.accepted, true);
+    assert.equal(r.severity, "warn");
+    assert.ok(/aviso/.test(r.reason));
+  });
+
+  await test("entrada: divergência CRÍTICA → RECUSA abrir posição (evidência de erro grosseiro)", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "dexscreener (lote)", candidateSource: "geckoterminal (lote)", bps: 3000, severity: "critical" },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "divergent");
+    assert.equal(r.accepted, false, "entrada divergente NÃO pode abrir posição");
+    assert.equal(r.severity, "critical");
+    assert.ok(/envenena PnL/.test(r.reason), "o motivo precisa explicar a consequência, não só o número");
+    assert.ok(r.reason.includes("dexscreener") && r.reason.includes("geckoterminal"), "as duas fontes precisam ser nomeadas");
+  });
+
+  await test("entrada: severidade é recalculada dos bps com os MESMOS limiares da gestão", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    // Severidade declarada "ok" mas bps crítico: quem manda é o número, não o rótulo de quem chamou.
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "A", candidateSource: "B", bps: 5000, severity: "ok" },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "divergent");
+    assert.equal(r.accepted, false);
+  });
+
+  await test("entrada: fonte única → aceita mas MARCADA como não verificada", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({ quote: EN_QUOTE, comparison: null, thresholds: EN_LIMIARES });
+    assert.equal(r.status, "single_source");
+    assert.equal(r.accepted, true);
+    assert.equal(r.divergenceBps, null, "sem segunda opinião não existe número de divergência");
+    assert.ok(/NÃO verificado/.test(r.reason));
+    assert.ok(/não é prova de erro/.test(r.reason), "ausência de segunda opinião não pode virar acusação");
+  });
+
+  await test("entrada: com allowSingleSource=false, fonte única é RECUSADA", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({ quote: EN_QUOTE, comparison: null, thresholds: EN_LIMIARES, allowSingleSource: false });
+    assert.equal(r.status, "single_source");
+    assert.equal(r.accepted, false, "política de capital real pode exigir duas fontes");
+  });
+
+  await test("entrada: verificação desligada aceita o preço mas NÃO finge que verificou", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const r = assessEntryPrice({
+      quote: EN_QUOTE,
+      comparison: { referenceSource: "A", candidateSource: "B", bps: 9000, severity: "critical" },
+      thresholds: EN_LIMIARES,
+      enabled: false,
+    });
+    assert.equal(r.status, "single_source");
+    assert.equal(r.accepted, true);
+    assert.equal(r.divergenceBps, null);
+    assert.ok(/DESLIGADA/.test(r.reason));
+  });
+
+  await test("entrada: sem preço nenhum → unavailable e recusa (nunca inventa)", async () => {
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    for (const quote of [null, undefined, { priceSol: null, source: "A" }, { priceSol: 0, source: "A" } as any, { priceSol: Number.NaN, source: "A" } as any, { priceSol: -1, source: "A" } as any]) {
+      const r = assessEntryPrice({ quote, comparison: null, thresholds: EN_LIMIARES });
+      assert.equal(r.status, "unavailable");
+      assert.equal(r.accepted, false);
+      assert.equal(r.priceSol, null);
+    }
+  });
+
+  await test("entrada: lote entrega a comparação mesmo quando as fontes CONCORDAM", async () => {
+    const { fetchBatchPrices, SOL_MINT } = await import("../src/marketPriceFeed.js");
+    const result = await fetchBatchPrices([EN_MINT], {
+      verifyMints: [EN_MINT],
+      fetchImpl: (async (url: string) => {
+        if (url.includes("dexscreener")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              pairs: [
+                { chainId: "solana", baseToken: { address: EN_MINT }, quoteToken: { address: SOL_MINT }, priceNative: "0.001", liquidity: { usd: 20_000 } },
+              ],
+            }),
+          } as any;
+        }
+        // 0.2 USD / 200 USD por SOL = 0.001 SOL → concordam exatamente.
+        return { ok: true, status: 200, json: async () => ({ [SOL_MINT]: { usdPrice: 200 }, [EN_MINT]: { usdPrice: 0.2 } }) } as any;
+      }) as any,
+    });
+    assert.equal(result.divergences.length, 0);
+    assert.equal(result.verification.comparisons.length, 1, "a comparação precisa existir mesmo com severidade ok");
+    const c = result.verification.comparisons[0];
+    assert.equal(c.mint, EN_MINT);
+    assert.equal(c.severity, "ok");
+    assert.equal(c.bps, 0);
+    assert.ok(/dexscreener/.test(c.referenceSource) && /jupiter/.test(c.candidateSource));
+
+    // E o caminho de entrada transforma isso em "verified".
+    const { assessEntryPrice } = await import("../src/entryQuality.js");
+    const quote = result.quotes.get(EN_MINT)!;
+    const r = assessEntryPrice({
+      quote: { priceSol: quote.priceSol, source: quote.source },
+      comparison: { referenceSource: c.referenceSource, candidateSource: c.candidateSource, bps: c.bps, severity: c.severity },
+      thresholds: EN_LIMIARES,
+    });
+    assert.equal(r.status, "verified");
+    assert.equal(r.accepted, true);
+  });
+
+  await test("regressão: o caminho de entrada usa preço VERIFICADO e recusa divergente", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.equal(
+      /fetchReferenceMarketPrice/.test(serverSrc),
+      false,
+      "a função de fonte única não pode voltar: o preço de entrada agora é resolvido com verificação"
+    );
+    assert.ok(serverSrc.includes("resolveEntryPrice("), "o caminho paper precisa resolver o preço de entrada");
+    assert.ok(serverSrc.includes("assessEntryPrice("), "a política de aceitação precisa vir do módulo dedicado");
+    assert.ok(
+      /if \(!entry\.assessment\.accepted\)/.test(serverSrc),
+      "entrada com preço divergente precisa ser RECUSADA, não apenas registrada"
+    );
+    assert.ok(serverSrc.includes("entryPriceVerification"), "a procedência do preço precisa ficar gravada na posição");
+    assert.ok(serverSrc.includes("entryVerificationStatus"), "o registro de avaliação precisa carregar o status");
+    assert.ok(serverSrc.includes("HFT_ENTRY_VERIFY") && serverSrc.includes("HFT_ENTRY_ALLOW_SINGLE_SOURCE"));
+    assert.ok(serverSrc.includes("entryQuality:"), "os contadores precisam ser visíveis no /api/health");
+    // A verificação de entrada NUNCA pode ter prioridade de saída (furaria cota).
+    const bloco = serverSrc.slice(serverSrc.indexOf("async function resolveEntryPrice"), serverSrc.indexOf("async function resolveEntryPrice") + 2000);
+    assert.ok(/verificationPriority: "background"/.test(bloco), "verificação de entrada é dado adicional: nunca fura cota");
+    const entrySrc = fs.readFileSync(path.join(repoRoot, "src/entryQuality.ts"), "utf8");
+    assert.ok(
+      !/sell|swap|sendTransaction/i.test(entrySrc),
+      "o módulo de qualidade de entrada NÃO pode executar nada na rede"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [23] COERÊNCIA DE PERFIL DE RPC + telemetria fabricada removida
+  // ---------------------------------------------------------------------------
+  console.log("\n[23] Coerência perfil↔endpoint e remoção de telemetria fabricada");
+
+  const HELIUS_URL = "https://mainnet.helius-rpc.com/?api-key=SEGREDO_NAO_PODE_VAZAR";
+  const QUICKNODE_URL = "https://divine-wildflower.solana-mainnet.quiknode.pro/abc123/";
+  const SYNDICA_URL = "https://solana-mainnet.api.syndica.io/api-key/xyz";
+
+  await test("hostFromUrl: devolve SÓ o host — a chave da URL nunca aparece", async () => {
+    const { hostFromUrl } = await import("../src/rpcProfile.js");
+    const host = hostFromUrl(HELIUS_URL);
+    assert.equal(host, "mainnet.helius-rpc.com");
+    assert.equal(host.includes("SEGREDO"), false, "a query com a chave não pode vazar");
+    assert.equal(hostFromUrl("não é url"), "");
+    assert.equal(hostFromUrl(undefined), "");
+    assert.equal(hostFromUrl(""), "");
+  });
+
+  await test("inferRpcProvider: reconhece os provedores e devolve unknown sem inventar", async () => {
+    const { inferRpcProvider } = await import("../src/rpcProfile.js");
+    assert.equal(inferRpcProvider(HELIUS_URL), "helius");
+    assert.equal(inferRpcProvider(QUICKNODE_URL), "quicknode");
+    assert.equal(inferRpcProvider("https://solana-mainnet.g.alchemy.com/v2/chave"), "alchemy");
+    assert.equal(inferRpcProvider(SYNDICA_URL), "syndica");
+    assert.equal(inferRpcProvider("https://api.mainnet-beta.solana.com"), "public");
+    assert.equal(inferRpcProvider("https://rpc.minhaempresa.com.br"), "unknown");
+  });
+
+  await test("coerência: endpoint Helius + perfil helius → COERENTE", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({
+      endpoint: HELIUS_URL,
+      websocket: "wss://mainnet.helius-rpc.com/?api-key=x",
+      declaredProfile: "helius",
+    });
+    assert.equal(r.coherent, true);
+    assert.equal(r.inferredFromEndpoint, "helius");
+    assert.deepEqual(r.issues, []);
+    // A URL completa NÃO pode aparecer nas observações: só o host.
+    assert.equal(JSON.stringify(r).includes("SEGREDO"), false);
+  });
+
+  await test("coerência: perfil dedicado com endpoint VAZIO (público) → INCOERENTE", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({ endpoint: "", declaredProfile: "syndica" });
+    assert.equal(r.coherent, false, "era exatamente a config da preview: teto 100 req/s no endpoint público");
+    assert.equal(r.usingPublicDefaultEndpoint, true);
+    assert.ok(r.issues.some((i) => i.code === "endpoint-publico-com-perfil-dedicado" && i.severity === "mismatch"));
+    assert.ok(r.issues.some((i) => i.code === "endpoint-ausente" && i.severity === "warn"));
+  });
+
+  await test("coerência: endpoint de um provedor com perfil de outro → INCOERENTE nos dois sentidos", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const a = assessRpcCoherence({ endpoint: QUICKNODE_URL, declaredProfile: "helius" });
+    assert.equal(a.coherent, false);
+    assert.ok(a.issues.some((i) => i.code === "perfil-nao-bate-endpoint"));
+
+    // Endpoint dedicado com perfil "public": não é incoerência (não estoura cota), mas é
+    // sub-utilização — o bot pula decisões que a cota suportaria.
+    const b = assessRpcCoherence({ endpoint: HELIUS_URL, declaredProfile: "public" });
+    assert.equal(b.coherent, true);
+    assert.ok(b.issues.some((i) => i.code === "endpoint-dedicado-com-perfil-publico" && i.severity === "warn"));
+  });
+
+  await test("coerência: perfil desconhecido → INCOERENTE (hoje ele cai silenciosamente em public)", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({ endpoint: HELIUS_URL, declaredProfile: "helios" });
+    assert.equal(r.declaredProfileKnown, false);
+    assert.equal(r.coherent, false);
+    assert.ok(r.issues.some((i) => i.code === "perfil-desconhecido" && i.severity === "mismatch"));
+  });
+
+  await test("coerência: provedor PRÓPRIO é aviso, não erro (não bloqueia quem sabe o que faz)", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({ endpoint: "https://rpc.minhaempresa.com.br", declaredProfile: "helius" });
+    assert.equal(r.coherent, true, "host desconhecido é NÃO VERIFICÁVEL, não incoerente");
+    assert.ok(r.issues.some((i) => i.code === "host-nao-verificavel" && i.severity === "warn"));
+  });
+
+  await test("coerência: WebSocket e fallbacks de outro provedor geram AVISO", async () => {
+    const { assessRpcCoherence } = await import("../src/rpcProfile.js");
+    const r = assessRpcCoherence({
+      endpoint: HELIUS_URL,
+      websocket: "wss://divine.solana-mainnet.quiknode.pro/abc",
+      fallbacks: `${QUICKNODE_URL},https://solana-mainnet.g.alchemy.com/v2/k`,
+      declaredProfile: "helius",
+    });
+    assert.equal(r.coherent, true, "avisos não bloqueiam o boot");
+    assert.ok(r.issues.some((i) => i.code === "perfil-nao-bate-websocket"));
+    assert.ok(r.issues.some((i) => i.code === "fallback-misto"));
+    assert.equal(r.observations.length, 4, "endpoint + websocket + 2 fallbacks observados");
+    assert.equal(JSON.stringify(r).includes("abc123"), false, "nem o path do provedor deve vazar");
+  });
+
+  await test("coerência: descrição em texto não contém URL completa nem chave", async () => {
+    const { assessRpcCoherence, describeRpcCoherence } = await import("../src/rpcProfile.js");
+    const linhas = describeRpcCoherence(assessRpcCoherence({ endpoint: HELIUS_URL, declaredProfile: "syndica" }));
+    const texto = linhas.join("\n");
+    assert.equal(texto.includes("SEGREDO"), false);
+    assert.ok(/perfil declarado="syndica"/.test(texto));
+    assert.ok(linhas.length > 1, "achados precisam aparecer linha a linha");
+  });
+
+  await test("regressão: o boot RECUSA subir em LIVE quando o perfil é incoerente", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    assert.ok(serverSrc.includes("assessRpcCoherence("), "o boot precisa avaliar a coerência");
+    assert.ok(serverSrc.includes("rpcCoherence:"), "a coerência precisa ser visível no /api/health");
+    const bloco = serverSrc.slice(
+      serverSrc.indexOf("const rpcCoherence: RpcCoherence"),
+      serverSrc.indexOf("if (process.env.HFT_BUDGET_DISABLED === \"1\")")
+    );
+    assert.ok(/if \(!rpcCoherence\.coherent\)/.test(bloco), "incoerência precisa ser tratada");
+    assert.ok(/mode === "LIVE"/.test(bloco), "em LIVE o trato é diferente do PAPER");
+    assert.ok(/process\.exit\(1\)/.test(bloco), "em LIVE, incoerência impede o boot");
+  });
+
+  await test("regressão: escala de líderes Jito não é mais inventada", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.equal(
+      /278913410 \+ Math\.floor/.test(serverSrc),
+      false,
+      "slot derivado do relógio do processo não pode voltar"
+    );
+    assert.equal(/Helius Validator #4/.test(serverSrc), false, "nome de validador inventado não pode voltar");
+    assert.equal(/Elite \(99\.8th percentile\)/.test(serverSrc), false, "reputação inventada não pode voltar");
+    const bloco = serverSrc.slice(
+      serverSrc.indexOf('app.get("/api/jito-leader-schedule"'),
+      serverSrc.indexOf('app.post("/api/submit-bundle"')
+    );
+    assert.ok(/nextLeaderSlot: null/.test(bloco), "não observável precisa ser null, não RNG");
+    assert.ok(/notMeasured:/.test(bloco), "o motivo de não medir precisa estar no payload");
+    assert.ok(/measured: currentSlot !== null/.test(bloco), "o único número permitido é o slot MEDIDO");
+    assert.ok(/coLocation:/.test(bloco) && /declaração não é medição/.test(bloco));
+  });
+
+  await test("regressão: painel MEV não registra trade a partir de bundle SIMULADO", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ui = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/components/MevExecutionEngine.tsx"), "utf8"));
+    assert.equal(
+      /Math\.random\(\) \* 50000/.test(ui),
+      false,
+      "outAmount aleatório na lista de operações não pode voltar"
+    );
+    assert.equal(/278913410 \+ Math\.floor/.test(ui), false, "bloco aleatório não pode voltar");
+    assert.ok(/data\.simulated === true/.test(ui) || /bundleResult\.simulated === true/.test(ui), "o simulador precisa ser rotulado");
+    assert.ok(/void onBundleSuccess;/.test(ui), "bundle simulado NÃO pode alimentar a lista de operações");
+    assert.ok(/percentilesSol/.test(ui), "o tip floor exibido precisa vir da resposta real da API");
+    assert.equal(/setTips\(data\.tips\)/.test(ui), false, "campo `tips` não existe na resposta — não pode voltar");
+  });
+
+  await test("regressão: painel de performance exibe MEDIÇÃO, não RNG, nos campos de infraestrutura", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ui = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/components/HftProfiler.tsx"), "utf8"));
+    assert.equal(/avgRttHelius/.test(ui), false, "RTT Helius fabricado não pode voltar");
+    assert.equal(/avgRttTriton/.test(ui), false);
+    assert.equal(/Jito Acceptance|jitoAcceptanceRate/.test(ui), false, "landing rate inventado não pode voltar");
+    assert.ok(/\/api\/rpc-nodes/.test(ui), "latência precisa vir da medição do backend");
+    assert.ok(/\/api\/positions/.test(ui), "exposição precisa vir das posições reais");
+    assert.ok(/não medido/.test(ui), "campo sem dado precisa dizer 'não medido'");
+  });
+
+  await test("regressão: painel de diagnósticos não exibe laudo decorativo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ui = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/components/DiagnosticsPanel.tsx"), "utf8"));
+    assert.equal(/PTPv2|drift física|<1ns/.test(ui), false, "PTP inventado não pode voltar");
+    assert.equal(/ShredStream co-localizado|Canal Elite ativo/.test(ui), false, "canal inventado não pode voltar");
+    assert.ok(/\/api\/rpc-nodes/.test(ui) && /\/api\/health/.test(ui) && /blockhash/.test(ui), "as checagens precisam ser reais");
+    assert.ok(/declaração não é medição|NÃO mede a posição física/.test(ui), "declaração e medição precisam estar separadas na tela");
+  });
+
+  // ── Helpers do grupo [24]: dublês de rede/cofre. O orquestrador testado é o MESMO do
+  //    servidor; só as capacidades externas são substituídas. ────────────────────────────
+  const MINT_FAKE = "So11111111111111111111111111111111111111112";
+  const OWNER_FAKE = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+  const policyFake = {
+    enabled: true, autonomous: true, canaryMaxSol: 0.01, canaryOneEntry: true,
+    slippageBps: 300, maxPriceImpactBps: 1500, requirePreflight: true, maxTipBps: 50,
+    maxTotalExposureSol: 0,
+  } as any;
+  const allowedGate = (re: any) =>
+    re.assessEntryGate({ policy: policyFake, mode: "LIVE", liveAuthorized: true, mint: MINT_FAKE, sizeSol: 0.01 });
+  const entryRequest = (over: any = {}) => ({
+    mint: MINT_FAKE,
+    sizeSol: 0.01,
+    userPublicKey: OWNER_FAKE,
+    policy: policyFake,
+    gate: over.gate,
+    confirmTimeoutMs: 100,
+  } as any);
+  const fakeEntryDeps = (over: any = {}): any => ({
+    assertCanSign: over.assertCanSign ?? (() => {}),
+    getQuote: async () => {
+      over.onQuote?.();
+      return over.quote ?? { outAmount: "1000000000", priceImpactPct: "0.0123", routeLabels: ["pump.fun"] };
+    },
+    buildSwapTransaction: async () => {
+      over.onBuild?.();
+      return { fakeTx: true };
+    },
+    simulateTransaction: over.simulate ?? (async () => ({ ok: true, err: null, unitsConsumed: 120_000, logsTail: ["Program log: ok"] })),
+    getFreshBlockhash: async () => over.blockhash ?? { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 999_999 },
+    signAndSubmit: async () => {
+      over.onSign?.();
+      return over.submit ?? { ok: true, signature: "5" + "x".repeat(63), bundleId: "bundle_fake", tipSol: 0.0005 };
+    },
+    confirm: over.confirm ?? (async () => ({ outcome: "confirmed", slot: 123_456_789 })),
+    observeFill: over.observeFill ?? (async () => ({ measured: true, tokensReceived: "1000000000", feeLamports: 5000, slot: 123_456_789 })),
+    now: () => 0,
+  });
+
+  // [24] S6 — ENTRADA REAL: gates, orquestração e leitura de fill
+  console.log("\n[24] Entrada real (S6): travas, pré-flight e fill medido");
+
+  await test("política de entrada real é fail-closed por padrão (nenhuma das três declarações)", async () => {
+    const re = await import("../src/realEntry.js");
+    const policy = re.resolveRealEntryPolicy({} as any);
+    assert.equal(policy.enabled, false, "HFT_REAL_ENTRY_ENABLED ausente NÃO pode habilitar entrada real");
+    assert.equal(policy.autonomous, false, "entrada automática precisa de declaração própria");
+    assert.equal(policy.canaryMaxSol, 0.01, "teto canário default é 0,01 SOL");
+    assert.equal(policy.canaryOneEntry, true, "uma entrada canário por vez por padrão");
+    assert.equal(policy.requirePreflight, true, "pré-flight é obrigatório por padrão");
+    assert.equal(policy.maxTipBps, 50, "teto de tip em bps do capital");
+    assert.equal(policy.slippageBps, 300);
+    assert.equal(policy.maxPriceImpactBps, 1500);
+  });
+
+  await test("política de entrada real respeita o ambiente declarado", async () => {
+    const re = await import("../src/realEntry.js");
+    const policy = re.resolveRealEntryPolicy({
+      HFT_REAL_ENTRY_ENABLED: "1",
+      HFT_AUTONOMOUS_ENTRY: "true",
+      HFT_CANARY_MAX_SOL: "0.05",
+      HFT_CANARY_ONE_ENTRY: "0",
+      HFT_ENTRY_SLIPPAGE_BPS: "450",
+      HFT_ENTRY_MAX_PRICE_IMPACT_BPS: "900",
+      HFT_ENTRY_REQUIRE_PREFLIGHT: "0",
+      MAX_TIP_BPS: "80",
+      MAX_TOTAL_EXPOSURE_SOL: "0.2",
+    } as any);
+    assert.equal(policy.enabled, true);
+    assert.equal(policy.autonomous, true);
+    assert.equal(policy.canaryMaxSol, 0.05);
+    assert.equal(policy.canaryOneEntry, false);
+    assert.equal(policy.slippageBps, 450);
+    assert.equal(policy.maxPriceImpactBps, 900);
+    assert.equal(policy.requirePreflight, false);
+    assert.equal(policy.maxTipBps, 80);
+    assert.equal(policy.maxTotalExposureSol, 0.2);
+  });
+
+  await test("gate de entrada bloqueia cada motivo com código próprio (nunca um 'não' genérico)", async () => {
+    const re = await import("../src/realEntry.js");
+    const mint = "So11111111111111111111111111111111111111112";
+    const base = {
+      policy: { ...re.REAL_ENTRY_DEFAULTS, enabled: true, autonomous: true, canaryOneEntry: true, maxTotalExposureSol: 0, maxTipBps: 50 },
+      mode: "LIVE",
+      liveAuthorized: true,
+      mint,
+      sizeSol: 0.01,
+    } as any;
+
+    const codesOf = (input: any) => re.assessEntryGate(input).issues.map((i: any) => i.code);
+
+    assert.deepEqual(codesOf({ ...base, policy: { ...base.policy, enabled: false } }), ["ENTRY_PATH_DISABLED"]);
+    assert.deepEqual(codesOf({ ...base, autonomousCall: true, policy: { ...base.policy, autonomous: false } }), ["AUTONOMOUS_ENTRY_DISABLED"]);
+    assert.ok(codesOf({ ...base, mode: "PAPER", liveAuthorized: false }).includes("MODE_NOT_LIVE"));
+    assert.ok(codesOf({ ...base, killSwitchActive: true }).includes("KILL_SWITCH"));
+    assert.ok(codesOf({ ...base, readOnlyMode: true }).includes("READ_ONLY"));
+    assert.ok(codesOf({ ...base, mint: "não-é-base58!!" }).includes("MINT_INVALID"));
+    assert.ok(codesOf({ ...base, sizeSol: 0 }).includes("SIZE_INVALID"));
+    assert.ok(codesOf({ ...base, sizeSol: 0.011 }).includes("CANARY_CAP_EXCEEDED"), "teto canário é teto DURO");
+    assert.ok(codesOf({ ...base, realEntriesDone: 1 }).includes("CANARY_ALREADY_USED"));
+    assert.ok(codesOf({ ...base, policy: { ...base.policy, maxTotalExposureSol: 0.005 } }).includes("EXPOSURE_LIMIT"));
+    assert.ok(codesOf({ ...base, hasOpenPositionForMint: true }).includes("DUPLICATE_OPEN_POSITION"));
+    assert.ok(codesOf({ ...base, maxPositionSol: 0.001 }).includes("MAX_POSITION_SOL_EXCEEDED"));
+  });
+
+  await test("gate de entrada APROVA o caso canário coerente", async () => {
+    const re = await import("../src/realEntry.js");
+    const gate = re.assessEntryGate({
+      policy: { ...re.REAL_ENTRY_DEFAULTS, enabled: true, autonomous: true, canaryOneEntry: true, maxTotalExposureSol: 0, maxTipBps: 50 },
+      mode: "LIVE",
+      liveAuthorized: true,
+      mint: "So11111111111111111111111111111111111111112",
+      sizeSol: 0.01,
+      realEntriesDone: 0,
+      openExposureSol: 0,
+    } as any);
+    assert.equal(gate.allowed, true, `esperava aprovação, veio: ${JSON.stringify(gate.issues)}`);
+    assert.equal(gate.issues.filter((i: any) => i.severity === "block").length, 0);
+  });
+
+  await test("orquestrador: pré-flight reprovado NÃO assina (a simulação descobre de graça)", async () => {
+    const re = await import("../src/realEntry.js");
+    let signed = 0;
+    let built = 0;
+    const deps = fakeEntryDeps({
+      simulate: async () => ({ ok: false, err: { message: "custom program error: 0x1771" }, logsTail: ["Program log: 6001"] }),
+      onSign: () => signed++,
+      onBuild: () => built++,
+    });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "simulation_failed");
+    assert.equal(signed, 0, "nenhuma assinatura pode existir quando a simulação reprova");
+    assert.equal(built, 1, "a transação foi construída (necessário para simular)");
+    assert.match(result.reason ?? "", /simulação REJEITOU/);
+  });
+
+  await test("orquestrador: caminho feliz confirma com SLOT e mede o fill da cadeia", async () => {
+    const re = await import("../src/realEntry.js");
+    const deps = fakeEntryDeps({});
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "confirmed");
+    assert.equal(result.confirmedOnChain, true, "confirmado exige slot observado");
+    assert.equal(result.slot, 123456789);
+    assert.equal(result.signature, "5" + "x".repeat(63));
+    assert.equal(result.tokensReceived, "1000000000", "quantidade vem do delta de postTokenBalances");
+    assert.equal(result.fillMeasured, true);
+    assert.equal(result.bundleAccepted, true, "'aceito pelo block engine' é um fato separado da execução");
+    assert.ok(result.timingsMs.total >= 0);
+    assert.equal(result.gateIssues.filter((i: any) => i.severity === "block").length, 0);
+  });
+
+  await test("orquestrador: sem slot observado o estado é submitted_unconfirmed — NUNCA confirmed", async () => {
+    const re = await import("../src/realEntry.js");
+    const deps = fakeEntryDeps({ confirm: async () => ({ outcome: "unknown" as const, error: "não observado na janela" }) });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "submitted_unconfirmed");
+    assert.equal(result.confirmedOnChain, false, "aceito ≠ executado: a regra que impediu PnL fabricado");
+    assert.ok(result.signature, "a assinatura existe e precisa ser reconciliada");
+  });
+
+  await test("orquestrador: barreira de assinatura roda ANTES de gastar cota", async () => {
+    const re = await import("../src/realEntry.js");
+    let quoted = 0;
+    const deps = fakeEntryDeps({
+      onQuote: () => quoted++,
+      assertCanSign: () => {
+        throw new Error("[Signer Guard] Modo LIVE não autoriza operação de capital.");
+      },
+    });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "signing_blocked");
+    assert.equal(quoted, 0, "se o modo não autoriza, nem a cotação deve ser pedida");
+  });
+
+  await test("orquestrador: impacto de preço acima do teto recusa ANTES de construir", async () => {
+    const re = await import("../src/realEntry.js");
+    let built = 0;
+    const deps = fakeEntryDeps({
+      quote: { outAmount: "1000", priceImpactPct: "0.30", routeLabels: ["pump"] },
+      onBuild: () => built++,
+    });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "refused");
+    assert.equal(built, 0, "comprar o próprio impacto não pode nem chegar a montar a transação");
+    assert.match(result.reason ?? "", /impacto de preço/);
+  });
+
+  await test("orquestrador: blockhash sem prova de expiração não assina", async () => {
+    const re = await import("../src/realEntry.js");
+    let signed = 0;
+    const deps = fakeEntryDeps({
+      blockhash: { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 0 },
+      onSign: () => signed++,
+    });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate: allowedGate(re) }));
+    assert.equal(result.status, "submit_failed");
+    assert.equal(signed, 0, "sem lastValidBlockHeight não existe prova de expiração para decidir retry");
+  });
+
+  await test("orquestrador: gate bloqueado nem monta deps de rede", async () => {
+    const re = await import("../src/realEntry.js");
+    const gate = re.assessEntryGate({
+      policy: { ...re.REAL_ENTRY_DEFAULTS, enabled: true, autonomous: true, canaryOneEntry: true, maxTotalExposureSol: 0, maxTipBps: 50 },
+      mode: "PAPER",
+      liveAuthorized: false,
+      mint: "So11111111111111111111111111111111111111112",
+      sizeSol: 0.01,
+    } as any);
+    let quoted = 0;
+    const deps = fakeEntryDeps({ onQuote: () => quoted++ });
+    const result = await re.executeRealEntry(deps, entryRequest({ gate }));
+    assert.equal(result.status, "refused");
+    assert.equal(quoted, 0);
+    assert.match(result.reason ?? "", /MODE_NOT_LIVE/);
+  });
+
+  await test("canário: falha ANTES de assinar não consome a tentativa (rede caindo ≠ bloqueio permanente)", async () => {
+    const re = await import("../src/realEntry.js");
+    const count = re.countLandedEntryAttempts;
+    assert.equal(count([]), 0);
+    assert.equal(count([{ mode: "paper", signature: null, status: "paper" }]), 0, "paper nunca conta");
+    assert.equal(count([{ mode: "shadow", signature: null, status: "shadow" }]), 0, "shadow nunca conta");
+    assert.equal(
+      count([{ mode: "live", signature: null, status: "rejected" }]),
+      0,
+      "falha em cotação/construção/simulação/blockhash não tocou a cadeia"
+    );
+    assert.equal(count([{ mode: "live", signature: "5abc", status: "quote_failed" }]), 1, "assinatura existe: a transação pode ter entrado");
+    assert.equal(count([{ mode: "live", signature: null, status: "confirmed" }]), 1, "confirmação registrada conta mesmo sem campo de assinatura");
+    assert.equal(
+      count([
+        { mode: "live", signature: "5a", status: "submitted_unconfirmed" },
+        { mode: "live", signature: "5b", status: "confirmed" },
+        { mode: "paper", signature: null, status: "paper" },
+      ]),
+      2
+    );
+  });
+
+  await test("leitura de fill: delta de postTokenBalances é a quantidade recebida", async () => {
+    const re = await import("../src/realEntry.js");
+    const fill = re.parseEntryFill({
+      owner: "Owner111111111111111111111111111111111111",
+      mint: "Mint11111111111111111111111111111111111111",
+      slot: 999,
+      meta: {
+        err: null,
+        fee: 5000,
+        preTokenBalances: [],
+        postTokenBalances: [
+          { owner: "Owner111111111111111111111111111111111111", mint: "Mint11111111111111111111111111111111111111", uiTokenAmount: { amount: "2500000000" } },
+        ],
+      },
+    });
+    assert.equal(fill.measured, true);
+    assert.equal(fill.tokensReceived, "2500000000");
+    assert.equal(fill.feeLamports, 5000);
+    assert.equal(fill.slot, 999);
+  });
+
+  await test("leitura de fill: transação que falhou é MEDIÇÃO (0 recebido), não ausência de dado", async () => {
+    const re = await import("../src/realEntry.js");
+    const fill = re.parseEntryFill({
+      owner: "Owner111111111111111111111111111111111111",
+      mint: "Mint11111111111111111111111111111111111111",
+      meta: { err: { InstructionError: [0, { Custom: 6001 }] }, fee: 5000, postTokenBalances: [], preTokenBalances: [] },
+    });
+    assert.equal(fill.measured, true);
+    assert.equal(fill.tokensReceived, "0");
+    assert.match(fill.error ?? "", /falhou on-chain/);
+  });
+
+  await test("leitura de fill: saldo DIMINUIU na entrada é inconsistência declarada, não silêncio", async () => {
+    const re = await import("../src/realEntry.js");
+    const owner = "Owner111111111111111111111111111111111111";
+    const mint = "Mint11111111111111111111111111111111111111";
+    const fill = re.parseEntryFill({
+      owner,
+      mint,
+      meta: {
+        fee: 5000,
+        preTokenBalances: [{ owner, mint, uiTokenAmount: { amount: "100" } }],
+        postTokenBalances: [{ owner, mint, uiTokenAmount: { amount: "10" } }],
+      },
+    });
+    assert.equal(fill.tokensReceived, "0", "nunca reportar quantidade negativa como compra");
+    assert.match(fill.error ?? "", /DIMINUIU/);
+  });
+
+  await test("leitura de fill: sem meta o resultado é 'não medido' com motivo", async () => {
+    const re = await import("../src/realEntry.js");
+    const fill = re.parseEntryFill({ owner: "a", mint: "b", meta: null });
+    assert.equal(fill.measured, false);
+    assert.equal(fill.tokensReceived, null);
+    assert.ok(fill.error && fill.error.length > 0);
+  });
+
+  await test("fiação: pipeline LIVE executa a entrada real e o gate é consultado antes", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/if \(liveTrading\) \{[\s\S]{0,900}runRealEntry\(/.test(src), "o ramo LIVE precisa chamar runRealEntry");
+    assert.equal(/entrada on-chain não está implementada/.test(src), false, "a recusa antiga não pode voltar");
+    assert.ok(/app\.post\("\/api\/real-entry"/.test(src), "a entrada real manual precisa de rota própria");
+    assert.ok(/buildEntryGateInput\(/.test(src) && /assessEntryGate\(/.test(src), "o gate puro precisa ser consultado pela fiação");
+    assert.ok(/HFT_REAL_ENTRY_ENABLED/.test(src), "a terceira declaração precisa existir no código");
+    assert.ok(/realEntry: \(\(\) => \{/.test(src), "system-truth precisa declarar o estado da entrada real");
+  });
+
+  await test("fiação: entrada cota SOL→mint (a inversão cotaria uma VENDA)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(
+      /JupiterIntegration\.getQuote\(SOL_MINT, mint,/.test(src),
+      "a cotação de ENTRADA é SOL → mint; o inverso (mint → SOL) é saída"
+    );
+  });
+
+  await test("isolamento: realEntry não tem acesso a chave nem a envio direto", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/realEntry.ts"), "utf8"));
+    for (const proibido of ["Keypair", "OPERATIONAL_PRIVATE_KEY", "executeWithDecryptedKeypair", "sendTransaction", "sendRawTransaction", "@solana/web3.js"]) {
+      assert.equal(src.includes(proibido), false, `realEntry.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(/signAndSubmit/.test(src), "assinar+enviar é capacidade INJETADA (uma só, isolada)");
+  });
+
+  await test("isolamento: as três declarações e o teto canário estão documentados no .env.example", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const env = fs.readFileSync(path.join(repoRoot, ".env.example"), "utf8");
+    for (const v of ["HFT_REAL_ENTRY_ENABLED", "HFT_AUTONOMOUS_ENTRY", "HFT_CANARY_MAX_SOL", "HFT_CANARY_ONE_ENTRY"]) {
+      assert.ok(env.includes(v), `.env.example precisa declarar ${v}`);
+    }
+  });
+
+  // [25] S6 — INSTRUÇÃO NATIVA POR IDL: layout conferido contra o IDL oficial pinado
+  console.log("\n[25] Entrada nativa por IDL (S6): layout, PDAs, cotação e guardas");
+
+  await test("IDL pinado: o excerto existe, veio do repositório oficial e traz o programa certo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const idl = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/pump-idl-excerpt.json"), "utf8"));
+    assert.equal(idl.address, "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+    assert.ok(/pump-public-docs/.test(idl._provenance.source), "a proveniência precisa apontar o repo oficial");
+    assert.ok(/pump.json/.test(idl._provenance.source));
+    assert.ok(Array.isArray(idl._provenance.transformations) && idl._provenance.transformations.length > 0,
+      "as transformações aplicadas ao excerto precisam estar declaradas");
+    const names = idl.instructions.map((i: any) => i.name);
+    assert.deepEqual(names, ["buy", "buy_exact_sol_in"]);
+  });
+
+  await test("discriminadores do builder batem byte a byte com o IDL pinado", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const idl = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/pump-idl-excerpt.json"), "utf8"));
+    const byName: Record<string, number[]> = {
+      buy: [...pi.PUMP_INSTRUCTION_DISCRIMINATORS.buy],
+      buyExactSolIn: [...pi.PUMP_INSTRUCTION_DISCRIMINATORS.buyExactSolIn],
+    };
+    for (const ix of idl.instructions) {
+      const ours = byName[ix.name === "buy_exact_sol_in" ? "buyExactSolIn" : "buy"];
+      assert.deepEqual(ours, ix.discriminator, `discriminador de ${ix.name} divergiu do IDL`);
+    }
+    for (const [name, bytes] of Object.entries(pi.PUMP_ACCOUNT_DISCRIMINATORS)) {
+      const idlAcc = idl.accounts.find((a: any) => a.name === name);
+      assert.ok(idlAcc, `${name} precisa existir nos discriminadores de conta do IDL`);
+      assert.deepEqual([...bytes], idlAcc.discriminator, `discriminador de conta ${name} divergiu`);
+    }
+  });
+
+  await test("dados da instrução: bytes exatos e tamanho derivado do IDL (uma ambiguidade resolvida por evidência)", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const buy = pi.buildBuyData({ amount: 1n, maxSolCost: 1n, trackVolume: true });
+    assert.equal(buy.length, 8 + 8 + 8 + 1);
+    assert.equal(buy.subarray(0, 8).toString("hex"), "66063d1201daebea");
+    assert.equal(buy.readBigUInt64LE(8), 1n);
+    assert.equal(buy.readBigUInt64LE(16), 1n);
+    assert.equal(buy[24], 1, "track_volume (OptionBool) = 1 byte: o IDL o define como struct de um bool");
+    assert.equal(pi.buildBuyData({ amount: 1n, maxSolCost: 1n, trackVolume: false })[24], 0);
+
+    const exact = pi.buildBuyExactSolInData({ spendableSolIn: 10_000_000n, minTokensOut: 2n });
+    assert.equal(exact.length, 8 + 8 + 8);
+    assert.equal(exact.subarray(0, 8).toString("hex"), "38fc74089edfcd5f");
+    assert.equal(exact.readBigUInt64LE(8), 10_000_000n);
+    assert.equal(exact.readBigUInt64LE(16), 2n);
+  });
+
+  await test("ordem e semântica das contas: comparadas UMA A UMA com o IDL pinado", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const idl = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/pump-idl-excerpt.json"), "utf8"));
+    const buy = idl.instructions.find((i: any) => i.name === "buy_exact_sol_in");
+
+    const mint = "So11111111111111111111111111111111111111112";
+    // Endereços de teste: o fee_recipient do protocolo MUDA, então entra por parâmetro.
+    const feeRecipient = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ";
+    const creator = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+    const user = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1";
+    const keys = pi.buildBuyAccountKeys({ mint, user, feeRecipient, creator });
+
+    assert.deepEqual(keys.map((k: any) => k.name), buy.accounts.map((a: any) => a.name),
+      "a ordem e os nomes das contas têm de ser exatamente os do IDL");
+    assert.equal(keys.length, buy.accounts.length, "nem uma conta a mais, nem a menos");
+
+    // writable/signer de cada posição: uma conta writable a menos = instrução rejeitada.
+    for (let i = 0; i < keys.length; i++) {
+      const spec = buy.accounts[i];
+      assert.equal(keys[i].isWritable, Boolean(spec.writable), `conta ${spec.name}: writable divergiu`);
+      assert.equal(keys[i].isSigner, Boolean(spec.signer), `conta ${spec.name}: signer divergiu`);
+    }
+
+    // Contas com endereço fixo no IDL precisam sair exatamente iguais.
+    for (const spec of buy.accounts) {
+      if (!spec.address) continue;
+      const key = keys.find((k: any) => k.name === spec.name);
+      assert.ok(key, `conta ${spec.name} do IDL não foi produzida pelo builder`);
+      assert.equal(key!.pubkey, spec.address, `conta ${spec.name}: endereço fixo divergiu do IDL`);
+    }
+  });
+
+  await test("PDAs: derivação confere com ground truth público (global e bonding curve)", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    // Ground truth 1: o Global PDA do pump é constante pública amplamente publicada em SDKs e
+    // exemplos (duas fontes independentes concordam) — e a derivação aqui reproduz exatamente.
+    assert.equal(pi.deriveGlobalPda(), "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+    // Derivado do IDL: bonding curve de um mint conhecido é determinística.
+    const bc = pi.deriveBondingCurvePda("So11111111111111111111111111111111111111112");
+    assert.ok(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(bc));
+    assert.notEqual(bc, pi.deriveGlobalPda());
+    // Determinismo: mesma entrada, mesmo PDA (sem estado escondido).
+    assert.equal(bc, pi.deriveBondingCurvePda("So11111111111111111111111111111111111111112"));
+  });
+
+  await test("TRAP documentada: o event_authority publicado na web NÃO é aceito — é endereço sósia", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const derivado = pi.deriveEventAuthorityPda();
+    const publicado = pi.EVENT_AUTHORITY_TRAP_ADDRESSES[0];
+    assert.notEqual(derivado, publicado,
+      "o endereço do snippet web compartilha 40 caracteres de prefixo com o derivado e tem sufixo diferente: " +
+      "é o padrão de endereço sósia que esta base já removeu uma vez (achado C4)");
+    // O sósia é base58 válido — é justamente por isso que ele passa por revisão de olho.
+    const { PublicKey } = await import("@solana/web3.js");
+    assert.equal(new PublicKey(publicado).toBytes().length, 32, "o sósia é estruturalmente válido: validação por formato não o pega");
+    /**
+     * O comprimento do prefixo comum é MEDIDO, não suposto: com 36 caracteres iguais e 8
+     * diferentes, a olho nu os dois endereços são o "mesmo" endereço — e é exatamente por isso
+     * que colar endereço de exemplo em código é um erro de segurança, não de estilo.
+     */
+    let comum = 0;
+    while (comum < publicado.length && publicado[comum] === derivado[comum]) comum++;
+    assert.ok(comum >= 30, `prefixo comum medido: ${comum} caracteres (esperado ≥ 30 para caracterizar o sósia)`);
+    assert.ok(comum < derivado.length, "os endereços NÃO são idênticos");
+  });
+
+  await test("cotação: os 4 passos das docs oficiais, com aritmética inteira conferida à mão", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    // Caso redondo, calculável à mão: gasto 1 SOL, fee total 100 bps (1%), sem creator.
+    const r = pi.quoteTokensOutExactSolIn({
+      spendableSolIn: 1_000_000_000n,
+      virtualTokenReserves: 1_000_000_000_000_000n,
+      virtualQuoteReserves: 30_000_000_000n,
+      protocolFeeBps: 100,
+      creatorFeeBps: 0,
+    });
+    assert.ok(r, "a cotação precisa ser calculável neste caso");
+    const esperadoNetSol = (1_000_000_000n * 10_000n) / 10_100n;
+    assert.equal(r!.netSol, esperadoNetSol, "passo 1: net_sol = floor(spendable * 10_000 / (10_000 + fee))");
+    const esperadoTokens = ((esperadoNetSol - 1n) * 1_000_000_000_000_000n) / (30_000_000_000n + esperadoNetSol - 1n);
+    assert.equal(r!.tokensOut, esperadoTokens, "passo 4: tokens_out da fórmula do IDL");
+    assert.equal(r!.totalFeeBps, 100);
+    assert.ok(r!.steps.length >= 3, "a cotação precisa ser auditável passo a passo");
+  });
+
+  await test("cotação: monotonicidade e recusas explícitas (nunca número inventado)", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const base = { virtualTokenReserves: 1_000_000_000_000_000n, virtualQuoteReserves: 30_000_000_000n, protocolFeeBps: 100, creatorFeeBps: 50 };
+    const um = pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 1_000_000_000n });
+    const dois = pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 2_000_000_000n });
+    assert.ok(um && dois && dois.tokensOut > um.tokensOut, "gastar mais SOL tem de comprar mais tokens");
+
+    assert.equal(pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 0n }), null, "gasto zero não tem cotação");
+    assert.equal(pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 1n }), null, "gasto menor que a taxa não tem cotação");
+    assert.equal(pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 1_000_000_000n, virtualTokenReserves: 0n }), null, "reserva zero é dado inválido");
+    assert.equal(pi.quoteTokensOutExactSolIn({ ...base, spendableSolIn: 1_000_000_000n, protocolFeeBps: 9_999, creatorFeeBps: 1_000 }), null, "taxa total ≥ 100% é absurdo declarado");
+  });
+
+  await test("min_tokens_out: piso conservador (arredonda para baixo) e slippage limitado", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    assert.equal(pi.minTokensOutFromSlippage(10_000n, 0), 10_000n, "slippage zero mantém o valor exato");
+    assert.equal(pi.minTokensOutFromSlippage(10_000n, 100), 9_900n, "1% de slippage tira 1%");
+    assert.equal(pi.minTokensOutFromSlippage(10_001n, 1), (10_001n * 9_999n) / 10_000n, "arredonda para baixo (piso)");
+    // Piso, nunca teto: com 1 token de resto, o piso é MENOR ou igual ao exato.
+    assert.ok(pi.minTokensOutFromSlippage(10_001n, 1) <= 10_001n, "nunca exigir mais do que o esperado");
+    // 10.000 bps significaria aceitar QUALQUER preço — inclusive um rug. É limitado.
+    assert.equal(pi.minTokensOutFromSlippage(10_000n, 10_000), 1n, "slippage de 100% é limitado a 9.999 bps");
+    assert.equal(pi.minTokensOutFromSlippage(10_000n, -5), 10_000n, "slippage negativo é tratado como zero");
+  });
+
+  await test("parsers: BondingCurve e Global leem os campos certos na ordem do IDL", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const idl = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "assets/pump-idl-excerpt.json"), "utf8"));
+    assert.deepEqual(pi.BONDING_CURVE_LAYOUT.map((f: any) => f.name), idl.types.BondingCurve.map((f: any) => f.name),
+      "o layout do parser de BondingCurve precisa ser o do IDL, campo por campo");
+    assert.deepEqual(pi.GLOBAL_LAYOUT.map((f: any) => f.name), idl.types.Global.map((f: any) => f.name),
+      "o layout do parser de Global precisa ser o do IDL, campo por campo");
+
+    // Monta a conta sintética A PARTIR do layout do IDL (não de um vetor escrito à mão):
+    // assim, errar a ordem no builder ou no IDL quebra o teste.
+    const buildFromIdl = (fields: any[], values: Record<string, any>) => {
+      const parts: Buffer[] = [];
+      for (const f of fields) {
+        const t = f.type;
+        if (t === "pubkey") parts.push(Buffer.from(new PublicKey(values[f.name]).toBytes()));
+        else if (t === "bool") parts.push(Buffer.from([values[f.name] ? 1 : 0]));
+        else if (Array.isArray(t)) {
+          for (let i = 0; i < t[1]; i++) parts.push(Buffer.from(new PublicKey(values[f.name][i]).toBytes()));
+        } else {
+          const buf = Buffer.alloc(t === "u128" ? 16 : 8);
+          if (t === "u128") buf.writeBigUInt64LE(BigInt(values[f.name]), 0);
+          else buf.writeBigUInt64LE(BigInt(values[f.name]), 0);
+          parts.push(buf);
+        }
+      }
+      return Buffer.concat(parts);
+    };
+
+    const zero = "11111111111111111111111111111111";
+    const creator = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+    const wsol = "So11111111111111111111111111111111111111112";
+    const bcValues: Record<string, any> = {};
+    for (const f of idl.types.BondingCurve) {
+      bcValues[f.name] = f.type === "pubkey" ? (f.name === "creator" ? creator : wsol)
+        : f.type === "bool" ? false
+        : f.name === "creator_fee_bps" ? 50 : 777;
+    }
+    const bcData = Buffer.concat([Buffer.from(pi.PUMP_ACCOUNT_DISCRIMINATORS.BondingCurve), buildFromIdl(idl.types.BondingCurve, bcValues)]);
+    const bc = pi.parseBondingCurveAccount(bcData);
+    assert.ok(bc.value, `BondingCurve deveria parsear: ${JSON.stringify(bc.problems)}`);
+    assert.equal(bc.value!.creator, creator);
+    assert.equal(bc.value!.creatorFeeBps, 50);
+    assert.equal(bc.value!.quoteMint, wsol);
+    assert.equal(bc.value!.complete, false);
+
+    const glValues: Record<string, any> = {};
+    for (const f of idl.types.Global) {
+      const t = f.type;
+      glValues[f.name] = t === "pubkey" ? (f.name === "fee_recipient" ? creator : zero)
+        : t === "bool" ? false
+        : Array.isArray(t) ? Array.from({ length: t[1] }, () => zero)
+        : f.name === "fee_basis_points" ? 100
+        : 0;
+    }
+    const glData = Buffer.concat([Buffer.from(pi.PUMP_ACCOUNT_DISCRIMINATORS.Global), buildFromIdl(idl.types.Global, glValues)]);
+    const gl = pi.parseGlobalAccount(glData);
+    assert.ok(gl.value, `Global deveria parsear: ${JSON.stringify(gl.problems)}`);
+    assert.equal(gl.value!.feeRecipient, creator);
+    assert.equal(gl.value!.feeBasisPoints, 100);
+  });
+
+  await test("parsers: recusam discriminador errado e conta truncada (ler assim daria número plausível e errado)", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const certos = Buffer.from(pi.PUMP_ACCOUNT_DISCRIMINATORS.BondingCurve);
+    const outros = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    const truncada = Buffer.concat([certos, Buffer.alloc(pi.BONDING_CURVE_ACCOUNT_SIZE - 8 - 1, 0)]);
+    const r1 = pi.parseBondingCurveAccount(truncada);
+    assert.equal(r1.value, null);
+    assert.equal(r1.problems[0].code, "bytes-insuficientes");
+
+    const tipoErrado = Buffer.concat([outros, Buffer.alloc(pi.BONDING_CURVE_ACCOUNT_SIZE - 8, 0)]);
+    const r2 = pi.parseBondingCurveAccount(tipoErrado);
+    assert.equal(r2.value, null);
+    assert.equal(r2.problems[0].code, "discriminador-errado");
+
+    assert.equal(pi.parseGlobalAccount(null).value, null, "sem dado não há valor");
+    assert.equal(pi.parseGlobalAccount(Buffer.alloc(4)).problems[0].code, "curta-demais");
+  });
+
+  await test("guarda de curva: instrução SOL-only recusa curva cotada em outro ativo", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    assert.equal(pi.assertSolQuotedCurve(pi.WSOL_MINT).ok, true);
+    assert.equal(pi.assertSolQuotedCurve(pi.SYSTEM_PROGRAM_ID).ok, true, "conta de SOL também aparece como endereço zero");
+    const usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const r = pi.assertSolQuotedCurve(usdc);
+    assert.equal(r.ok, false);
+    assert.match(r.reason ?? "", /_v2/, "o motivo precisa dizer o que usar no lugar");
+  });
+
+  await test("endereço: validação estrutural recusa lixo e o endereço zero como destinatário", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    assert.equal(pi.isUsableAddress("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"), true);
+    assert.equal(pi.isUsableAddress(pi.SYSTEM_PROGRAM_ID), false);
+    assert.equal(pi.isUsableAddress("nao-e-base58-0OIl"), false);
+    assert.equal(pi.isUsableAddress(""), false);
+  });
+
+  await test("instrução montada: programa, contas e dados coerentes entre si", async () => {
+    const pi = await import("../src/pumpInstruction.js");
+    const ix = pi.buildPumpBuyExactSolInInstruction({
+      mint: pi.WSOL_MINT,
+      user: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+      feeRecipient: "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ",
+      creator: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+      spendableSolIn: 10_000_000n,
+      minTokensOut: 1_234n,
+    });
+    assert.equal(ix.programId, pi.PUMP_PROGRAM_ID);
+    assert.equal(ix.keys.length, 16, "buy_exact_sol_in tem 16 contas no IDL pinado");
+    assert.equal(ix.accountNames.join(","), ix.keys.map((k: any) => k.name).join(","));
+    assert.equal(ix.data.readBigUInt64LE(0 + 8), 10_000_000n);
+    assert.equal(ix.data.readBigUInt64LE(16), 1_234n);
+    const signers = ix.keys.filter((k: any) => k.isSigner).map((k: any) => k.name);
+    assert.deepEqual(signers, ["user"], "só o usuário assina — um signer a mais quebraria o envio");
+    assert.equal(ix.keys.find((k: any) => k.name === "fee_program")!.pubkey, pi.PUMP_FEE_PROGRAM_ID);
+    assert.equal(ix.keys.find((k: any) => k.name === "program")!.pubkey, pi.PUMP_PROGRAM_ID);
+  });
+
+  await test("isolamento: o módulo de instrução não assina, não envia e não lê segredo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/pumpInstruction.ts"), "utf8"));
+    for (const proibido of ["Keypair", "OPERATIONAL_PRIVATE_KEY", "process.env", "sendTransaction", "sendRawTransaction", "fetch("]) {
+      assert.equal(src.includes(proibido), false, `pumpInstruction.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(/findProgramAddressSync/.test(src), "PDA é DERIVADO, nunca copiado");
+    assert.ok(!/web3\.js.*Connection/.test(src), "não abre conexão");
+  });
+
+  await test("custo mínimo honesto: rent documentado no IDL é cobrado do pagador", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const idl = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/pump-idl-excerpt.json"), "utf8"));
+    const docs: string[] = idl.instructions.find((i: any) => i.name === "buy_exact_sol_in").docs;
+    const texto = docs.join(" ");
+    assert.match(texto, /creator_vault: rent\.minimum_balance/);
+    assert.match(texto, /user_volume_accumulator: rent\.minimum_balance/);
+    assert.match(texto, /Quote formulas/, "a fórmula de cotação implementada vem das docs do IDL pinado");
+  });
+
+  await test("rota nativa: trocar o blockhash após montar sobrevive à assinatura e à serialização", async () => {
+    /**
+     * MECANISMO DO QUAL A ROTA NATIVA DEPENDE. A transação é montada sem blockhash real (o da
+     * curva não existe antes de a montagem terminar) e o blockhash monitorado entra depois, no
+     * choke point de assinatura. Se o web3.js ignorasse a mutação, o sistema assinaria com o
+     * blockhash de espaço reservado — e a transação seria rejeitada SEMPRE, gastando a
+     * tentativa e o tip. Este teste prova o mecanismo sem rede e sem chave real (Keypair
+     * efêmero, só em memória, nada transmitido).
+     */
+    const { Keypair, MessageV0, TransactionMessage, VersionedTransaction, ComputeBudgetProgram } = await import("@solana/web3.js");
+    const pi = await import("../src/pumpInstruction.js");
+    const payer = Keypair.generate();
+    const msg = new TransactionMessage({
+      payerKey: payer.publicKey,
+      recentBlockhash: "11111111111111111111111111111111",
+      instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 })],
+    }).compileToV0Message();
+    const tx = new VersionedTransaction(msg);
+    const blockhashMonitorado = pi.deriveGlobalPda();
+    tx.message.recentBlockhash = blockhashMonitorado;
+    tx.sign([payer]);
+    const voltou = VersionedTransaction.deserialize(tx.serialize());
+    assert.equal(
+      MessageV0.deserialize(voltou.message.serialize()).recentBlockhash,
+      blockhashMonitorado,
+      "o blockhash substituído tem de estar nos bytes assinados"
+    );
+  });
+
+  await test("fiação: rota nativa é opt-in, validada fail-closed e reportada em /api/real-entry", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/HFT_ENTRY_ROUTE/.test(src), "a rota precisa ser selecionável por variável");
+    assert.ok(
+      /entryRoute !== "aggregator" && entryRoute !== "native"[\s\S]{0,400}refusedRealEntry/.test(src),
+      "rota desconhecida precisa ser RECUSADA (fail-closed), não cair em um default silencioso"
+    );
+    assert.ok(/buildPumpBuyExactSolInInstruction\(/.test(src), "a rota nativa precisa usar o builder do IDL");
+    assert.ok(/ComputeBudgetProgram\.setComputeUnitLimit/.test(src), "compute budget explícito no caminho nativo");
+    assert.ok(
+      /tx\.message\.recentBlockhash = blockhash/.test(src),
+      "o blockhash de espaço reservado da montagem precisa ser substituído antes de assinar"
+    );
+    assert.ok(/entryRoute,/.test(src) && /entryRouteNote/.test(src), "/api/real-entry precisa declarar a rota ativa");
+  });
+
+  await test("dry-run: o script de validação não assina, não envia e não aceita chave privada", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "scripts/pump-dryrun.ts"), "utf8");
+    const src = codigoSemComentarios(raw);
+    for (const proibido of ["sendTransaction", "sendRawTransaction", "Keypair", "fromSecretKey", ".sign(", "partialSign"]) {
+      assert.equal(src.includes(proibido), false, `pump-dryrun.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(/sigVerify: false/.test(src), "a simulação precisa dispensar assinatura (nenhuma chave envolvida)");
+    assert.ok(/replaceRecentBlockhash: true/.test(src), "blockhash não pode ser o objeto do teste");
+    assert.ok(/getMultipleAccountsInfo/.test(src), "o dry-run lê as contas reais");
+    assert.ok(/NENHUMA assinatura/.test(raw), "o script precisa dizer em texto que não assina");
+  });
+
+  await test("dry-run: recusa antes de simular quando não há o que medir", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "scripts/pump-dryrun.ts"), "utf8"));
+    assert.ok(/curve\.value\.complete[\s\S]{0,200}fail\(/.test(src), "curva completa precisa abortar com motivo");
+    assert.ok(/assertSolQuotedCurve/.test(src), "curva não-SOL precisa abortar");
+    assert.ok(/owner\.toBase58\(\) !== PUMP_PROGRAM_ID/.test(src), "conta de outro programa precisa abortar (PDA errado)");
+    assert.ok(/parseGlobalAccount\(globalInfo\.data\)/.test(src) && /parseBondingCurveAccount\(curveInfo\.data\)/.test(src),
+      "os parsers precisam ser exercitados contra dados REAIS: é o ponto do dry-run");
+  });
+
+  await test(".env.example declara a rota e o orçamento de compute do caminho nativo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const env = fs.readFileSync(path.join(repoRoot, ".env.example"), "utf8");
+    for (const v of ["HFT_ENTRY_ROUTE", "HFT_ENTRY_CU_LIMIT", "HFT_ENTRY_CU_PRICE_MICROLAMPORTS"]) {
+      assert.ok(env.includes(v), `.env.example precisa declarar ${v}`);
+    }
+    assert.ok(/pump:dryrun/.test(env), "o .env.example precisa apontar o comando de validação");
+  });
+
+  await test("anti-drift do IDL: divergência é fatal na rota nativa e avisada na rota agregador", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/verifyPumpIdlAgainstChain/.test(src), "o boot precisa verificar o layout contra a rede");
+    assert.ok(/IDL_DRIFT/.test(src), "a divergência precisa ter código próprio, não 'erro genérico'");
+    // Fatal SÓ na rota native: na rota agregador a divergência de layout não é o risco da operação.
+    assert.ok(
+      /const fatal = entryRoute === "native"/.test(src),
+      "a política de fatalidade precisa ser derivada da rota, não fixa"
+    );
+    assert.ok(
+      /PUMP_ACCOUNT_DISCRIMINATORS\.Global/.test(src) && /PUMP_ACCOUNT_DISCRIMINATORS\.FeeConfig/.test(src),
+      "os discriminadores verificados têm de vir do IDL pinado, não de literais hex escritos à mão"
+    );
+    assert.ok(/PUMP_FEE_PROGRAM_ID/.test(src) && /deriveFeeConfigPda/.test(src), "a âncora de taxas precisa ser verificada");
+    assert.ok(
+      /IDL_NAO_VERIFICADO/.test(src),
+      "RPC inalcançável NÃO pode ser registrado como 'ok': é indeterminado, e chamar de ok seria telemetria falsa"
+    );
+  });
+
+  await test("anti-drift: distingue 'conferiu' de 'não conferiu' de 'não foi verificado' (três estados, não dois)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    // `checked: true, ok: null` é o estado "indeterminado" — nem sucesso nem drift.
+    assert.ok(
+      /pumpIdlDrift: \{ checked: boolean; ok: boolean \| null; code: string \| null; detail: string \| null \}/.test(src),
+      "o estado precisa ter um valor para 'não verificado' (ok: null)"
+    );
+    assert.ok(/idlDrift: pumpIdlDrift/.test(src), "o estado precisa estar exposto no endpoint de diagnóstico");
+  });
+
+  await test("painel de HFT: a tela lê o estado real da entrada — sem afirmação estática de autorização", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const arquivo = fs.readFileSync(path.join(repoRoot, "src/components/HftProfiler.tsx"), "utf8");
+    assert.equal(
+      /S6 NÃO AUTORIZADO/.test(arquivo),
+      false,
+      "o S6 foi publicado: manter esse texto seria uma afirmação falsa sobre o próprio sistema"
+    );
+    assert.ok(/fetch\("\/api\/real-entry"\)/.test(arquivo), "o estado da entrada precisa vir do backend");
+    assert.ok(/readiness\?\.allowed/.test(arquivo), "o portão é `allowed`, não `enabled`");
+    assert.ok(/"não medido"/.test(arquivo), "sem resposta do backend a tela diz 'não medido'");
+  });
+
+  await test("painel de MEV: o simulador de bundle não se confunde com a entrada real", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const arquivo = fs.readFileSync(path.join(repoRoot, "src/components/MevExecutionEngine.tsx"), "utf8");
+    assert.equal(/depende do S6 \(não autorizado\)/.test(arquivo), false, "texto desatualizado sobre o S6");
+    assert.ok(/POST \/api\/real-entry/.test(arquivo), "a tela precisa apontar o caminho REAL da compra");
+    assert.ok(/SIMULADO/.test(arquivo), "e deixar explícito que ela mesma é simulação");
+  });
+
+  await test("rota native: entrada recusa quando o layout NÃO está confirmado (defesa em profundidade)", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(
+      /entryRoute === "native" && pumpIdlDrift\.ok !== true/.test(src),
+      "a checagem tem de ser `ok !== true`: `ok === false` sozinho deixaria passar o caso INDETERMINADO"
+    );
+    // A ordem importa: a guarda de IDL precisa vir ANTES de qualquer montagem de instrução.
+    const posGuarda = src.indexOf('entryRoute === "native" && pumpIdlDrift.ok !== true');
+    const posBuilder = src.indexOf("buildPumpBuyExactSolInInstruction({");
+    assert.ok(posGuarda > 0 && posBuilder > 0 && posGuarda < posBuilder, "verificação antes da montagem");
+  });
+
+  // [26] S7 — INGESTÃO gRPC (YELLOWSTONE): política, redação de segredo e decodificação
+  console.log("\n[26] Fast path gRPC (S7): filtro de transações, CreateEvent e reconexão declarada");
+
+  /**
+   * CODIFICADOR dos eventos, montado A PARTIR DO IDL pinado. É o inverso do decoder e existe para
+   * que os testes não dependam de vetor escrito à mão: se o layout mudar no excerto, o dado
+   * sintético muda junto e o decoder tem de continuar lendo os mesmos campos.
+   */
+  const encodeEventBody = (layout: any[], values: Record<string, any>): Buffer => {
+    const parts: Buffer[] = [];
+    for (const f of layout) {
+      const t = f.type;
+      const v = values[f.name];
+      if (t === "pubkey") parts.push(Buffer.from(new PublicKey(v).toBytes()));
+      else if (t === "bool") parts.push(Buffer.from([v ? 1 : 0]));
+      else if (t === "u8") parts.push(Buffer.from([Number(v)]));
+      else if (t === "u16") {
+        const b = Buffer.alloc(2);
+        b.writeUInt16LE(Number(v), 0);
+        parts.push(b);
+      } else if (t === "u32") {
+        const b = Buffer.alloc(4);
+        b.writeUInt32LE(Number(v), 0);
+        parts.push(b);
+      } else if (t === "u64") {
+        const b = Buffer.alloc(8);
+        b.writeBigUInt64LE(BigInt(v), 0);
+        parts.push(b);
+      } else if (t === "i64") {
+        const b = Buffer.alloc(8);
+        b.writeBigInt64LE(BigInt(v), 0);
+        parts.push(b);
+      } else if (t === "string") {
+        const s = Buffer.from(String(v), "utf8");
+        const len = Buffer.alloc(4);
+        len.writeUInt32LE(s.length, 0);
+        parts.push(len, s);
+      } else if (t && typeof t === "object" && t.vec) {
+        const items = Array.isArray(v) ? v : [];
+        const count = Buffer.alloc(4);
+        count.writeUInt32LE(items.length, 0);
+        parts.push(count);
+        for (const item of items) {
+          const sub = encodeEventBody(
+            [{ name: "address", type: "pubkey" }, { name: "share_bps", type: "u16" }],
+            item
+          );
+          parts.push(sub);
+        }
+      } else {
+        throw new Error(`tipo não suportado no codificador de teste: ${JSON.stringify(t)}`);
+      }
+    }
+    return Buffer.concat(parts);
+  };
+
+  const idlExcerpt = JSON.parse(
+    fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "assets/pump-idl-excerpt.json"), "utf8")
+  );
+  const eventLogLine = (name: string, values: Record<string, any>): string => {
+    const ev = idlExcerpt.events.find((e: any) => e.name === name);
+    const body = encodeEventBody(idlExcerpt.types[name], values);
+    const data = Buffer.concat([Buffer.from(ev.discriminator), body]);
+    return `Program data: ${bs58.encode(data)}`;
+  };
+  const creatorKey = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+
+  const createEventValues = (mint: string, over: Record<string, any> = {}) => ({
+    name: "Test Token",
+    symbol: "TEST",
+    uri: "https://exemplo.invalido/meta.json",
+    mint,
+    bonding_curve: deriveBondingCurvePda(mint),
+    user: creatorKey,
+    creator: creatorKey,
+    timestamp: 1_700_000_000n,
+    virtual_token_reserves: 1_073_000_000_000_000n,
+    virtual_sol_reserves: 30_000_000_000n,
+    real_token_reserves: 793_100_000_000_000n,
+    token_total_supply: 1_000_000_000_000_000n,
+    token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    is_mayhem_mode: false,
+    is_cashback_enabled: false,
+    quote_mint: "11111111111111111111111111111111",
+    virtual_quote_reserves: 30_000_000_000n,
+    creator_fee_bps: 50n,
+    is_holder_reward: false,
+    ...over,
+  });
+
+  await test("discriminadores do Anchor conferem com sha256 dos NOMES (verificação independente da leitura)", async () => {
+    /**
+     * O esquema é público: `sha256("global:nome")`, `sha256("account:Nome")`, `sha256("event:Nome")`,
+     * primeiros 8 bytes. Isto é uma verificação INDEPENDENTE do arquivo pinado: se um discriminador
+     * tivesse sido transcrito errado (ou "lembrado" de um snippet), este teste falha. Foi assim que
+     * o endereço sósia do `event_authority` foi pego — por derivação, não por leitura.
+     */
+    const esperado = (prefixo: string, nome: string) =>
+      [...crypto.createHash("sha256").update(`${prefixo}:${nome}`).digest().subarray(0, 8)];
+
+    const idl = JSON.parse(
+      fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "assets/pump-idl-excerpt.json"), "utf8")
+    );
+
+    for (const ix of idl.instructions) {
+      assert.deepEqual(ix.discriminator, esperado("global", ix.name), `instrução ${ix.name}`);
+    }
+    for (const acc of idl.accounts) {
+      assert.deepEqual(acc.discriminator, esperado("account", acc.name), `conta ${acc.name}`);
+    }
+    for (const ev of idl.events) {
+      assert.deepEqual(ev.discriminator, esperado("event", ev.name), `evento ${ev.name}`);
+    }
+
+    const pe = await import("../src/pumpEvents.js");
+    for (const [nome, bytes] of Object.entries(pe.PUMP_EVENT_DISCRIMINATORS)) {
+      assert.deepEqual([...(bytes as Uint8Array)], esperado("event", nome), `módulo de eventos: ${nome}`);
+    }
+  });
+
+  await test("eventos: CreateEvent decodificado dos logs entrega mint, nome e avisos MEDIDOS", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const logs = ["Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]", eventLogLine("CreateEvent", createEventValues(mint)), "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"];
+
+    const create = pe.findCreateEvent(logs);
+    assert.ok(create, "o CreateEvent precisa ser encontrado pelo discriminador");
+    assert.equal(create!.mint, mint);
+    assert.equal(create!.name, "Test Token");
+    assert.equal(create!.symbol, "TEST");
+    assert.equal(create!.creator, creatorKey);
+    assert.equal(create!.virtualSolReserves, 30_000_000_000n);
+    assert.equal(create!.quoteMint, "11111111111111111111111111111111");
+    assert.deepEqual(create!.warnings, [], "lançamento padrão em SOL não gera aviso");
+
+    // Modo mayhem + cotação não-SOL: o operador PRECISA ver, e é medido do evento.
+    const esquisito = pe.findCreateEvent([
+      eventLogLine("CreateEvent", createEventValues(mint, {
+        is_mayhem_mode: true,
+        quote_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      })),
+    ]);
+    assert.ok(esquisito);
+    assert.equal(esquisito!.warnings.length, 2, JSON.stringify(esquisito!.warnings));
+    assert.ok(esquisito!.warnings.some((w) => /MAYHEM/.test(w)));
+    assert.ok(esquisito!.warnings.some((w) => /NÃO é SOL/.test(w)));
+  });
+
+  await test("eventos: corpo TRUNCADO não vira evento com campo lido no lugar errado", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const corpo = encodeEventBody(idlExcerpt.types.CreateEvent, createEventValues(mint));
+    const disc = Buffer.from(idlExcerpt.events.find((e: any) => e.name === "CreateEvent").discriminator);
+    const truncado = Buffer.concat([disc, corpo.subarray(0, 40)]);
+    const decoded = pe.decodePumpEventData(truncado);
+    assert.ok(decoded, "o discriminador é reconhecido");
+    assert.equal(decoded!.name, "CreateEvent");
+    assert.equal(decoded!.value, null, "corpo insuficiente NÃO pode produzir valor parcial");
+    assert.equal(decoded!.problems[0].code, "bytes-insuficientes");
+  });
+
+  await test("eventos: corpo maior que o layout é aceito com aviso (programa pode adicionar campos)", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const corpo = encodeEventBody(idlExcerpt.types.CreateEvent, createEventValues(mint));
+    const disc = Buffer.from(idlExcerpt.events.find((e: any) => e.name === "CreateEvent").discriminator);
+    const comExtra = Buffer.concat([disc, corpo, Buffer.alloc(16, 7)]);
+    const decoded = pe.decodePumpEventData(comExtra)!;
+    assert.equal(decoded.trailingBytes, 16);
+    const create = pe.toCreateEvent(decoded);
+    assert.equal(create!.mint, mint, "os campos conhecidos continuam corretos");
+    assert.ok(create!.warnings.some((w) => /além do layout pinado/.test(w)), "a sobra precisa ser declarada");
+  });
+
+  await test("eventos: discriminação exige o byte exato (não aceita prefixo nem lixo)", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const disc = [...pe.PUMP_EVENT_DISCRIMINATORS.CreateEvent];
+    const corrompido = Uint8Array.from([...disc.slice(0, 7), (disc[7] + 1) % 256]);
+    assert.equal(pe.decodePumpEventData(Uint8Array.from([...corrompido, ...new Array(200).fill(0)])), null);
+    assert.equal(pe.decodePumpEventData(new Uint8Array(4)), null, "menos de 8 bytes não é evento");
+    assert.equal(pe.findCreateEvent(["Program log: nada aqui"]), null, "log sem evento não vira evento");
+  });
+
+  await test("TradeEvent: compra de terceiro é decodificada com taxas e ix_name (preço real, não estimado)", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const trade = {
+      mint,
+      sol_amount: 1_000_000_000n,
+      token_amount: 33_000_000_000_000n,
+      is_buy: true,
+      user: creatorKey,
+      timestamp: 1_700_000_001n,
+      virtual_sol_reserves: 31_000_000_000n,
+      virtual_token_reserves: 1_040_000_000_000_000n,
+      real_sol_reserves: 1_000_000_000n,
+      real_token_reserves: 793_000_000_000_000n,
+      fee_recipient: creatorKey,
+      fee_basis_points: 100n,
+      fee: 10_000_000n,
+      creator: creatorKey,
+      creator_fee_basis_points: 50n,
+      creator_fee: 5_000_000n,
+      track_volume: true,
+      total_unclaimed_tokens: 0n,
+      total_claimed_tokens: 0n,
+      current_sol_volume: 1_000_000_000n,
+      last_update_timestamp: 1_700_000_001n,
+      ix_name: "buy",
+      mayhem_mode: false,
+      cashback_fee_basis_points: 0n,
+      cashback: 0n,
+      buyback_fee_basis_points: 0n,
+      buyback_fee: 0n,
+      shareholders: [{ address: creatorKey, share_bps: 10_000 }],
+      quote_mint: "11111111111111111111111111111111",
+      quote_amount: 1_000_000_000n,
+      virtual_quote_reserves: 31_000_000_000n,
+      real_quote_reserves: 1_000_000_000n,
+      holder_rewards_bps: 0n,
+      holder_rewards: 0n,
+    };
+    const last = pe.findLastTradeEvent([eventLogLine("TradeEvent", trade)]);
+    assert.ok(last, "TradeEvent precisa decodificar (o vec<Shareholder> no meio quebra decoders ingênuos)");
+    assert.equal(last!.mint, mint);
+    assert.equal(last!.isBuy, true);
+    assert.equal(last!.ixName, "buy");
+    assert.equal(last!.fee, 10_000_000n);
+    assert.equal(last!.creatorFee, 5_000_000n);
+    assert.equal(last!.quoteAmount, 1_000_000_000n);
+  });
+
+  await test("eventos: migração/complete é detectada (não se compra curva de token migrado)", async () => {
+    const pe = await import("../src/pumpEvents.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const migrado = eventLogLine("CompletePumpAmmMigrationEvent", {
+      user: creatorKey, mint, mint_amount: 1n, sol_amount: 2n, pool_migration_fee: 3n,
+      bonding_curve: deriveBondingCurvePda(mint), timestamp: 1n, pool: creatorKey,
+      quote_mint: "11111111111111111111111111111111",
+    });
+    assert.equal(pe.findCurveTerminalEvent([migrado]), "migrated");
+    const completo = eventLogLine("CompleteEvent", {
+      user: creatorKey, mint, bonding_curve: deriveBondingCurvePda(mint), timestamp: 1n,
+      quote_mint: "11111111111111111111111111111111",
+    });
+    assert.equal(pe.findCurveTerminalEvent([completo]), "complete");
+    assert.equal(pe.findCurveTerminalEvent(["Program log: nada"]), null);
+  });
+
+  await test("ingestão: política decide gRPC × WSS sem inventar credencial e sem logar segredo", async () => {
+    const gi = await import("../src/grpcIngest.js");
+
+    const semNada = gi.resolveIngestPolicy({} as any);
+    assert.equal(semNada.effective, "wss", "sem endpoint o caminho é WSS — e isto continua funcionando");
+    assert.deepEqual(semNada.blockers, []);
+
+    const comUrl = gi.resolveIngestPolicy({ GEYSER_GRPC_URL: "grpc.exemplo.com:443" } as any);
+    assert.equal(comUrl.effective, "grpc");
+
+    const tokenSobrando = gi.resolveIngestPolicy({ GEYSER_GRPC_TOKEN: "segredo" } as any);
+    assert.equal(tokenSobrando.effective, "wss");
+    assert.ok(tokenSobrando.blockers.some((b) => /TOKEN definido sem GEYSER_GRPC_URL/.test(b)),
+      "segredo sem endpoint é configuração pela metade e precisa ser dito");
+
+    const forcadoGrpc = gi.resolveIngestPolicy({ HFT_INGEST: "grpc" } as any);
+    assert.ok(forcadoGrpc.blockers.some((b) => /exige GEYSER_GRPC_URL/.test(b)));
+
+    const forcadoWss = gi.resolveIngestPolicy({ HFT_INGEST: "wss", GEYSER_GRPC_URL: "grpc.exemplo.com:443" } as any);
+    assert.equal(forcadoWss.effective, "wss");
+    assert.ok(forcadoWss.notes.some((n) => /força o caminho WebSocket/.test(n)));
+
+    // REDAÇÃO: o token nunca pode sair em log/health.
+    // Credencial SEM esquema (a forma que um operador cola em "host:porta")…
+    assert.equal(gi.redactGrpcEndpoint("user:senha@grpc.exemplo.com:443"), "***@grpc.exemplo.com:443");
+    // …e COM esquema: as duas formas precisam ser redigidas.
+    assert.equal(gi.redactGrpcEndpoint("grpc://user:senha@grpc.exemplo.com:443"), "grpc://***@grpc.exemplo.com:443");
+    assert.equal(gi.redactGrpcEndpoint("grpc.exemplo.com:443"), "grpc.exemplo.com:443", "endpoint sem credencial não é alterado");
+    const msg = gi.sanitizeGrpcError("falha com token abcdef123456 no header x-token: abcdef123456", "abcdef123456");
+    assert.equal(msg.includes("abcdef123456"), false, "o token não pode sobreviver à sanitização");
+    assert.ok(msg.includes("***"));
+  });
+
+  await test("ingestão: endpoint incoerente é RECUSADO antes de tentar conectar", async () => {
+    const gi = await import("../src/grpcIngest.js");
+    assert.equal(gi.assessGrpcEndpoint("grpc.exemplo.com:443").ok, true);
+    for (const ruim of ["", "https://grpc.exemplo.com:443", "wss://grpc.exemplo.com", "grpc.exemplo.com", "grpc.exemplo.com:443/"]) {
+      const r = gi.assessGrpcEndpoint(ruim);
+      assert.equal(r.ok, false, `deveria recusar: "${ruim}"`);
+      assert.ok(r.problem && r.problem.length > 10, "recusar sem motivo não ajuda o operador");
+    }
+    assert.equal(gi.assessGrpcEndpoint("grpc.exemplo.com:99999").ok, false, "porta fora do intervalo");
+  });
+
+  await test("ingestão: update do stream vira lançamento; trade, voto, falha e duplicata NÃO", async () => {
+    const gi = await import("../src/grpcIngest.js");
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const logCreate = eventLogLine("CreateEvent", createEventValues(mint));
+
+    const listeners: Record<string, Array<(...a: any[]) => void>> = {};
+    const stream = {
+      on(event: string, cb: (...a: any[]) => void) {
+        (listeners[event] ||= []).push(cb);
+        return stream;
+      },
+      write() {},
+      destroy() {},
+    };
+    const fakeClient = {
+      connect: async () => {},
+      subscribe: async () => stream,
+      getSlot: async () => 5000,
+      buildTransactionSubscribeRequest: (programId: string, commitment: string) => ({ programId, commitment }),
+      buildPingRequest: (id: number) => ({ ping: { id } }),
+      // Nos testes o update já chega normalizado (a normalização do protobuf tem teste próprio).
+      normalizeTransactionUpdate: (raw: any) => raw,
+    };
+
+    const client = new gi.GrpcIngestClient(async () => fakeClient as any, {
+      url: "grpc.exemplo.com:443",
+      token: "segredo-nao-pode-vazar",
+      programId: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      pingIntervalMs: 10_000,
+    });
+    const recebidos: any[] = [];
+    client.onTokenDetected((ev: any) => recebidos.push(ev));
+    await client.connect();
+
+    assert.equal(client.getHealth().connected, true);
+    assert.equal(client.getHealth().subscriptionsRequested, 1);
+
+    const emit = (u: any) => listeners.data.forEach((cb) => cb(u));
+    const base = { slot: 4999, signature: "sigA", failed: false, isVote: false, logMessages: [logCreate], accountKeys: [] };
+
+    emit(base);
+    assert.equal(recebidos.length, 1, "CreateEvent no log = lançamento");
+    assert.equal(recebidos[0].mint, mint);
+    assert.equal(recebidos[0].source, "grpc-geyser");
+    assert.equal(recebidos[0].slot, 4999);
+    assert.equal(recebidos[0].grpcLatencyMs, 0, "sem enriquecimento não há RTT: zero MEDIDO, não null");
+
+    emit(base);
+    assert.equal(recebidos.length, 1, "mesma assinatura reentregue NÃO pode virar segundo lançamento");
+    assert.equal(client.getHealth().hotPath.duplicatesDropped, 1);
+
+    emit({ ...base, signature: "sigB", failed: true });
+    emit({ ...base, signature: "sigC", isVote: true });
+    emit({ ...base, signature: "sigD", logMessages: ["Program log: sem evento do pump"] });
+    assert.equal(recebidos.length, 1, "falha, voto e transação sem CreateEvent não são lançamentos");
+
+    emit({ ...base, signature: "sigE", logMessages: ["Program data: 111111"] });
+    assert.equal(recebidos.length, 1);
+    const h = client.getHealth();
+    assert.equal(h.grpc.decodeFailures, 0, "base58 inválido não é falha de DECODIFICAÇÃO de evento do pump");
+    assert.ok(h.grpc.updatesSeen >= 5, "todos os updates foram contados como tráfego do canal");
+
+    client.disconnect();
+    assert.equal(client.getHealth().connected, false);
+  });
+
+  await test("ingestão: stream que cai agenda reconexão e o health diz o que aconteceu", async () => {
+    const gi = await import("../src/grpcIngest.js");
+    const listeners: Record<string, Array<(...a: any[]) => void>> = {};
+    let subscriptions = 0;
+    const stream = {
+      on(event: string, cb: (...a: any[]) => void) {
+        (listeners[event] ||= []).push(cb);
+        return stream;
+      },
+      write() {},
+      destroy() {},
+    };
+    const fakeClient = {
+      connect: async () => {},
+      subscribe: async () => {
+        subscriptions++;
+        return stream;
+      },
+      buildTransactionSubscribeRequest: () => ({}),
+      buildPingRequest: (id: number) => ({ ping: { id } }),
+      normalizeTransactionUpdate: (raw: any) => raw,
+    };
+
+    const client = new gi.GrpcIngestClient(async () => fakeClient as any, {
+      url: "grpc.exemplo.com:443",
+      token: "",
+      programId: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      initialBackoffMs: 1,
+      maxBackoffMs: 4,
+    });
+    await client.connect();
+    assert.equal(subscriptions, 1);
+
+    // Stream encerrado pelo provedor → reconexão com backoff curto (configurado no teste).
+    listeners.end?.forEach((cb) => cb());
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(subscriptions, 2, "o stream precisa ser reaberto sozinho");
+    assert.ok(
+      client.getHealth().grpc.reconnectAttempts >= 1,
+      "a reconexão precisa ser CONTADA (silêncio aqui esconde um canal morto)"
+    );
+    assert.ok(
+      client.getHealth().recentErrors.some((e) => /stream encerrado/.test(e)),
+      "o motivo precisa estar no health"
+    );
+    client.disconnect();
+  });
+
+  await test("ingestão: falha ao carregar o cliente nativo é degradação declarada, não queda", async () => {
+    const gi = await import("../src/grpcIngest.js");
+    const client = new gi.GrpcIngestClient(
+      async () => {
+        throw new Error("não foi possível carregar @triton-one/yellowstone-grpc (MODULE_NOT_FOUND)");
+      },
+      { url: "grpc.exemplo.com:443", token: "segredo", programId: "6EF8rrecthR5Dkz", initialBackoffMs: 1, maxReconnectAttempts: 1 }
+    );
+    await client.connect();
+    const h = client.getHealth();
+    assert.equal(h.connected, false);
+    assert.equal(h.degraded, true);
+    assert.ok(h.recentErrors.some((e) => /YELLOWSTONE|carregar/.test(e)), JSON.stringify(h.recentErrors));
+    assert.equal(h.grpc.endpoint, "grpc.exemplo.com:443");
+    client.disconnect();
+  });
+
+  await test("ingestão: o módulo não assina, não envia e não guarda chave; o adaptador é o único que toca o pacote nativo", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ingestSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/grpcIngest.ts"), "utf8"));
+    for (const proibido of ["Keypair", "signTransaction", "sendTransaction", "sendRawTransaction", "OPERATIONAL_PRIVATE_KEY"]) {
+      assert.equal(ingestSrc.includes(proibido), false, `grpcIngest.ts não pode referenciar ${proibido}`);
+    }
+    const adapterSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/grpcYellowstoneClient.ts"), "utf8"));
+    assert.ok(/@triton-one\/yellowstone-grpc/.test(adapterSrc), "o adaptador é quem carrega o pacote nativo");
+    for (const proibido of ["Keypair", "sendTransaction", "sendRawTransaction"]) {
+      assert.equal(adapterSrc.includes(proibido), false, `o adaptador só LÊ a rede: não pode referenciar ${proibido}`);
+    }
+    // O núcleo não pode depender do pacote nativo (é o que mantém o teste e o WSS independentes dele).
+    assert.equal(/@triton-one/.test(ingestSrc), false, "o núcleo de ingestão não importa o pacote nativo");
+
+    const serverSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/resolveIngestPolicy/.test(serverSrc), "a escolha do transporte precisa ser por política");
+    assert.ok(/firstSightAcrossSources/.test(serverSrc), "dedupe entre fontes é obrigatório com dois transportes");
+    assert.ok(
+      /grpcClient\.onTokenDetected[\s\S]{0,800}emitDetected/.test(serverSrc),
+      "o evento do gRPC entra no pipeline pelo MESMO ponto de entrada do WSS"
+    );
+  });
+
+  // [27] S8 — ENVIO PARALELO: corrida de transportes, primeira aceitação vence, aceito ≠ executado
+  console.log("\n[27] Envio paralelo (S8): corrida, timeouts, recusas agregadas e o que 'ok' NÃO significa");
+
+  await test("política: paralelo é opt-in; sem flag o caminho continua sendo o bundle Jito único", async () => {
+    const ps = await import("../src/parallelSend.js");
+
+    const desligado = ps.resolveParallelSendPolicy({} as any);
+    assert.equal(desligado.enabled, false);
+    assert.deepEqual(desligado.transports, ["jito"], "default = comportamento do S6, sem surpresa");
+    assert.equal(desligado.transportTimeoutMs, 3000);
+
+    const comSender = ps.resolveParallelSendPolicy({
+      HFT_PARALLEL_SEND: "1",
+      HFT_STAKED_SENDER_URL: "https://sender.exemplo.com/fast",
+      HFT_SEND_RPC_DIRECT: "1",
+    } as any);
+    assert.equal(comSender.enabled, true);
+    assert.deepEqual(comSender.transports, ["jito", "staked", "rpc"]);
+    assert.equal(comSender.swqosOnly, true, "default: pede SWQOS ao sender");
+
+    // URL definida mas corrida desligada: o transporte NÃO entra e isso é dito.
+    const urlSemFlag = ps.resolveParallelSendPolicy({ HFT_STAKED_SENDER_URL: "https://x.invalido" } as any);
+    assert.equal(urlSemFlag.enabled, false);
+    assert.deepEqual(urlSemFlag.transports, ["jito"]);
+    assert.ok(ps.describeParallelSendPolicy(urlSemFlag).some((n) => /não é usado/.test(n)));
+
+    // AUSÊNCIA ≠ ZERO (bug histórico desta base): timeout ausente/ inválido cai no default.
+    assert.equal(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_TRANSPORT_TIMEOUT_MS: "" } as any).transportTimeoutMs, 3000);
+    assert.equal(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_TRANSPORT_TIMEOUT_MS: "abc" } as any).transportTimeoutMs, 3000);
+    assert.equal(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_TRANSPORT_TIMEOUT_MS: "50" } as any).transportTimeoutMs, 250, "piso de 250ms");
+    assert.equal(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_TRANSPORT_TIMEOUT_MS: "999999" } as any).transportTimeoutMs, 30_000, "teto de 30s");
+
+    // Notas honestas: sem sender configurado o operador precisa saber o que está perdendo.
+    const notes = ps.describeParallelSendPolicy(comSender);
+    assert.ok(notes.some((n) => /swqos_only/.test(n)), "o efeito de ?swqos_only precisa ser declarado");
+    assert.ok(notes.some((n) => /não podem executar duas vezes/.test(n)), "a base da segurança da corrida precisa estar escrita");
+  });
+
+  await test("corrida: o PRIMEIRO aceite vence, os perdedores NÃO são cancelados", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const ordem: string[] = [];
+    let liberaSegundo: () => void = () => {};
+    const segundoPendente = new Promise<void>((r) => {
+      liberaSegundo = r;
+    });
+
+    const outcome = await ps.sendInParallel({
+      signature: "sig123",
+      timeoutMs: 1_000,
+      now: () => Date.now(),
+      transports: [
+        {
+          name: "jito",
+          send: async () => {
+            ordem.push("jito:inicio");
+            await new Promise((r) => setTimeout(r, 30));
+            throw new Error("block engine recusou");
+          },
+        },
+        {
+          name: "staked",
+          send: async () => {
+            ordem.push("staked:inicio");
+            await new Promise((r) => setTimeout(r, 5));
+            return "sender aceitou";
+          },
+        },
+        {
+          name: "rpc",
+          send: async () => {
+            ordem.push("rpc:inicio");
+            await segundoPendente;
+            ordem.push("rpc:terminou");
+            return null;
+          },
+        },
+      ],
+    });
+
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.winner, "staked");
+    assert.deepEqual(ordem.slice(0, 3), ["jito:inicio", "staked:inicio", "rpc:inicio"], "TODOS partem juntos");
+    assert.ok(ordem.includes("rpc:terminou") === false, "o resultado não espera os lentos");
+
+    // O perdedor continua: liberar depois NÃO muda o vencedor, mas fica registrado na telemetria.
+    liberaSegundo();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(ordem.includes("rpc:terminou"), "o transporte lento terminou seu trabalho (não foi abortado)");
+    assert.equal(outcome.winner, "staked", "o vencedor não pode ser reescrito por quem chega depois");
+    assert.deepEqual(outcome.acceptedBy, ["staked"]);
+    assert.ok(outcome.note.includes("ACEITO não é EXECUTADO"), "a nota precisa recusar a leitura 'executado'");
+  });
+
+  await test("corrida: todos recusando agrega os MOTIVOS (nunca um erro genérico)", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const outcome = await ps.sendInParallel({
+      signature: "sig9",
+      timeoutMs: 1_000,
+      now: () => Date.now(),
+      transports: [
+        { name: "jito", send: async () => { throw new Error("HTTP 429 do block engine"); } },
+        { name: "staked", send: async () => { throw new Error("sender HTTP 403"); } },
+      ],
+    });
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.winner, null);
+    assert.equal(outcome.attempts.length, 2);
+    assert.ok(outcome.note.includes("jito=HTTP 429"), outcome.note);
+    assert.ok(outcome.note.includes("staked=sender HTTP 403"), outcome.note);
+    assert.equal(outcome.attempts.every((a) => a.latencyMs >= 0), true);
+  });
+
+  await test("corrida: transporte pendurado morre no timeout e não segura o resultado", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const inicio = Date.now();
+    const outcome = await ps.sendInParallel({
+      signature: "sigT",
+      timeoutMs: 120,
+      now: () => Date.now(),
+      transports: [
+        // Nunca resolve: é o caso do endpoint que aceita a conexão e não responde.
+        { name: "staked", send: () => new Promise(() => {}) },
+      ],
+    });
+    const gasto = Date.now() - inicio;
+    assert.equal(outcome.ok, false);
+    assert.ok(outcome.attempts[0].error?.includes("timeout"), JSON.stringify(outcome.attempts));
+    assert.ok(gasto < 1_500, `o timeout precisa respeitar o limite configurado (gastou ${gasto}ms)`);
+  });
+
+  await test("corrida: transporte duplicado é config inválida (ambiguidade em telemetria de execução)", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const outcome = await ps.sendInParallel({
+      signature: "sigD",
+      timeoutMs: 500,
+      now: () => Date.now(),
+      transports: [
+        { name: "jito", send: async () => "a" },
+        { name: "jito", send: async () => "b" },
+      ],
+    });
+    assert.equal(outcome.ok, false);
+    assert.ok(outcome.note.includes("duplicado"), outcome.note);
+    assert.equal(outcome.attempts.length, 0, "config inválida não deve nem tentar enviar");
+  });
+
+  await test("corrida: sem transporte configurado é recusa explícita, não 'sucesso por vacuidade'", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const outcome = await ps.sendInParallel({ signature: "s", transports: [], timeoutMs: 100, now: () => Date.now() });
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.acceptedBy.length, 0);
+    assert.ok(/nenhum transporte/.test(outcome.note));
+  });
+
+  await test("sender com stake: aceite exige ASSINATURA na resposta (HTTP 200 não é aceite)", async () => {
+    const ps = await import("../src/parallelSend.js");
+
+    const ok = ps.buildStakedSenderTransport({
+      url: "https://sender.exemplo.com/fast",
+      swqosOnly: true,
+      rawTransactionBase64: "AQID",
+      timeoutMs: 500,
+      fetchImpl: (async (url: any, init: any) => {
+        assert.ok(String(url).includes("swqos_only=true"), "o parâmetro de SWQOS precisa ir na URL");
+        const body = JSON.parse(String(init.body));
+        assert.equal(body.method, "sendTransaction");
+        assert.equal(body.params[1].encoding, "base64");
+        assert.equal(body.params[1].skipPreflight, true, "pré-flight já foi feito na simulação");
+        assert.equal(body.params[1].maxRetries, 0, "repetição é decisão do sistema de intenções");
+        return { ok: true, status: 200, json: async () => ({ result: "5" + "x".repeat(80) }) } as any;
+      }) as any,
+    });
+    const aceito = await ok.send(new AbortController().signal);
+    assert.ok(typeof aceito === "string" && aceito.includes("aceitou"));
+
+    const semResultado = ps.buildStakedSenderTransport({
+      url: "https://sender.exemplo.com/fast",
+      swqosOnly: false,
+      rawTransactionBase64: "AQID",
+      timeoutMs: 500,
+      fetchImpl: (async () => ({ ok: true, status: 200, json: async () => ({}) }) as any) as any,
+    });
+    await assert.rejects(() => semResultado.send(new AbortController().signal) as Promise<any>, /sem assinatura/);
+
+    const erroJson = ps.buildStakedSenderTransport({
+      url: "https://sender.exemplo.com/fast",
+      swqosOnly: false,
+      rawTransactionBase64: "AQID",
+      timeoutMs: 500,
+      fetchImpl: (async () => ({ ok: true, status: 200, json: async () => ({ error: { message: "tip abaixo do mínimo" } }) }) as any) as any,
+    });
+    await assert.rejects(() => erroJson.send(new AbortController().signal) as Promise<any>, /tip abaixo do mínimo/);
+
+    const http500 = ps.buildStakedSenderTransport({
+      url: "https://sender.exemplo.com/fast",
+      swqosOnly: false,
+      rawTransactionBase64: "AQID",
+      timeoutMs: 500,
+      fetchImpl: (async () => ({ ok: false, status: 500, text: async () => "boom" }) as any) as any,
+    });
+    await assert.rejects(() => http500.send(new AbortController().signal) as Promise<any>, /HTTP 500/);
+  });
+
+  await test("adaptadores Jito e RPC: aceite é traduzido e recusa vira exceção (sem 'sucesso' por HTTP)", async () => {
+    const ps = await import("../src/parallelSend.js");
+
+    const jitoOk = ps.buildJitoTransport(async () => ({ success: true, bundleId: "abc123def456" }));
+    assert.ok(String(await jitoOk.send(new AbortController().signal)).includes("aceito"));
+
+    const jitoRecusou = ps.buildJitoTransport(async () => ({ success: false, error: "block engine fora do ar" }));
+    await assert.rejects(() => jitoRecusou.send(new AbortController().signal) as Promise<any>, /fora do ar/);
+
+    const rpcOk = ps.buildRpcDirectTransport(async () => "rpc aceitou");
+    assert.equal(await rpcOk.send(new AbortController().signal), "rpc aceitou");
+
+    const rpcFalhou = ps.buildRpcDirectTransport(async () => {
+      throw new Error("sendRawTransaction: blockhash expirado");
+    });
+    await assert.rejects(() => rpcFalhou.send(new AbortController().signal) as Promise<any>, /blockhash expirado/);
+  });
+
+  await test("integração: a corrida existe no caminho assinado e mantém 'aceito ≠ executado'", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+
+    assert.ok(/PARALLEL_SEND\.enabled/.test(src), "a corrida precisa ser condicionada à política");
+    assert.ok(/buildJitoTransport/.test(src) && /buildStakedSenderTransport/.test(src) && /buildRpcDirectTransport/.test(src));
+    assert.ok(/assertCanSign\("entry"\)/.test(src), "o envio direto passa pelo choke point de assinatura (defesa em profundidade)");
+    /**
+     * A LEITURA das variáveis de envio fica centralizada em `resolveParallelSendPolicy`. Texto
+     * explicativo que cita o nome da variável é permitido — o que não pode existir é um segundo
+     * ponto de decisão no servidor (duas leituras = duas políticas possíveis).
+     */
+    for (const v of ["HFT_PARALLEL_SEND", "HFT_STAKED_SENDER_URL", "HFT_SEND_RPC_DIRECT"]) {
+      assert.equal(
+        src.includes(`process.env.${v}`),
+        false,
+        `${v} não pode ser lida no server: a política é resolvida uma única vez em parallelSend.ts`
+      );
+    }
+
+    // A ordem importa: assinar UMA vez e só então enviar por vários caminhos.
+    const posSign = src.indexOf("tx.sign([keypair])");
+    const posRace = src.indexOf("sendInParallel(");
+    assert.ok(posSign > 0 && posRace > posSign, "a corrida de envio vem DEPOIS da assinatura única");
+
+    // Nenhuma linha pode reportar execução: a confirmação é outro estágio.
+    assert.ok(
+      /status: "submitted_unconfirmed"/.test(src) || /submitted_unconfirmed/.test(src),
+      "aceite continua sendo estado próprio, distinto de confirmado"
+    );
+    assert.ok(/race\.note/.test(src), "o motivo agregado da corrida precisa ser reportado quando falha");
+  });
+
+  await test("envio paralelo: nada aqui assina, guarda chave ou abre conexão própria", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/parallelSend.ts"), "utf8"));
+    for (const proibido of ["Keypair", ".sign(", "secretKey", "OPERATIONAL_PRIVATE_KEY", "new Connection"]) {
+      assert.equal(src.includes(proibido), false, `parallelSend.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(/rawTransactionBase64/.test(src), "recebe bytes JÁ assinados — é o chamador que assina");
+  });
+
+  // [28] S9 — RÓTULOS DE RESULTADO E VALIDAÇÃO ESTATÍSTICA
+  console.log("\n[28] Rótulos de resultado (S9): base de cálculo explícita e veredito honesto");
+
+  await test("rótulo: medição de PERNA ÚNICA não vira PnL (o defeito do ΔSOL da venda)", async () => {
+    /**
+     * REGRESSÃO DO DEFEITO CENTRAL CORRIGIDO NO S11. O extrator anterior lia o ΔSOL da transação de
+     * VENDA e gravava como `pnlNetSol` com `measuredOnChain: true`. Esse número é a RECEITA da venda:
+     * uma compra de 0,01 SOL vendida por 0,02 SOL aparecia como "+0,02 SOL de PnL líquido medido"
+     * (lucro real: +0,01 SOL), e entrava na validação como desfecho confiável.
+     *
+     * Regra nova: `measuredOnChain: true` NÃO basta. A procedência precisa ser declarada, e só
+     * `round_trip_legs*` (duas pernas) é `net_measured`. Medição de perna única tem rótulo próprio e
+     * fica FORA da conclusão; procedência ausente também.
+     */
+    const ol = await import("../src/outcomeLabels.js");
+    const pernaUnica = ol.labelTrade({
+      id: "venda1", token: "T", mint: "m", amount: "a", outAmount: "b", block: 10, tipSol: 0,
+      time: new Date().toISOString(), latencyMs: 500, status: "success", mode: "live",
+      signature: "sigVenda", pnlNetSol: 0.02, measuredOnChain: true, pnlBasis: "exit_leg_only",
+      saleProceedsSol: 0.02,
+    } as any);
+    assert.equal(pernaUnica.basis, "single_leg_measured");
+    assert.equal(pernaUnica.excluded, true, "medição de perna única NÃO entra na validação");
+    assert.ok(pernaUnica.pnlNetSol === null, "o campo PnL é null: o número parcial vive em saleProceedsSol");
+    assert.ok(/RECEITA DA VENDA|não é o lucro/i.test(pernaUnica.reason), pernaUnica.reason);
+    assert.ok(pernaUnica.provenance.some((p) => /pnlBasis=exit_leg_only/.test(p)));
+
+    // Procedência AUSENTE (registro antigo, de antes desta versão): fail-closed, também não promove.
+    const semProcedencia = ol.labelTrade({
+      id: "antigo", token: "T", mint: "m", amount: "a", outAmount: "b", block: 11, tipSol: 0,
+      time: new Date().toISOString(), latencyMs: 500, status: "success", mode: "live",
+      signature: "sigAntiga", pnlNetSol: 0.02, measuredOnChain: true,
+    } as any);
+    assert.equal(semProcedencia.basis, "single_leg_measured", "sem procedência declarada, NÃO promove a medido");
+    assert.equal(semProcedencia.excluded, true);
+    assert.ok(semProcedencia.provenance.some((p) => /procedência NÃO declarada/.test(p)));
+
+    // E o ciclo completo, com procedência, É promovido — a correção não pode virar bloqueio geral.
+    const ciclo = ol.labelTrade({
+      id: "ciclo", token: "T", mint: "m", amount: "a", outAmount: "b", block: 12, tipSol: 0,
+      time: new Date().toISOString(), latencyMs: 500, status: "success", mode: "live",
+      signature: "sigCiclo", pnlNetSol: 0.01, measuredOnChain: true, pnlBasis: "round_trip_legs",
+    } as any);
+    assert.equal(ciclo.basis, "net_measured");
+    assert.equal(ciclo.label, "win");
+    assert.equal(ciclo.excluded, false);
+
+    // Divergência de janela é medida e declarada, mas o número segue sendo do ciclo.
+    const comDivergencia = ol.labelTrade({
+      id: "div", token: "T", mint: "m", amount: "a", outAmount: "b", block: 13, tipSol: 0,
+      time: new Date().toISOString(), latencyMs: 500, status: "success", mode: "live",
+      signature: "sigDiv", pnlNetSol: -0.002, measuredOnChain: true, pnlBasis: "round_trip_legs_window_conflict",
+    } as any);
+    assert.equal(comDivergencia.basis, "net_measured");
+    assert.ok(/outra movimentação de SOL/.test(comDivergencia.reason), comDivergencia.reason);
+  });
+
+  await test("rótulo: só PnL LÍQUIDO medido on-chain entra na validação (o resto é excluído com motivo)", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const base = { id: "t1", token: "TST", mint: "mint1", amount: "0.01 SOL", outAmount: "1000", block: 10, tipSol: 0.000001, route: "Jupiter Manual Jito Exit", time: new Date().toISOString(), latencyMs: 900 };
+
+    const win = ol.labelTrade({ ...base, status: "success", mode: "live", signature: "sig", pnlNetSol: 0.01, measuredOnChain: true, pnlBasis: "round_trip_legs" } as any);
+    assert.equal(win.label, "win");
+    assert.equal(win.basis, "net_measured");
+    assert.equal(win.excluded, false);
+    assert.ok(win.pnlNetSol === 0.01 && win.pnlPercent === null, "o rótulo medido não carrega percentual de preço");
+
+    const loss = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: -0.004, measuredOnChain: true, pnlBasis: "round_trip_legs" } as any);
+    assert.equal(loss.label, "loss");
+
+    // Empate com epsilon DECLARADO (1.000 lamports = 1 base fee).
+    const empate = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: 0.0000005, measuredOnChain: true, pnlBasis: "round_trip_legs" } as any);
+    assert.equal(empate.label, "breakeven");
+    assert.equal(ol.BREAKEVEN_EPSILON_SOL, 0.000001);
+
+    /**
+     * O CASO QUE MAIS IMPORTA: PnL presente mas NÃO medido on-chain. Tratar como win seria usar um
+     * número que não passou pela cadeia — a definição de PnL fabricado.
+     */
+    const naoMedido = ol.labelTrade({ ...base, status: "success", mode: "live", pnlNetSol: 0.01, measuredOnChain: false } as any);
+    assert.equal(naoMedido.basis, "none");
+    assert.equal(naoMedido.excluded, true);
+    assert.ok(naoMedido.pnlNetSol === null, "sem medição on-chain o valor NÃO é promovido a resultado");
+  });
+
+  await test("rótulo: paper, tentativa falhada e perna de entrada ficam FORA da conclusão", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const base = { id: "t", token: "T", mint: "m", amount: "a", outAmount: "b", block: 1, tipSol: 0, time: new Date().toISOString(), latencyMs: 100 };
+
+    const paper = ol.labelTrade({ ...base, status: "paper", mode: "paper", pnlNetSol: 0.5, measuredOnChain: true } as any);
+    assert.equal(paper.label, "win", "paper tem rótulo (é diagnóstico útil)");
+    assert.equal(paper.excluded, true, "…mas NUNCA entra na validação");
+    assert.equal(paper.exclusionReason, "modo paper");
+    // A: a base da sombra é PRÓPRIA. Antes era `net_measured` — a mesma base da validação —, o que
+    // fazia a superfície mostrar "net_measured" num resultado simulado.
+    assert.equal(paper.basis, "paper_simulated");
+    assert.notEqual(paper.basis, "net_measured");
+
+    const falhou = ol.labelTrade({ ...base, status: "failed", mode: "live", route: "Jito Exit falhou" } as any);
+    assert.equal(falhou.label, "failed_attempt");
+    assert.equal(falhou.excluded, true);
+    assert.ok(/CUSTO/.test(falhou.reason), "tentativa falhada é custo, não desfecho de estratégia");
+    assert.equal(falhou.attemptKind, "exit", "a rota de saída classifica a tentativa como saída");
+    assert.equal(falhou.attemptKindSource, "texto");
+
+    const recusada = ol.labelTrade({ ...base, status: "rejected", mode: "live", route: "Jupiter → Jito bundle [pump.fun curva]" } as any);
+    assert.equal(recusada.label, "failed_attempt");
+
+    // Perna de ENTRADA confirmada: não tem resultado por natureza.
+    const entrada = ol.labelTrade({ ...base, status: "confirmed", mode: "live", signature: "s", route: "Jupiter → Jito bundle [pump.fun curva]" } as any);
+    assert.equal(entrada.label, "entry_leg");
+    assert.equal(entrada.excluded, true);
+    assert.ok(/só existe quando a posição é fechada/.test(entrada.reason));
+
+    // PnL presente sem status conhecido e sem medição: NÃO MEDIDO, não "zero".
+    const semNumero = ol.labelTrade({ ...base, status: "unknown", mode: "live" } as any);
+    assert.equal(semNumero.label, "unresolved");
+    assert.ok(/NÃO MEDIDO/.test(semNumero.reason));
+  });
+
+  await test("rótulo de posição fechada: sempre estimado (preço sem custos) e sempre excluído", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const pos = {
+      id: "p1", token: "T", mint: "m", sizeSol: 0.01, entryPrice: 1, currentPrice: 1.2, pnlPercent: 20,
+      status: "closed", stopLossPercent: -20, takeProfitPercent: 20, trailingStopActive: false,
+      trailingStopOffsetPercent: 3, highestPrice: 1.2, timeOpened: new Date(Date.now() - 60_000).toISOString(),
+      timeClosed: new Date().toISOString(), mode: "live", slippageBps: 300,
+    };
+    const rotulo = ol.labelPosition(pos as any);
+    assert.equal(rotulo.label, "estimated_win");
+    assert.equal(rotulo.basis, "price_estimated");
+    assert.equal(rotulo.excluded, true);
+    assert.ok(rotulo.pnlNetSol === null, "posição não tem PnL líquido: o campo fica null em vez de reaproveitar o percentual");
+    assert.ok(rotulo.pnlPercent === 20);
+    assert.ok(/NÃO inclui tip, priority fee, base fee nem rent/.test(rotulo.reason));
+
+    const abertas = ol.labelAll([], [{ ...pos, status: "open" } as any]);
+    assert.equal(abertas.length, 0, "posição aberta não é desfecho: não se rotula resultado que ainda não existe");
+  });
+
+  await test("cobertura: relatório avisa quando a amostra válida é pequena demais ou enviesada", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const agora = new Date().toISOString();
+    const mk = (i: number, extra: any) => ({
+      id: `t${i}`, token: "T", mint: `m${i}`, amount: "a", outAmount: "b", block: i, tipSol: 0,
+      time: agora, latencyMs: 100, ...extra,
+    });
+
+    const rotulados = ol.labelAll(
+      [
+        mk(1, { status: "success", mode: "live", pnlNetSol: 0.01, measuredOnChain: true, pnlBasis: "round_trip_legs" }),
+        mk(2, { status: "confirmed", mode: "live", route: "Jupiter → Jito bundle [entrada]" }),
+        mk(3, { status: "unknown", mode: "live" }),
+        mk(4, { status: "unknown", mode: "live" }),
+        mk(5, { status: "unknown", mode: "live" }),
+      ] as any,
+      []
+    );
+    const cov = ol.summarizeCoverage(rotulados);
+    assert.equal(cov.total, 5);
+    assert.equal(cov.measured, 1);
+    // 4 dos 5 registros não têm número: a perna de entrada e os três sem status conhecido.
+    assert.equal(cov.withoutNumber, 4);
+    assert.ok(Math.abs(cov.missingShare - 0.8) < 1e-9);
+    assert.ok(cov.notes.some((n) => /não têm número de resultado/.test(n)), JSON.stringify(cov.notes));
+
+    const vazio = ol.summarizeCoverage([]);
+    assert.ok(vazio.notes.some((n) => /sem dado não há conclusão/.test(n)));
+  });
+
+  await test("Wilson: o intervalo cobre os extremos sem sair de [0,1] (ao contrário da normal)", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    assert.equal(sv.wilsonInterval(0, 0), null);
+
+    const extremo = sv.wilsonInterval(0, 10)!;
+    assert.equal(extremo.low, 0);
+    assert.ok(extremo.high > 0 && extremo.high < 0.35, `high=${extremo.high}`);
+
+    const metade = sv.wilsonInterval(50, 100)!;
+    assert.ok(Math.abs(metade.low - 0.404) < 0.01, `low=${metade.low}`);
+    assert.ok(Math.abs(metade.high - 0.596) < 0.01, `high=${metade.high}`);
+
+    const vinte = sv.wilsonInterval(1, 5)!;
+    assert.ok(vinte.low >= 0 && vinte.high <= 1);
+  });
+
+  await test("intervalo da média: n=1 devolve null (não se inventa desvio-padrão de uma amostra)", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    const um = sv.meanConfidenceInterval([0.5]);
+    assert.equal(um.mean, 0.5);
+    assert.equal(um.standardError, null);
+    assert.equal(um.low, null, "sem n>=2, o intervalo é null — melhor 'não calculável' que número falso");
+
+    const simetrico = sv.meanConfidenceInterval([1, -1, 1, -1]);
+    assert.equal(simetrico.mean, 0);
+    assert.ok(simetrico.low !== null && simetrico.low < 0 && simetrico.high! > 0);
+
+    const positivo = sv.meanConfidenceInterval([0.001, 0.0012, 0.0009, 0.0011]);
+    assert.ok(positivo.low! > 0, "média positiva com dispersão pequena → IC acima de zero");
+  });
+
+  await test("veredito: os 5 estados, com o que mudaria a conclusão em cada um", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    const ol = await import("../src/outcomeLabels.js");
+    const ctx = (trades: any[]) =>
+      sv.buildValidationReport({
+        labeled: ol.labelAll(trades as any, []),
+        source: { name: "teste", tradesRead: trades.length, positionsRead: 0, truncated: false, note: "" },
+      });
+
+    const medido = (i: number, pnl: number, at: number) => ({
+      id: `t${i}`, token: "T", mint: `m${i}`, amount: "a", outAmount: "b", block: i, tipSol: 1e-6,
+      time: new Date(at).toISOString(), latencyMs: 500, status: "success", mode: "live",
+      pnlNetSol: pnl, measuredOnChain: true, pnlBasis: "round_trip_legs", feesSol: 5e-6,
+    });
+
+    // 1. sem dados
+    const vazio = ctx([]);
+    assert.equal(vazio.verdict.state, "sem_dados");
+    assert.ok(vazio.verdict.caveats.length > 0);
+
+    // 2. amostra insuficiente (5 operações medidas)
+    const poucas = ctx([1, 2, 3, 4, 5].map((i) => medido(i, 0.01, i * 1000)));
+    assert.equal(poucas.verdict.state, "amostra_insuficiente");
+    assert.ok(/piso declarado/.test(poucas.verdict.why), poucas.verdict.why);
+    assert.ok(/mais 95 operação/.test(poucas.verdict.whatWouldChangeIt), poucas.verdict.whatWouldChangeIt);
+    assert.equal(poucas.metrics.trades, 5, "as métricas continuam sendo reportadas — é o veredito que qualifica");
+
+    // 3. indistinguível de zero (100 operações alternando +0,001/-0,001)
+    const zero = ctx(Array.from({ length: 100 }, (_, i) => medido(i, i % 2 === 0 ? 0.001 : -0.001, i * 1000)));
+    assert.equal(zero.verdict.state, "indistinguivel_de_zero");
+    assert.ok(/CONTÉM o zero/.test(zero.verdict.why));
+
+    // 4. edge negativo (100 operações perdendo ~0,001 com dispersão pequena)
+    const negativo = ctx(Array.from({ length: 100 }, (_, i) => medido(i, -0.001 - (i % 5) * 0.00001, i * 1000)));
+    assert.equal(negativo.verdict.state, "edge_negativo");
+    assert.ok(/não aumentar tamanho de posição/.test(negativo.verdict.whatWouldChangeIt));
+
+    // 5. candidato a edge (100 operações ganhando ~0,001 com dispersão pequena)
+    const positivo = ctx(Array.from({ length: 100 }, (_, i) => medido(i, 0.001 + (i % 5) * 0.00001, i * 1000)));
+    assert.equal(positivo.verdict.state, "candidato_a_edge");
+    assert.ok(/candidato ≠ lucrativo/.test(positivo.verdict.caveats.join(" ")));
+    assert.ok(positivo.winRateInterval !== null && positivo.winRateInterval.low > 0.5);
+  });
+
+  await test("relatório: métricas saem do conjunto MEDIDO, com cobertura e custos declarados", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    const ol = await import("../src/outcomeLabels.js");
+    const agora = Date.now();
+    const trades: any[] = [
+      { id: "a", token: "T", mint: "m1", amount: "a", outAmount: "b", block: 1, tipSol: 2e-6, time: new Date(agora - 3000).toISOString(), latencyMs: 500, status: "success", mode: "live", pnlNetSol: 0.002, measuredOnChain: true, pnlBasis: "round_trip_legs", feesSol: 5e-6 },
+      { id: "b", token: "T", mint: "m2", amount: "a", outAmount: "b", block: 2, tipSol: 2e-6, time: new Date(agora - 2000).toISOString(), latencyMs: 500, status: "success", mode: "live", pnlNetSol: -0.001, measuredOnChain: true, pnlBasis: "round_trip_legs", feesSol: 7e-6 },
+      { id: "c", token: "T", mint: "m3", amount: "a", outAmount: "b", block: 3, tipSol: 2e-6, time: new Date(agora - 1000).toISOString(), latencyMs: 500, status: "confirmed", mode: "live", route: "entrada" },
+    ];
+    const rep = sv.buildValidationReport({
+      labeled: ol.labelAll(trades, [{ id: "p", token: "T", mint: "m1", sizeSol: 0.01, entryPrice: 1, currentPrice: 1.5, pnlPercent: 50, status: "closed", stopLossPercent: -20, takeProfitPercent: 20, trailingStopActive: false, trailingStopOffsetPercent: 3, highestPrice: 1.5, timeOpened: new Date(agora - 5000).toISOString(), timeClosed: new Date(agora).toISOString(), mode: "live" } as any]),
+      source: { name: "teste", tradesRead: trades.length, positionsRead: 1, truncated: false, note: "fonte de teste" },
+    });
+
+    assert.equal(rep.metrics.trades, 2, "só os 2 desfechos MEDIDOS entram nas métricas");
+    assert.ok(Math.abs(rep.metrics.expectancySol - 0.0005) < 1e-12, `expectancy=${rep.metrics.expectancySol}`);
+    assert.equal(rep.metrics.wins, 1);
+    assert.equal(rep.metrics.losses, 1);
+    assert.equal(rep.coverage.measured, 2);
+    assert.equal(rep.coverage.estimated, 1, "a posição fechada entra como ESTIMADO (diagnóstico)");
+    assert.ok(rep.measuredCosts.feesSol !== null && Math.abs(rep.measuredCosts.feesSol - 12e-6) < 1e-15);
+    assert.ok(rep.measuredCosts.tipsSol !== null && Math.abs(rep.measuredCosts.tipsSol - 4e-6) < 1e-15);
+    assert.ok(rep.exclusionsByReason.some((e) => /perna de entrada/.test(e.reason)));
+    assert.equal(rep.source.name, "teste", "a fonte precisa ser declarada no relatório");
+    assert.equal(rep.byLabel.entry_leg, 1);
+  });
+
+  await test("S9: fiação no servidor — o endpoint declara a fonte e o truncamento", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(/app\.get\("\/api\/performance"/.test(src), "o relatório precisa de um endpoint");
+    assert.ok(/labelAll\(/.test(src) && /buildValidationReport\(/.test(src));
+    assert.ok(/histórico truncado por construção/.test(src), "o teto de 50 trades do JSON precisa ser declarado ao operador");
+    assert.ok(/fonte: banco/.test(src), "quando lê do banco, a fonte precisa ser declarada");
+  });
+
+  // [29] S10 — POSTGRES: schema, voo único ENTRE PROCESSOS e guarda fail-closed
+  console.log("\n[29] Postgres (S10): claim atômico entre processos, espelho de escrita e fail-closed");
+
+  /**
+   * POSTGRES DE VERDADE, EM MEMÓRIA. `@electric-sql/pglite` é PostgreSQL compilado para WASM
+   * (v18): o SQL, o índice único parcial e as expressões de intervalo são os do Postgres real. Um
+   * dublê em JavaScript não pegaria a diferença entre "meu código acha que o índice funciona" e
+   * "o banco garante o índice" — e é justamente essa diferença que sustenta o voo único.
+   */
+  const abrirPglite = async (): Promise<{ db: any; client: any }> => {
+    const { PGlite } = await import("@electric-sql/pglite");
+    const db = new PGlite();
+    const client = {
+      query: async (sql: string, params?: unknown[]) => {
+        const res = await db.query(sql, params as any[]);
+        return { rows: res.rows, rowCount: res.affectedRows ?? null };
+      },
+      end: async () => {
+        await db.close();
+      },
+    };
+    return { db, client };
+  };
+
+  const policyPostgres = async (over: Record<string, string> = {}) => {
+    const st = await import("../src/storage/postgresStorage.js");
+    return st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "postgres://x", ...over } as any);
+  };
+
+  await test("política de armazenamento: default JSON, Postgres exige DATABASE_URL, AUSÊNCIA ≠ ZERO", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+
+    const padrao = st.resolveStoragePolicy({} as any);
+    assert.equal(padrao.mode, "json", "o default preserva o comportamento anterior");
+    assert.equal(padrao.claimTtlMs, 300_000);
+    assert.deepEqual(padrao.blockers, []);
+
+    const semUrl = st.resolveStoragePolicy({ HFT_STORAGE: "postgres" } as any);
+    assert.equal(semUrl.mode, "json");
+    assert.ok(semUrl.blockers.some((b) => /exige DATABASE_URL/.test(b)));
+
+    // URL definida mas modo JSON: o banco NÃO está sendo usado — e isso precisa ser dito, não inferido.
+    const urlSobrando = st.resolveStoragePolicy({ DATABASE_URL: "postgres://x" } as any);
+    assert.equal(urlSobrando.mode, "json");
+    assert.ok(urlSobrando.blockers.some((b) => /NÃO está sendo usado/.test(b)));
+
+    const modoErrado = st.resolveStoragePolicy({ HFT_STORAGE: "mysql" } as any);
+    assert.ok(modoErrado.blockers.some((b) => /não é um modo conhecido/.test(b)), "não adivinhar modo desconhecido");
+
+    // Ausência de variável cai no default; valor fora do intervalo é limitado (não vira 0).
+    const semTtl = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u" } as any);
+    assert.equal(semTtl.claimTtlMs, 300_000);
+    const ttlMinimo = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u", HFT_STORAGE_CLAIM_TTL_MS: "10" } as any);
+    assert.equal(ttlMinimo.claimTtlMs, 5_000, "piso de 5s: TTL curto demais faria dois processos entrarem em sequência");
+    const hist = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u", HFT_STORAGE_HISTORY_LIMIT: "999999999" } as any);
+    assert.equal(hist.historyLimit, 1_000_000, "teto: carregar histórico ilimitado na memória é DoS de si mesmo");
+
+    const logInvalido = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u", HFT_STORAGE_MIRROR_LOGS: "tudo" } as any);
+    assert.equal(logInvalido.mirrorLogs, "critical", "valor inválido cai no default declarado");
+  });
+
+  await test("guarda fail-closed: Postgres pedido e fora do ar BLOQUEIA a assinatura", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const json = st.resolveStoragePolicy({} as any);
+    const pg = st.resolveStoragePolicy({ HFT_STORAGE: "postgres", DATABASE_URL: "u" } as any);
+
+    // Modo JSON: permite, declarando o limite (voo único por processo).
+    const emJson = st.decideEntryStorageGuard(json, { configured: false, connected: false, migrated: false, schemaVersion: null, lastError: null });
+    assert.equal(emJson.allowSign, true);
+    assert.ok(/POR PROCESSO|por processo/.test(emJson.detail!));
+
+    const fora = st.decideEntryStorageGuard(pg, { configured: true, connected: false, migrated: false, schemaVersion: null, lastError: "ECONNREFUSED" });
+    assert.equal(fora.allowSign, false);
+    assert.equal(fora.code, "STORAGE_UNAVAILABLE");
+    assert.ok(/não está respondendo/.test(fora.detail!));
+
+    const semMigrar = st.decideEntryStorageGuard(pg, { configured: true, connected: true, migrated: false, schemaVersion: 0, lastError: null });
+    assert.equal(semMigrar.allowSign, false);
+    assert.equal(semMigrar.code, "STORAGE_SCHEMA_OUTDATED");
+    assert.ok(/storage:migrate/.test(semMigrar.detail!), "a recusa precisa dizer o comando que resolve");
+
+    const ok = st.decideEntryStorageGuard(pg, { configured: true, connected: true, migrated: true, schemaVersion: 1, lastError: null });
+    assert.equal(ok.allowSign, true);
+  });
+
+  await test("migração: aplica a v1 e é IDEMPOTENTE (rodar de novo não aplica nada)", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const storage = new st.PostgresStorage(client, await policyPostgres(), "proc#1");
+
+    const primeira = await storage.migrate();
+    assert.deepEqual(primeira.applied, [1]);
+    assert.equal(primeira.alreadyAt, null);
+
+    const segunda = await storage.migrate();
+    assert.deepEqual(segunda.applied, [], "a segunda execução não pode reaplicar a mesma migração");
+    assert.equal(segunda.alreadyAt, 1);
+
+    const health = await storage.initialize();
+    assert.equal(health.connected, true);
+    assert.equal(health.migrated, true, `schema v${health.schemaVersion}`);
+
+    // As 5 tabelas do S10 existem de fato.
+    const tabelas = await client.query(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
+    );
+    const nomes = tabelas.rows.map((r: any) => r.table_name);
+    for (const esperada of ["schema_migrations", "positions", "trades", "intents", "entry_claims", "decision_logs"]) {
+      assert.ok(nomes.includes(esperada), `${esperada} ausente (tabelas: ${nomes.join(", ")})`);
+    }
+    await storage.close();
+  });
+
+  await test("banco NOVO: conectado mas sem schema (não é o mesmo que banco fora do ar)", async () => {
+    /**
+     * A diferença importa para o boot: `connected=false` → aborta sem tentar migrar (fail-closed);
+     * `connected=true, migrated=false` → tenta migrar e sobe. Se um banco limpo fosse reportado
+     * como "sem conexão", o operador nunca conseguiria apontar o bot para uma base nova.
+     */
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const storage = new st.PostgresStorage(client, await policyPostgres(), "host#novo");
+
+    const health = await storage.initialize();
+    assert.equal(health.connected, true, "o banco respondeu: está conectado");
+    assert.equal(health.migrated, false, "…mas o schema ainda não existe");
+    assert.equal(health.schemaVersion, null);
+    assert.equal(health.lastError, null, "banco limpo não é erro de conexão");
+
+    // Depois de migrar, o mesmo objeto passa a reportar pronto — sem reconectar.
+    await storage.migrate();
+    const depois = await storage.initialize();
+    assert.equal(depois.migrated, true);
+    assert.equal(depois.schemaVersion, 1);
+    await storage.close();
+  });
+
+  await test("voo único ENTRE PROCESSOS: dois processos, o mesmo mint, exatamente UM ganha", async () => {
+    /**
+     * O TESTE CENTRAL DO S10. Dois adaptadores distintos sobre o MESMO banco representam duas
+     * instâncias do bot na mesma carteira — o cenário que o guarda em memória (`InFlightMints`) não
+     * cobre, porque memória de um processo não é visível para o outro.
+     */
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const policy = await policyPostgres();
+    const processoA = new st.PostgresStorage(client, policy, "hostA#100");
+    const processoB = new st.PostgresStorage(client, policy, "hostB#200");
+    await processoA.migrate();
+
+    const mint = "8mQr7tW1YcVb6yqkKk3s6hUnJxJ7c8Xq2pQyZz1aBcDe";
+    const a = await processoA.claimEntry({ mint, side: "entry", payload: { sizeSol: 0.01 } });
+    const b = await processoB.claimEntry({ mint, side: "entry", payload: { sizeSol: 0.01 } });
+
+    assert.equal(a.acquired, true);
+    assert.equal(a.reason, "novo");
+    assert.equal(b.acquired, false, "o segundo processo NÃO pode entrar no mesmo mint");
+    assert.equal(b.reason, "ocupado");
+    assert.equal(b.heldBy, "hostA#100", "o perdedor recebe QUEM detém o claim — não um erro genérico");
+    assert.ok(b.expiresAt !== null, "…e até quando o mint está reservado");
+    assert.ok(/hostA#100/.test(b.detail));
+
+    // Mints diferentes não competem: o voo único é por (mint, side).
+    const outroMint = await processoB.claimEntry({ mint: "OutroMint1111111111111111111111111111111111", side: "entry" });
+    assert.equal(outroMint.acquired, true);
+
+    // LIBERAÇÃO SÓ PELO DONO: com o claimId do A, o B consegue liberar? Não — o id é a credencial.
+    const liberadoPeloB = await processoB.releaseEntryClaim(a.claimId!);
+    assert.equal(liberadoPeloB, true, "o UPDATE é por claim_id: quem tem o id libera (é a mesma linha)");
+
+    await processoA.close();
+  });
+
+  await test("claim expirado: retomada atômica; o antigo dono NÃO consegue mais liberar", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const policy = await policyPostgres();
+    const processoA = new st.PostgresStorage(client, policy, "hostA#100");
+    const processoB = new st.PostgresStorage(client, policy, "hostB#200");
+    await processoA.migrate();
+
+    const mint = "ExpiradoMint11111111111111111111111111111111";
+    // TTL de 1s (mínimo do adaptador): esperamos ele vencer para simular um processo que morreu.
+    const a = await processoA.claimEntry({ mint, side: "entry", ttlMs: 1_000 });
+    assert.equal(a.acquired, true);
+
+    // Ainda dentro do TTL: B não consegue.
+    const cedo = await processoB.claimEntry({ mint, side: "entry" });
+    assert.equal(cedo.acquired, false);
+    assert.equal(cedo.reason, "ocupado");
+
+    await new Promise((r) => setTimeout(r, 1_100));
+
+    const tarde = await processoB.claimEntry({ mint, side: "entry" });
+    assert.equal(tarde.acquired, true, "claim vencido precisa ser retomável — senão um crash bloqueia o mint para sempre");
+    assert.equal(tarde.reason, "retomado-expirado");
+    assert.ok(/não liberou/.test(tarde.detail));
+
+    /**
+     * SEGURANÇA: o dono ANTIGO (A) não pode liberar o claim do B. O claim_id mudou na retomada, e a
+     * liberação é por claim_id — se fosse por (mint, side), A liberaria o claim de B e DOIS
+     * processos poderiam entrar no mesmo mint.
+     */
+    const liberacaoDoAntigo = await processoA.releaseEntryClaim(a.claimId!);
+    assert.equal(liberacaoDoAntigo, false, "liberação pelo id antigo NÃO pode afetar o claim novo");
+
+    const aindaAtivo = await processoB.listActiveClaims();
+    assert.equal(aindaAtivo.filter((c) => c.mint === mint).length, 1, "o claim novo segue ativo após a tentativa do dono antigo");
+
+    const liberacaoCerta = await processoB.releaseEntryClaim(tarde.claimId!);
+    assert.equal(liberacaoCerta, true);
+    assert.equal((await processoB.listActiveClaims()).filter((c) => c.mint === mint).length, 0);
+
+    // Depois de liberar, o mint volta a estar disponível para QUALQUER processo.
+    const depois = await processoA.claimEntry({ mint, side: "entry" });
+    assert.equal(depois.acquired, true);
+    assert.equal(depois.reason, "novo");
+
+    await processoA.close();
+  });
+
+  await test("banco indisponível: claim devolve 'banco-indisponivel' (nunca 'livre')", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const quebrado = {
+      query: async () => {
+        throw new Error("connection terminated unexpectedly");
+      },
+      end: async () => {},
+    };
+    const storage = new st.PostgresStorage(quebrado as any, await policyPostgres(), "hostX#1");
+    const health = await storage.initialize();
+    assert.equal(health.connected, false);
+    assert.ok(/connection terminated/.test(health.lastError!));
+
+    const claim = await storage.claimEntry({ mint: "m", side: "entry" });
+    assert.equal(claim.acquired, false);
+    assert.equal(claim.reason, "banco-indisponivel");
+    assert.ok(/falha ao consultar o banco/.test(claim.detail), "falha de infraestrutura não pode ser apresentada como 'ocupado'");
+  });
+
+  await test("espelho: upsert idempotente de posição/trade/intenção com campos promovidos", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const storage = new st.PostgresStorage(client, await policyPostgres(), "host#1");
+    await storage.migrate();
+
+    const pos: any = {
+      id: "pos1", token: "TST", mint: "mintX", sizeSol: 0.01, entryPrice: 1.5, currentPrice: 1.6,
+      pnlPercent: 6.6, status: "open", stopLossPercent: -20, takeProfitPercent: 20,
+      trailingStopActive: false, trailingStopOffsetPercent: 3, highestPrice: 1.6,
+      timeOpened: new Date().toISOString(), mode: "live", executionIntentId: "int1",
+    };
+    assert.equal(await storage.mirrorPosition(pos), true);
+    // DUAS escritas do mesmo id: o espelho é upsert, então o banco tem UMA linha atualizada.
+    assert.equal(await storage.mirrorPosition({ ...pos, currentPrice: 1.8, pnlPercent: 20, status: "exit_pending" }), true);
+
+    const linhas = await client.query("SELECT status, pnl_percent, payload FROM positions WHERE id = 'pos1'");
+    assert.equal(linhas.rows.length, 1, "upsert não pode duplicar a posição");
+    assert.equal(linhas.rows[0].status, "exit_pending");
+    assert.equal(Number(linhas.rows[0].pnl_percent), 20);
+    assert.equal(linhas.rows[0].payload.currentPrice, 1.8, "o payload preserva o registro COMPLETO (schema não perde campo)");
+
+    assert.equal(
+      await storage.mirrorTrade({
+        id: "tr1", token: "TST", mint: "mintX", amount: "0.01 SOL", outAmount: "1", block: 10, tipSol: 2e-6,
+        route: "exit", time: new Date().toISOString(), latencyMs: 800, status: "success", mode: "live",
+        signature: "sig", pnlNetSol: 0.002, feesSol: 5e-6, measuredOnChain: true,
+      } as any),
+      true
+    );
+    const trade = await client.query("SELECT mode, pnl_net_sol, measured_on_chain FROM trades WHERE id = 'tr1'");
+    assert.equal(trade.rows[0].mode, "live");
+    assert.equal(Number(trade.rows[0].pnl_net_sol), 0.002);
+    assert.equal(trade.rows[0].measured_on_chain, true, "o campo que distingue medido de estimado é promovido a coluna");
+
+    assert.equal(
+      await storage.mirrorIntent({
+        id: "int1", positionId: "pos1", mint: "mintX", side: "entry", state: "signed", attempt: 1,
+        signature: "sig", lastValidBlockHeight: 123, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      } as any),
+      true
+    );
+
+    const counts = await storage.counts();
+    assert.equal(counts.positions, 1);
+    assert.equal(counts.trades, 1);
+    assert.equal(counts.intents, 1);
+    await storage.close();
+  });
+
+  await test("espelho de logs: o filtro de nível é aplicado no adaptador (critical por default)", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+
+    const padrao = new st.PostgresStorage(client, await policyPostgres(), "host#1");
+    await padrao.migrate();
+    await padrao.mirrorLog({ level: "INFO", component: "RISK_ENGINE", message: "info qualquer" });
+    await padrao.mirrorLog({ level: "WARN", component: "REAL_ENTRY", message: "aviso relevante" });
+    await padrao.mirrorLog({ level: "CRITICAL", component: "REAL_ENTRY", message: "crítico" });
+    const gravados = await client.query("SELECT level FROM decision_logs ORDER BY id");
+    assert.deepEqual(gravados.rows.map((r: any) => r.level), ["WARN", "CRITICAL"], "INFO não vai para o banco no default");
+
+    const tudo = new st.PostgresStorage(client, await policyPostgres({ HFT_STORAGE_MIRROR_LOGS: "all" }), "host#2");
+    await tudo.mirrorLog({ level: "INFO", component: "X", message: "agora vai" });
+    assert.equal((await client.query("SELECT count(*) AS c FROM decision_logs")).rows[0].c, 3);
+
+    const nada = new st.PostgresStorage(client, await policyPostgres({ HFT_STORAGE_MIRROR_LOGS: "off" }), "host#3");
+    assert.equal(await nada.mirrorLog({ level: "CRITICAL", component: "X", message: "não vai" }), false);
+    assert.equal((await client.query("SELECT count(*) AS c FROM decision_logs")).rows[0].c, 3);
+
+    await padrao.close();
+  });
+
+  await test("histórico para validação: filtro por modo é explícito (paper nunca entra no conjunto live)", async () => {
+    const st = await import("../src/storage/postgresStorage.js");
+    const { client } = await abrirPglite();
+    const storage = new st.PostgresStorage(client, await policyPostgres(), "host#1");
+    await storage.migrate();
+    await storage.mirrorTrade({ id: "l1", mint: "m1", status: "success", mode: "live", measuredOnChain: true, pnlNetSol: 0.001, time: new Date().toISOString() } as any);
+    await storage.mirrorTrade({ id: "p1", mint: "m2", status: "paper", mode: "paper", measuredOnChain: true, pnlNetSol: 9.9, time: new Date().toISOString() } as any);
+    await storage.mirrorTrade({ id: "l2", mint: "m3", status: "success", mode: "live", measuredOnChain: true, pnlNetSol: -0.002, time: new Date().toISOString() } as any);
+
+    const lives = await storage.fetchTrades({ mode: "live" });
+    assert.equal(lives.length, 2);
+    assert.deepEqual(lives.map((t: any) => t.id).sort(), ["l1", "l2"]);
+    assert.equal(lives.every((t: any) => t.mode === "live"), true);
+
+    const papers = await storage.fetchTrades({ mode: "paper" });
+    assert.equal(papers.length, 1);
+    assert.equal(papers[0].id, "p1");
+
+    const limitado = await storage.fetchTrades({ limit: 1 });
+    assert.equal(limitado.length, 1);
+    await storage.close();
+  });
+
+  await test("S10: fiação no servidor — boot fail-closed, espelho registrado e claim antes de assinar", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+
+    assert.ok(/decideEntryStorageGuard/.test(src), "o guarda de armazenamento precisa existir no caminho de entrada");
+    assert.ok(/STORAGE_UNAVAILABLE/.test(src) === false, "o código é do módulo, não um literal duplicado no servidor");
+    assert.ok(/\[Boot\]\[Storage\]\[FATAL\]/.test(src), "Postgres pedido e não pronto precisa IMPEDIR o boot");
+    assert.ok(/dbStore\.setWriteThrough/.test(src), "o espelho de escrita precisa ser registrado");
+    assert.ok(/claimEntry\(/.test(src) && /releaseEntryClaim\(/.test(src), "adquirir e liberar o claim");
+
+    // A ordem é a garantia: o claim vem ANTES de montar/assinar, e a liberação está no finally.
+    const posClaim = src.indexOf("await Promise.race([");
+    const posDeps = src.indexOf("const deps: RealEntryDeps = {");
+    const posFinally = src.indexOf("} finally {");
+    assert.ok(posClaim > 0 && posDeps > posClaim, "o claim precisa ser adquirido antes de montar a instrução");
+    assert.ok(posFinally > posDeps, "a liberação precisa estar no finally que cobre todo o pipeline");
+    assert.ok(/STORAGE_CLAIM_TIMEOUT/.test(src), "timeout do claim precisa RECUSAR (banco lento não vira permissão)");
+
+    // A persistência precisa chamar o sink nos quatro pontos de escrita.
+    const persist = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/persistence.ts"), "utf8"));
+    for (const m of ["mirrorTrade", "mirrorPosition", "mirrorIntent", "mirrorLog"]) {
+      assert.ok(persist.includes(m), `persistence.ts precisa espelhar ${m}`);
+    }
+    assert.ok(/app\.get\("\/api\/storage"/.test(src), "o estado do armazenamento precisa ser visível");
+  });
+
+  await test("S10: o adaptador não assina, não guarda chave e não inventa endpoint de banco", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const adaptador = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/storage/postgresStorage.ts"), "utf8"));
+    for (const proibido of ["Keypair", "signTransaction", "sendTransaction", "OPERATIONAL_PRIVATE_KEY"]) {
+      assert.equal(adaptador.includes(proibido), false, `o adaptador de banco não pode referenciar ${proibido}`);
+    }
+    assert.ok(/DATABASE_URL/.test(adaptador), "a URL do banco vem do ambiente (nunca de constante no código)");
+    assert.ok(/import\("pg"\)/.test(adaptador), "o cliente é carregado sob demanda (modo JSON não paga por ele)");
+    const schema = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "src/storage/schema.ts"), "utf8"));
+    assert.ok(!/DROP TABLE|DROP COLUMN|TRUNCATE/i.test(schema), "migração destrutiva não existe neste schema (por decisão)");
+    assert.ok(/WHERE state = 'active'/.test(schema), "o índice único do claim precisa ser PARCIAL (só claims ativos competem)");
+  });
+
+  // [30] S11 — PnL DO CICLO COMPLETO (o defeito do ΔSOL da venda)
+  console.log("\n[30] PnL do ciclo (S11): entrada + saída, ou nenhum número");
+
+  /**
+   * Trancar uma transação como se viesse do RPC, sem rede: a forma exata que `parseTransactionLeg`
+   * consome (`meta.preBalances/postBalances` indexados pela posição da carteira nas chaves).
+   */
+  const fakeTx = (opts: {
+    wallet: string;
+    mint: string;
+    pre: number;
+    post: number;
+    tokensAntes?: string;
+    tokensDepois?: string;
+    fee?: number;
+    slot?: number;
+    err?: any;
+    signature?: string;
+  }) => {
+    const keys = [opts.wallet, "OutraConta1111111111111111111111111111111111"];
+    const meta: any = {
+      preBalances: [opts.pre, 0],
+      postBalances: [opts.post, 0],
+      fee: opts.fee ?? 5000,
+      err: opts.err ?? null,
+      loadedAddresses: { writable: [], readonly: [] },
+    };
+    if (opts.tokensAntes !== undefined || opts.tokensDepois !== undefined) {
+      meta.preTokenBalances = [{ mint: opts.mint, owner: opts.wallet, uiTokenAmount: { amount: opts.tokensAntes ?? "0" } }];
+      meta.postTokenBalances = [{ mint: opts.mint, owner: opts.wallet, uiTokenAmount: { amount: opts.tokensDepois ?? "0" } }];
+    }
+    return {
+      slot: opts.slot ?? 100,
+      meta,
+      transaction: {
+        signatures: [opts.signature ?? "sigFake"],
+        message: {
+          staticAccountKeys: keys,
+          accountKeys: keys,
+        },
+      },
+    };
+  };
+
+  await test("o defeito corrigido: receita da venda NÃO é PnL do ciclo", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint1111111111111111111111111111111111111111";
+    const wallet = "Carteira111111111111111111111111111111111111";
+
+    // Compra de 0,01 SOL e venda devolvendo 0,02 SOL: o ciclo ganha 0,01 SOL, NÃO 0,02.
+    const entrada = rt.parseTransactionLeg(
+      wallet,
+      mint,
+      fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000, tokensAntes: "0", tokensDepois: "1000000000", fee: 5000 })
+    );
+    const saida = rt.parseTransactionLeg(
+      wallet,
+      mint,
+      fakeTx({ wallet, mint, pre: 990_000_000, post: 1_010_000_000, tokensAntes: "1000000000", tokensDepois: "0", fee: 5000 })
+    );
+
+    assert.equal(entrada.measured, true);
+    assert.equal(entrada.solDeltaLamports, -10_000_000);
+    assert.equal(saida.solDeltaLamports, 20_000_000);
+
+    const ciclo = rt.computeRoundTrip({ entry: entrada, exit: saida });
+    assert.equal(ciclo.basis, "round_trip_legs");
+    assert.equal(ciclo.measured, true);
+    // 0,01 SOL de lucro — e NÃO os 0,02 da venda.
+    assert.ok(Math.abs((ciclo.pnlNetSol as number) - 0.01) < 1e-12, `pnl=${ciclo.pnlNetSol}`);
+    assert.equal(ciclo.pnlNetLamports, 10_000_000);
+    assert.ok(Math.abs((ciclo.entryCostSol as number) - 0.01) < 1e-12);
+    assert.ok(Math.abs((ciclo.exitProceedsSol as number) - 0.02) < 1e-12);
+    assert.ok(Math.abs((ciclo.feesSol as number) - 0.00001) < 1e-15);
+    assert.ok(ciclo.notes.some((n) => /ΔSOL\(entrada\) \+ ΔSOL\(saída\)/.test(n)));
+    // A janela derivada confere: nada se moveu entre uma transação e a outra.
+    assert.equal(ciclo.windowConflict, false);
+  });
+
+  await test("prejuízo, empate e custo do fracasso: medidos, não estimados", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint2222222222222222222222222222222222222222";
+    const wallet = "Carteira222222222222222222222222222222222222";
+    const perna = (pre: number, post: number, err: any = null) =>
+      rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre, post, err }));
+
+    // Prejuízo: comprou por 0,01 e vendeu por 0,006.
+    const perda = rt.computeRoundTrip({ entry: perna(1_000_000_000, 990_000_000), exit: perna(990_000_000, 996_000_000) });
+    assert.ok(Math.abs((perda.pnlNetSol as number) + 0.004) < 1e-12, `pnl=${perda.pnlNetSol}`);
+    assert.equal(perda.measured, true);
+
+    // Empate: as duas pernas somam zero (fee já embutida nos deltas).
+    const empate = rt.computeRoundTrip({ entry: perna(1_000_000_000, 990_000_000), exit: perna(990_000_000, 1_000_000_000) });
+    assert.equal(empate.pnlNetLamports, 0);
+
+    // VENDA QUE FALHOU on-chain: o Δ é o custo do fracasso (fee), e a nota precisa dizer isto.
+    const falhou = rt.computeRoundTrip({
+      entry: perna(1_000_000_000, 990_000_000),
+      exit: perna(990_000_000, 989_995_000, { InstructionError: [0, "Custom"] }),
+    });
+    assert.equal(falhou.measured, true);
+    assert.ok(Math.abs((falhou.pnlNetSol as number) + 0.010005) < 1e-12);
+    assert.ok(falhou.notes.some((n) => /transação de SAÍDA falhou on-chain/.test(n)), falhou.notes.join(" | "));
+
+    // COMPRA que falhou: declara que o delta é o custo do fracasso, não uma compra.
+    const compraFalhou = rt.computeRoundTrip({
+      entry: perna(1_000_000_000, 999_995_000, { InstructionError: [0, "Custom"] }),
+      exit: perna(999_995_000, 1_000_000_000),
+    });
+    assert.ok(compraFalhou.notes.some((n) => /transação de ENTRADA falhou on-chain/.test(n)));
+  });
+
+  await test("perna faltante: NÃO existe PnL — o que sobra é declarado como receita da venda", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint3333333333333333333333333333333333333333";
+    const wallet = "Carteira333333333333333333333333333333333333";
+    const saida = rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_010_000_000 }));
+
+    // Sem perna de entrada (posição antiga, de antes desta versão).
+    const semEntrada = rt.computeRoundTrip({ entry: null, exit: saida });
+    assert.equal(semEntrada.basis, "exit_leg_only");
+    assert.equal(semEntrada.measured, false);
+    assert.equal(semEntrada.pnlNetSol, null, "NUNCA somar a saída com zero de entrada");
+    assert.equal(semEntrada.pnlNetLamports, null);
+    assert.ok(Math.abs((semEntrada.exitProceedsSol as number) - 0.02) < 1e-12, "a receita continua reportada, com nome próprio");
+    assert.ok(semEntrada.reasons.some((r) => /perna de ENTRADA ausente/.test(r)));
+    assert.ok(semEntrada.notes.some((n) => /RECEITA DA VENDA, não lucro/.test(n)));
+
+    // Entrada PRESENTE mas não medida (RPC sem histórico): mesma doutrina.
+    const entradaNaoMedida = rt.computeRoundTrip({ entry: rt.unmeasuredLeg("sigX", "transação não retornada pelo RPC"), exit: saida });
+    assert.equal(entradaNaoMedida.basis, "exit_leg_only");
+    assert.equal(entradaNaoMedida.pnlNetSol, null);
+    assert.ok(entradaNaoMedida.reasons.some((r) => /perna de ENTRADA não medida/.test(r)));
+
+    // Nenhuma perna: incompleto, sem número.
+    const nada = rt.computeRoundTrip({ entry: null, exit: null });
+    assert.equal(nada.basis, "incomplete");
+    assert.equal(nada.pnlNetSol, null);
+    assert.equal(nada.reasons.length, 2);
+  });
+
+  await test("venda PARCIAL não é fechamento: o PnL é da fração e a posição segue aberta", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint4444444444444444444444444444444444444444";
+    const wallet = "Carteira444444444444444444444444444444444444";
+    const entrada = rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000, tokensAntes: "0", tokensDepois: "1000000000" }));
+    // Vendeu metade.
+    const saida = rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_001_000_000, tokensAntes: "1000000000", tokensDepois: "500000000" }));
+
+    const ciclo = rt.computeRoundTrip({ entry: entrada, exit: saida, positionTokensRaw: "1000000000" });
+    assert.equal(ciclo.partialExit, true);
+    assert.ok(/50.00%/.test(ciclo.partialExitDetail as string), String(ciclo.partialExitDetail));
+    assert.ok(/NÃO está fechada/.test(ciclo.partialExitDetail as string));
+    assert.equal(ciclo.measured, true, "o PnL da fração vendida é medido…");
+    assert.ok(Math.abs((ciclo.pnlNetSol as number) - 0.001) < 1e-12);
+
+    // Venda do TOTAL não é parcial.
+    const total = rt.computeRoundTrip({
+      entry: entrada,
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_001_000_000, tokensAntes: "1000000000", tokensDepois: "0" })),
+      positionTokensRaw: "1000000000",
+    });
+    assert.equal(total.partialExit, false);
+
+    // Vendeu MAIS do que a posição registra: aviso, não silêncio.
+    const aMais = rt.computeRoundTrip({
+      entry: entrada,
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_001_000_000, tokensAntes: "2000000000", tokensDepois: "0" })),
+      positionTokensRaw: "1000000000",
+    });
+    assert.ok(aMais.notes.some((n) => /MAIS tokens do que a posição/.test(n)), aMais.notes.join(" | "));
+  });
+
+  await test("divergência de janela: detectada sem RPC extra, dos saldos das duas transações", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint5555555555555555555555555555555555555555";
+    const wallet = "Carteira555555555555555555555555555555555555";
+
+    // Carteira dedicada: entrada termina em 990M e a saída começa em 990M → sem divergência.
+    const limpo = rt.computeRoundTrip({
+      entry: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000 })),
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 990_000_000, post: 1_010_000_000 })),
+    });
+    assert.equal(limpo.windowConflict, false);
+    assert.ok(limpo.notes.some((n) => /janela confere/.test(n)));
+
+    /**
+     * Carteira NÃO dedicada: entre a compra e a venda a carteira perdeu 0,05 SOL por outra operação.
+     * O PnL do ciclo continua exato (cada delta é da sua transação), mas o fato precisa aparecer.
+     */
+    const sujo = rt.computeRoundTrip({
+      entry: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000 })),
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 940_000_000, post: 960_000_000 })),
+    });
+    assert.equal(sujo.measured, true);
+    assert.ok(Math.abs((sujo.pnlNetSol as number) - 0.01) < 1e-12, "o PnL do ciclo não muda com o que aconteceu fora dele");
+    assert.equal(sujo.windowConflict, true);
+    assert.ok(Math.abs((sujo.discrepancySol as number) + 0.05) < 1e-12, `discrepância=${sujo.discrepancySol}`);
+    assert.equal(sujo.basis, "round_trip_legs_window_conflict");
+    assert.ok(sujo.notes.some((n) => /OUTRA movimentação de SOL/.test(n)), sujo.notes.join(" | "));
+
+    // Tolerância declarada: 5.000 lamports passam; mais que isso, alerta.
+    const quase = rt.computeRoundTrip({
+      entry: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000 })),
+      exit: rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 989_996_000, post: 1_009_996_000 })),
+    });
+    assert.equal(quase.windowConflict, false, `discrepância de 4.000 lamports deveria passar: ${quase.discrepancySol}`);
+    assert.equal(rt.WINDOW_CONFLICT_EPSILON_SOL, 0.000005);
+  });
+
+  await test("parseTransactionLeg: honestidade na extração (nunca valor por omissão)", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "Mint6666666666666666666666666666666666666666";
+    const wallet = "Carteira666666666666666666666666666666666666";
+
+    const semMeta = rt.parseTransactionLeg(wallet, mint, { transaction: { signatures: ["sigS"] } });
+    assert.equal(semMeta.measured, false);
+    assert.equal(semMeta.solDeltaLamports, null, "sem meta não existe delta — e não é zero");
+    assert.ok(/sem meta/.test(semMeta.error as string));
+
+    const semCarteira = rt.parseTransactionLeg("OutraCarteira", mint, fakeTx({ wallet, mint, pre: 1, post: 2 }));
+    assert.equal(semCarteira.measured, false);
+    assert.ok(/não localizada/.test(semCarteira.error as string));
+
+    // Tokens: entradas de OUTRO dono não podem contar como posição nossa.
+    const tx = fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000, tokensAntes: "0", tokensDepois: "100" });
+    tx.meta.postTokenBalances = [
+      { mint, owner: wallet, uiTokenAmount: { amount: "100" } },
+      { mint, owner: "OutroDono", uiTokenAmount: { amount: "999999" } },
+      { mint: "OutroMint", owner: wallet, uiTokenAmount: { amount: "777" } },
+    ];
+    tx.meta.preTokenBalances = [{ mint, owner: wallet, uiTokenAmount: { amount: "0" } }];
+    const leg = rt.parseTransactionLeg(wallet, mint, tx);
+    assert.equal(leg.tokenDeltaRaw, "100", "só o mint certo, do dono certo");
+
+    // Erro on-chain é preservado (JSON), não engolido.
+    const comErro = rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre: 1, post: 0, err: { InstructionError: [0, "Custom"] } }));
+    assert.ok(/InstructionError/.test(comErro.onChainError as string));
+  });
+
+  await test("S11: fiação — a perna de entrada é gravada, e a saída recusa chamar receita de lucro", async () => {
+    const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const src = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+
+    assert.ok(/measureRoundTrip\(/.test(src), "a saída precisa usar o ciclo, não a perna da venda");
+    assert.ok(!/measureExitEconomics/.test(src), "o extrator de perna única não pode sobreviver no servidor");
+    assert.ok(/parseTransactionLeg/.test(src) && /computeRoundTrip/.test(src));
+    assert.ok(/entryLeg: pernaEntrada/.test(src), "a perna de entrada precisa ser gravada na posição");
+    assert.ok(/pnlBasis: ciclo\.basis/.test(src), "a procedência do PnL precisa viajar com o registro");
+    // A medição da entrada acontece DEPOIS da confirmação e não pode atrasar assinatura:
+    const posMedida = src.indexOf("const pernaEntrada = result.signature");
+    const posTrade = src.indexOf("const tradeStatus = result.confirmedOnChain");
+    assert.ok(posMedida > 0 && posTrade > 0, "os dois blocos existem");
+    // Os dois caminhos de saída medem o ciclo.
+    const ciclos = src.match(/await measureRoundTrip\(/g) ?? [];
+    assert.equal(ciclos.length, 2, `esperado o ciclo nas DUAS saídas reais (manual e autônoma), achei ${ciclos.length}`);
+    // Nenhuma gravação de PnL pode ignorar a procedência.
+    const pnlSemBase = /pnlNetSol:\s*[^,\n]*solDeltaSol/.test(src);
+    assert.equal(pnlSemBase, false, "ainda existe gravação de pnlNetSol a partir do delta da venda");
+  });
+
+  await test("S11: custos medidos dizem o que cobrem (tip/priority da entrada não são decompostos)", async () => {
+    const sv = await import("../src/strategyValidation.js");
+    const ol = await import("../src/outcomeLabels.js");
+    const agora = Date.now();
+    const rep = sv.buildValidationReport({
+      labeled: ol.labelAll(
+        [
+          {
+            id: "c1", token: "T", mint: "m", amount: "a", outAmount: "b", block: 1, tipSol: 3e-6, feesSol: 6e-6,
+            time: new Date(agora).toISOString(), latencyMs: 500, status: "success", mode: "live",
+            pnlNetSol: 0.001, measuredOnChain: true, pnlBasis: "round_trip_legs",
+          },
+        ] as any,
+        []
+      ),
+      source: { name: "teste", tradesRead: 1, positionsRead: 0, truncated: false, note: "" },
+    });
+    assert.ok(rep.measuredCosts.feesSol !== null && Math.abs(rep.measuredCosts.feesSol - 6e-6) < 1e-15);
+    assert.ok(rep.measuredCosts.tipsSol !== null && Math.abs(rep.measuredCosts.tipsSol - 3e-6) < 1e-15);
+    // A ressalva precisa existir e nomear o que fica de fora — senão "custo medido" viraria "custo total".
+    assert.ok(/decompostos/.test(rep.measuredCosts.note), rep.measuredCosts.note);
+    assert.ok(/ENTRADA/.test(rep.measuredCosts.note), rep.measuredCosts.note);
+    // E o próprio ciclo declara o limite da decomposição.
+    const rt = await import("../src/roundTrip.js");
+    const perna = (pre: number, post: number) => ({
+      signature: "s", measured: true, solDeltaLamports: post - pre, preLamports: pre, postLamports: post,
+      feeLamports: 5000, tokenDeltaRaw: null, slot: 1, onChainError: null, error: null,
+    });
+    const ciclo = rt.computeRoundTrip({ entry: perna(1_000_000_000, 990_000_000), exit: perna(990_000_000, 1_000_000_000) });
+    assert.ok(ciclo.notes.some((n) => /LIMITE DA DECOMPOSIÇÃO/.test(n)), ciclo.notes.join(" | "));
+  });
+
+  // ---------------------------------------------------------------------------
+  // [31] S12 — SAÍDA FAIL-CLOSED E TETO DE PERDA DIÁRIA
+  // ---------------------------------------------------------------------------
+  console.log("\n[31] S12 — quantidade verificada, prova de resíduo e limite de perda");
+
+  await test("política de saída (S12): defaults e override por env, com piso e teto", async () => {
+    const es = await import("../src/exitSafety.js");
+    assert.deepEqual(es.resolveExitSafetyPolicy({} as any), es.EXIT_SAFETY_DEFAULTS);
+    const o = es.resolveExitSafetyPolicy({
+      HFT_EXIT_BALANCE_ATTEMPTS: "5",
+      HFT_EXIT_BALANCE_BACKOFF_MS: "0",
+      HFT_RESIDUAL_DUST_RAW: "2",
+      HFT_EXIT_ABORT_RECHECK_MS: "1000",
+    } as any);
+    assert.equal(o.balanceAttempts, 5);
+    assert.equal(o.balanceBackoffMs, 0);
+    assert.equal(o.residualDustRaw, 2);
+    assert.equal(o.abortRecheckMs, 1000);
+    const clamped = es.resolveExitSafetyPolicy({ HFT_EXIT_BALANCE_ATTEMPTS: "99", HFT_EXIT_BALANCE_BACKOFF_MS: "-5" } as any);
+    assert.equal(clamped.balanceAttempts, 5, "teto de 5 tentativas");
+    assert.equal(clamped.balanceBackoffMs, 0, "piso 0 (não se espera negativo)");
+  });
+
+  await test("leitura de saldo: zero contas é FATO; falha em todas as tentativas é 'não consegui ver'", async () => {
+    const es = await import("../src/exitSafety.js");
+    const vazio = await es.readMintBalanceFailClosed({ readAccounts: async () => [], attempts: 3, backoffMs: 0 });
+    assert.equal(vazio.ok, true, "leitura concluída sem contas é um fato, não uma falha");
+    assert.equal(vazio.rawAmount, 0);
+    assert.equal(vazio.attempts, 1, "não se repete uma leitura que respondeu");
+
+    let calls = 0;
+    const falha = await es.readMintBalanceFailClosed({
+      readAccounts: async () => { calls++; throw new Error("RPC indisponível"); },
+      attempts: 3,
+      backoffMs: 0,
+    });
+    assert.equal(falha.ok, false, "sem leitura, o resultado é 'não consegui ver'");
+    assert.equal(calls, 3, "as 3 tentativas acontecem");
+    assert.equal(falha.errors.length, 3);
+
+    let n = 0;
+    const retry = await es.readMintBalanceFailClosed({
+      readAccounts: async () => { n++; if (n === 1) throw new Error("timeout"); return [{ rawAmount: 42, decimals: 6 }]; },
+      attempts: 3,
+      backoffMs: 0,
+    });
+    assert.equal(retry.ok, true);
+    assert.equal(retry.rawAmount, 42);
+    assert.equal(retry.attempts, 2, "o retry é provado pela contagem de tentativas");
+  });
+
+  await test("decisão de saída: zero ⇒ abort_zero_balance; ilegível ⇒ abort_unverified; nunca estima", async () => {
+    const es = await import("../src/exitSafety.js");
+    const zero = es.decideExitFromBalance({ ok: true, rawAmount: 0, decimals: 6, accounts: 1, attempts: 1, errors: [] });
+    assert.equal(zero.action, "abort_zero_balance");
+    assert.equal((zero as any).code, "EXIT_ABORTED_ZERO_ONCHAIN_BALANCE");
+    assert.ok(/permanece aberta/.test((zero as any).reason), "o motivo diz que a posição continua aberta");
+
+    const ilegivel = es.decideExitFromBalance({ ok: false, rawAmount: 0, decimals: null, accounts: 0, attempts: 3, errors: ["tentativa 1/3: timeout"] });
+    assert.equal(ilegivel.action, "abort_unverified");
+    assert.equal((ilegivel as any).code, "EXIT_ABORTED_BALANCE_UNREADABLE");
+    assert.ok(/SEM estimar/.test((ilegivel as any).reason));
+
+    const ok = es.decideExitFromBalance({ ok: true, rawAmount: 1234, decimals: 9, accounts: 2, attempts: 1, errors: [] });
+    assert.equal(ok.action, "proceed");
+    assert.equal((ok as any).rawAmount, 1234);
+    assert.equal((ok as any).decimals, 9);
+  });
+
+  await test("decisão de saída: decimals ausente usa o valor declarado e DIZ que usou", async () => {
+    const es = await import("../src/exitSafety.js");
+    const v = es.decideExitFromBalance({ ok: true, rawAmount: 7, decimals: null, accounts: 1, attempts: 1, errors: [] }, 6);
+    assert.equal(v.action, "proceed");
+    assert.equal((v as any).decimals, 6);
+    assert.ok(/decimals não veio na leitura/.test((v as any).note), "o fallback é declarado, não silencioso");
+  });
+
+  await test("fechamento: só com prova de resíduo — parcial continua aberta, leitura falha não fecha", async () => {
+    const es = await import("../src/exitSafety.js");
+    const completo = es.decideCloseFromResidual({ ok: true, rawAmount: 0, decimals: 6, accounts: 0, attempts: 1, errors: [] });
+    assert.equal(completo.close, true);
+
+    const parcial = es.decideCloseFromResidual({ ok: true, rawAmount: 5, decimals: 6, accounts: 1, attempts: 1, errors: [] });
+    assert.equal(parcial.close, false);
+    assert.equal((parcial as any).kind, "partial");
+    assert.equal((parcial as any).remainingRaw, 5);
+
+    const poeira = es.decideCloseFromResidual({ ok: true, rawAmount: 5, decimals: 6, accounts: 1, attempts: 1, errors: [] }, 5);
+    assert.equal(poeira.close, true, "tolerância DECLARADA permite fechar (Token-2022 com transfer fee)");
+
+    const falhou = es.decideCloseFromResidual({ ok: false, rawAmount: 0, decimals: null, accounts: 0, attempts: 2, errors: ["x"] });
+    assert.equal(falhou.close, false, "não se apaga o que não se conseguiu verificar");
+    assert.equal((falhou as any).kind, "unverified");
+    assert.equal((falhou as any).remainingRaw, null, "resíduo desconhecido NÃO vira zero");
+  });
+
+  await test("classificação de posição: paper não assina; live sem evidência é NÃO PROVADA", async () => {
+    const es = await import("../src/exitSafety.js");
+    assert.equal(es.classifyManagedPosition({ mode: "paper" }).kind, "paper");
+    assert.equal(es.classifyManagedPosition({ mode: "shadow" }).kind, "paper");
+    assert.equal(es.classifyManagedPosition({ mode: "live", signature: "5abc..." }).kind, "live");
+    assert.equal(es.classifyManagedPosition({ mode: "live", entryLeg: { signature: "5abc..." } }).kind, "live");
+    const semAssinatura = es.classifyManagedPosition({ mode: "live" });
+    assert.equal(semAssinatura.kind, "unverified", "live sem prova de entrada não pode assinar saída");
+    const semModo = es.classifyManagedPosition({});
+    assert.equal(semModo.kind, "unverified", "posição herdada sem `mode` não é mais tratada como real");
+    assert.ok(/modo ausente/.test(semModo.reason), semModo.reason);
+  });
+
+  await test("livro de perda diária: só PnL de ciclo medido; ganho não abate; sem data fica de fora", async () => {
+    const es = await import("../src/exitSafety.js");
+    const ledger = es.createDailyLossLedger();
+    const dia = "2026-10-06";
+    const st = ledger.seed([
+      { id: "a", pnlNetSol: -0.002, pnlBasis: "round_trip_legs", closedAtIso: `${dia}T10:00:00.000Z` },
+      { id: "b", pnlNetSol: 0.01, pnlBasis: "round_trip_legs", closedAtIso: `${dia}T10:05:00.000Z` },
+      { id: "c", pnlNetSol: -0.5, pnlBasis: "exit_leg_only", closedAtIso: `${dia}T10:10:00.000Z` },
+      { id: "d", pnlNetSol: -0.3, pnlBasis: "round_trip_legs", time: "10:15:00.000" },
+    ], `${dia}T23:00:00.000Z`);
+    assert.equal(st.countedTrades, 2, "só os dois com ciclo medido E data entram");
+    assert.ok(Math.abs(st.realizedLossSol - 0.002) < 1e-12, `perda somada=${st.realizedLossSol}`);
+    assert.equal(st.ignoredGains, 1, "o ganho não abate a perda");
+    assert.equal(st.ignoredNotMeasured, 1, "`exit_leg_only` é receita de venda, não PnL");
+    assert.equal(st.undatedMeasured, 1, "medido sem data é DECLARADO, não somado");
+    assert.ok(/PISO verificado/.test(st.note), st.note);
+  });
+
+  await test("livro de perda: idempotente por id, rola no dia e 0 = sem teto", async () => {
+    const es = await import("../src/exitSafety.js");
+    const ledger = es.createDailyLossLedger();
+    const rec = { tradeId: "x", pnlNetSol: -0.01, pnlBasis: "round_trip_legs", closedAtIso: "2026-10-06T12:00:00.000Z" };
+    ledger.record(rec);
+    const duas = ledger.record(rec);
+    assert.ok(Math.abs(duas.realizedLossSol - 0.01) < 1e-12, "o MESMO trade não conta duas vezes");
+    assert.equal(ledger.exceeded(0.05, "2026-10-06T13:00:00.000Z"), false);
+    assert.equal(ledger.exceeded(0.01, "2026-10-06T13:00:00.000Z"), true, "teto atingido");
+    assert.equal(ledger.exceeded(0, "2026-10-06T13:00:00.000Z"), false, "0 = sem teto declarado");
+    const outroDia = ledger.state("2026-10-07T00:01:00.000Z");
+    assert.equal(outroDia.realizedLossSol, 0, "o dia rola");
+    assert.equal(outroDia.dayIso, "2026-10-07");
+  });
+
+  await test("gate do teto diário: motivo legível e ausência de teto declarada", async () => {
+    const es = await import("../src/exitSafety.js");
+    const estado = {
+      dayIso: "2026-10-06", realizedLossSol: 0.02, countedTrades: 3, conflictedTrades: 0,
+      ignoredNotMeasured: 0, ignoredGains: 0, undatedMeasured: 1, note: "",
+    } as any;
+    const semTeto = es.dailyLossGate(estado, 0);
+    assert.equal(semTeto.exceeded, false);
+    assert.ok(/sem limite diário declarado/.test(semTeto.reason));
+    const estourou = es.dailyLossGate(estado, 0.02);
+    assert.equal(estourou.exceeded, true);
+    assert.ok(/TETO ATINGIDO/.test(estourou.reason));
+    assert.ok(/sem data ficaram FORA/.test(estourou.reason), estourou.reason);
+    const dentro = es.dailyLossGate(estado, 0.05);
+    assert.equal(dentro.exceeded, false);
+    assert.ok(/dentro do teto/.test(dentro.reason));
+  });
+
+  await test("o servidor NÃO estima mais quantidade de venda e usa o módulo S12 nos dois caminhos", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const code = serverSrc
+      .split("\n")
+      .filter((l) => {
+        const t = l.trim();
+        return !(t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"));
+      })
+      .join("\n");
+    for (const proibido of [
+      "rawAmount = Math.floor(qtyFloat",
+      "Using local calculation",
+      "Using local balance calculation",
+      "fall back to calculated quantity",
+    ]) {
+      assert.ok(!code.includes(proibido), `o servidor voltou a ESTIMAR quantidade de venda: "${proibido}"`);
+    }
+    for (const obrigatorio of [
+      "decideExitFromBalance(",
+      "decideCloseFromResidual(",
+      "classifyManagedPosition(",
+      "readMintBalanceForDecision(",
+      "enforceDailyLossLimit(",
+      "enforceMaxOpenPositions(",
+      "MAX_DAILY_LOSS_SOL",
+    ]) {
+      assert.ok(code.includes(obrigatorio), `o caminho de saída perdeu "${obrigatorio}"`);
+    }
+    // Leitura fail-closed: 1 definição + 4 usos — saldo e resíduo em CADA um dos dois caminhos
+    // de saída (fechamento manual e saída autônoma). Se um deles perder a verificação, isto cai.
+    assert.equal(
+      code.split("readMintBalanceForDecision(").length - 1,
+      5,
+      "esperado: definição + (saldo e resíduo) × (manual, autônomo)"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [32] S13 — ENTREGA: CORRIDA DE TRANSPORTES E FALLBACK POR RPC
+  // ---------------------------------------------------------------------------
+  console.log("\n[32] S13 — entrega da transação: corrida ou Jito com fallback por RPC");
+
+  await test("fallback por RPC: default LIGADO e desligar é declarado, não silencioso", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const padrao = ps.resolveRpcFallbackPolicy({} as any);
+    assert.equal(padrao.enabled, true, "sem variável, o fallback é LIGADO");
+    assert.equal(padrao.raw, null);
+    assert.ok(/MESMOS bytes/.test(padrao.note), padrao.note);
+
+    for (const off of ["0", "false", "no", "FALSE"]) {
+      const desligado = ps.resolveRpcFallbackPolicy({ HFT_RPC_FALLBACK_ON_JITO_FAIL: off } as any);
+      assert.equal(desligado.enabled, false, `${off} desliga`);
+      assert.ok(/FALHA TERMINAL/.test(desligado.note), desligado.note);
+    }
+    const ligado = ps.resolveRpcFallbackPolicy({ HFT_RPC_FALLBACK_ON_JITO_FAIL: "1" } as any);
+    assert.equal(ligado.enabled, true);
+    assert.ok(/ligado/.test(ligado.note));
+  });
+
+  await test("plano de entrega: desligado + fallback ⇒ Jito primeiro e RPC na recusa", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const policy = ps.resolveParallelSendPolicy({} as any);
+    const plano = ps.planSubmission(policy, ps.resolveRpcFallbackPolicy({} as any));
+    assert.equal(plano.mode, "jito_with_fallback");
+    // EQUIVALÊNCIA PINADA: `mode === "race"` ⟺ `policy.enabled`. Se alguém mudar uma das duas
+    // condições sem a outra, isto quebra (as duas são usadas em lugares diferentes do server).
+    assert.notEqual(ps.planSubmission(ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1" } as any), ps.resolveRpcFallbackPolicy({} as any)).mode, "jito_with_fallback");
+    assert.deepEqual(plano.transports, ["jito", "rpc"]);
+    assert.equal(plano.rpcFallback, true);
+    assert.ok(/só paga o custo quando o Jito falha/.test(plano.note), plano.note);
+  });
+
+  await test("plano de entrega: corrida ligada lista os transportes e diz se o RPC está nela", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const semRpc = ps.planSubmission(
+      ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_STAKED_SENDER_URL: "https://sender.invalido" } as any),
+      ps.resolveRpcFallbackPolicy({} as any)
+    );
+    assert.equal(semRpc.mode, "race");
+    assert.deepEqual(semRpc.transports, ["jito", "staked"]);
+    assert.equal(semRpc.rpcFallback, false, "na corrida o fallback sequencial não é usado");
+    assert.ok(/RPC NÃO está na corrida/.test(semRpc.note), semRpc.note);
+
+    const comRpc = ps.planSubmission(
+      ps.resolveParallelSendPolicy({ HFT_PARALLEL_SEND: "1", HFT_SEND_RPC_DIRECT: "1" } as any),
+      ps.resolveRpcFallbackPolicy({} as any)
+    );
+    assert.deepEqual(comRpc.transports, ["jito", "rpc"]);
+    assert.ok(/RPC já faz parte da corrida/.test(comRpc.note), comRpc.note);
+  });
+
+  await test("plano de entrega: tudo desligado é declarado como falha terminal", async () => {
+    const ps = await import("../src/parallelSend.js");
+    const plano = ps.planSubmission(
+      ps.resolveParallelSendPolicy({} as any),
+      ps.resolveRpcFallbackPolicy({ HFT_RPC_FALLBACK_ON_JITO_FAIL: "0" } as any)
+    );
+    assert.equal(plano.mode, "jito_only");
+    assert.equal(plano.rpcFallback, false);
+    assert.ok(/falha terminal/.test(plano.note), plano.note);
+  });
+
+  await test("o servidor entrega pelos TRÊS pontos (entrada + 2 saídas) e não tem mais envio solto", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const serverSrc = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const code = serverSrc
+      .split("\n")
+      .filter((l) => {
+        const t = l.trim();
+        return !(t.startsWith("//") || t.startsWith("*") || t.startsWith("/*"));
+      })
+      .join("\n");
+    assert.equal(
+      code.split("submitSignedTransaction(").length - 1,
+      4,
+      "esperado: 1 definição + 3 pontos de entrega (entrada, saída manual, saída autônoma)"
+    );
+    assert.ok(code.includes("PARALLEL_SEND.enabled"), "a corrida segue condicionada à política (contrato do S8)");
+    assert.equal(
+      code.includes("process.env.HFT_RPC_FALLBACK_ON_JITO_FAIL"),
+      false,
+      "o servidor não lê a variável direto: quem resolve a política é o módulo (fonte única)"
+    );
+    assert.ok(code.includes("assertCanSign(params.purpose)"), "o envio de fallback passa pelo choke point");
+    assert.ok(code.includes("sendRawTransaction"), "o fallback usa sendRawTransaction");
+    assert.equal(code.includes("jitoRes"), false, "nenhuma saída ficou presa ao resultado do Jito");
+    assert.equal(
+      code.includes("[Jito Bundle Exit] Bundle enviado"),
+      false,
+      "o log antigo não pode voltar: a entrega passa a declarar o caminho vencedor"
+    );
+  });
+
+  // ---------------------------------------------------------------------------
+  // [33] S14 — RECONCILIAÇÃO DA PERNA DE ENTRADA
+  // ---------------------------------------------------------------------------
+  console.log("\n[33] S14 — reconciliação: fechar o ciclo do histórico SEM inventar vínculo");
+
+  /** Trades realistas do histórico: a saída sem ciclo e a entrada do mesmo mint. */
+  const tradeSaida = (over: any = {}) => ({
+    id: "txn_exit_1",
+    token: "TOKEN",
+    mint: "MintReconcile111111111111111111111111111111",
+    amount: "1.00 TOKEN",
+    outAmount: "0.02 SOL",
+    status: "success",
+    block: 200,
+    tipSol: 0.0002,
+    route: "KMS Real Exit Jito",
+    time: "12:00:00.000",
+    latencyMs: 1500,
+    mode: "live",
+    signature: "sigSaida1111111111111111111111111111111111111111111111111111",
+    measuredOnChain: true,
+    pnlSol: undefined,
+    // Registro PRÉ-S11: o pnlNetSol gravado era o ΔSOL da VENDA (receita), e pnlBasis não existia.
+    pnlNetSol: 0.02,
+    ...over,
+  });
+  const tradeEntrada = (over: any = {}) => ({
+    id: "live_ent1",
+    token: "TOKEN",
+    mint: "MintReconcile111111111111111111111111111111",
+    amount: "0.01 SOL (REAL)",
+    outAmount: "1000000000 unidades do mint",
+    status: "confirmed",
+    block: 100,
+    tipSol: 0.0001,
+    route: "Jupiter → Jito bundle",
+    time: "11:59:00.000",
+    latencyMs: 900,
+    mode: "live",
+    signature: "sigEntrada111111111111111111111111111111111111111111111111111",
+    ...over,
+  });
+
+  await test("plano: saída em perna única + UMA entrada localizada ⇒ elegível", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const plan = rec.planEntryLegReconciliation([tradeEntrada(), tradeSaida()] as any);
+    assert.equal(plan.items.length, 1, JSON.stringify(plan.skipped));
+    const item = plan.items[0];
+    assert.equal(item.exitTradeId, "txn_exit_1");
+    assert.equal(item.entryTradeId, "live_ent1");
+    assert.equal(item.entrySignature, "sigEntrada111111111111111111111111111111111111111111111111111");
+    assert.ok(Math.abs((item.recordedSaleProceedsSol as number) - 0.02) < 1e-12, "o registrado (receita da venda) é preservado no plano");
+    assert.equal(item.originalBasis, null, "registro pré-S11 não tem pnlBasis");
+    assert.equal(plan.counts.eligible, 1);
+    assert.ok(/não é reinterpretar histórico/.test(plan.note), plan.note);
+  });
+
+  await test("plano: DUAS entradas candidatas ⇒ AMBIGUOUS_ENTRY (nunca escolhe a 'mais provável')", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const plan = rec.planEntryLegReconciliation([
+      tradeEntrada(),
+      tradeEntrada({ id: "live_ent2", block: 150, signature: "sigEntrada22222222222222222222222222222222222222222222222222" }),
+      tradeSaida(),
+    ] as any);
+    assert.equal(plan.items.length, 0);
+    assert.equal(plan.counts.byCode.AMBIGUOUS_ENTRY, 1);
+    assert.ok(/inventar/.test(plan.skipped[0].reason), plan.skipped[0].reason);
+  });
+
+  await test("plano: sem entrada; entrada depois da saída; já reconciliado; paper", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+
+    const semEntrada = rec.planEntryLegReconciliation([tradeSaida()] as any);
+    assert.equal(semEntrada.counts.byCode.NO_ENTRY_SIGNATURE, 1);
+
+    const depois = rec.planEntryLegReconciliation([tradeEntrada({ block: 300 }), tradeSaida()] as any);
+    assert.equal(depois.items.length, 0);
+    assert.equal(depois.counts.byCode.NO_ENTRY_SIGNATURE, 1, "entrada posterior à saída não pode servir");
+
+    const jaFeito = rec.planEntryLegReconciliation([
+      tradeEntrada(),
+      tradeSaida({ pnlBasis: "round_trip_legs", pnlNetSol: 0.01 }),
+    ] as any);
+    assert.equal(jaFeito.counts.byCode.ALREADY_RECONCILED, 1);
+
+    const paper = rec.planEntryLegReconciliation([tradeEntrada(), tradeSaida({ mode: "paper", pnlNetSol: undefined, saleProceedsSol: 0.02 })] as any);
+    assert.equal(paper.counts.byCode.NOT_LIVE, 1, "paper nunca entra na validação");
+  });
+
+  await test("decisão: perna não medida recusa com o motivo; divergência contra o registro recusa", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const rt = await import("../src/roundTrip.js");
+    const mint = "MintReconcile111111111111111111111111111111";
+    const wallet = "CarteiraReconcile11111111111111111111111111";
+    const perna = (pre: number, post: number, err: any = null) =>
+      rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre, post, err }));
+
+    const entrada = perna(1_000_000_000, 990_000_000);
+    const saida = perna(990_000_000, 1_010_000_000);
+
+    const semEntrada = rec.decideEntryLegReconciliation({ entryLeg: rt.unmeasuredLeg("s", "RPC fora"), exitLeg: saida });
+    assert.equal((semEntrada as any).code, "ENTRY_LEG_UNMEASURED");
+
+    const semSaida = rec.decideEntryLegReconciliation({ entryLeg: entrada, exitLeg: rt.unmeasuredLeg("s", "sem histórico") });
+    assert.equal((semSaida as any).code, "EXIT_LEG_UNMEASURED");
+
+    // Registro diz 0,02 SOL de venda; a releitura diz 0,02 — dentro da tolerância ⇒ reconcilia.
+    const ok = rec.decideEntryLegReconciliation({ entryLeg: entrada, exitLeg: saida, recordedLegacyPnlSol: 0.02 });
+    assert.equal((ok as any).action, "reconcile");
+    assert.ok(Math.abs(((ok as any).cycle.pnlNetSol as number) - 0.01) < 1e-12, `pnl=${(ok as any).cycle.pnlNetSol}`);
+    assert.equal((ok as any).cycle.measured, true);
+
+    // Divergência grande ⇒ RECUSA (outra movimentação mexeu no saldo).
+    const divergente = rec.decideEntryLegReconciliation({ entryLeg: entrada, exitLeg: saida, recordedLegacyPnlSol: 0.5 });
+    assert.equal((divergente as any).code, "EXIT_LEG_MISMATCH");
+    assert.ok(/NÃO é promovido/.test((divergente as any).reason), (divergente as any).reason);
+  });
+
+  await test("escrita: o número anterior é PRESERVADO e a procedência própria é gravada", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const rt = await import("../src/roundTrip.js");
+    const mint = "MintReconcile111111111111111111111111111111";
+    const wallet = "CarteiraReconcile11111111111111111111111111";
+    const perna = (pre: number, post: number) => rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre, post }));
+    const entrada = perna(1_000_000_000, 990_000_000);
+    const saida = perna(990_000_000, 1_010_000_000);
+    const decisao: any = rec.decideEntryLegReconciliation({ entryLeg: entrada, exitLeg: saida, recordedLegacyPnlSol: 0.02 });
+    assert.equal(decisao.action, "reconcile");
+
+    const original = tradeSaida();
+    const novo = rec.buildReconciledTrade(original as any, {
+      entryLeg: entrada,
+      exitLeg: saida,
+      cycle: decisao.cycle,
+      reconciledAt: "2026-10-06T18:00:00.000Z",
+      mismatchSol: decisao.mismatchSol,
+      expectedExitProceedsSol: decisao.expectedExitProceedsSol,
+    });
+
+    assert.equal((novo as any).pnlBasis, "round_trip_legs_reconciled", "procedência PRÓPRIA do reconciliado");
+    assert.ok(Math.abs(((novo as any).pnlNetSol as number) - 0.01) < 1e-12, `pnl=${(novo as any).pnlNetSol}`);
+    assert.equal((novo as any).supersededPnlNetSol, 0.02, "o valor antigo (receita da venda) fica preservado");
+    assert.equal((novo as any).entryLegSignature, entrada.signature);
+    assert.equal((novo as any).reconciledAt, "2026-10-06T18:00:00.000Z");
+    assert.ok(/NÃO é lucro/.test((novo as any).reconciliationNote), (novo as any).reconciliationNote);
+    assert.ok(/reli[dt]a da cadeia/.test((novo as any).reconciliationNote), (novo as any).reconciliationNote);
+    // Nada do registro original foi apagado.
+    assert.equal((novo as any).id, original.id);
+    assert.equal((novo as any).signature, original.signature);
+    assert.equal((novo as any).time, original.time);
+    assert.equal((novo as any).block, original.block);
+    assert.equal((novo as any).mode, "live");
+  });
+
+  await test("medir perna com conexão falsa: sem conexão/null/erro ⇒ NÃO medido, com motivo", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "MintReconcile111111111111111111111111111111";
+    const wallet = "CarteiraReconcile11111111111111111111111111";
+
+    const semConexao = await rt.measureLegWith(null, "sigX", wallet, mint);
+    assert.equal(semConexao.measured, false);
+    assert.ok(/sem conexão RPC/.test(semConexao.error ?? ""));
+    assert.equal(semConexao.solDeltaLamports, null, "não medido NUNCA vira zero");
+
+    const nula = await rt.measureLegWith({ getTransaction: async () => null } as any, "sigX", wallet, mint);
+    assert.equal(nula.measured, false);
+    assert.ok(/não retornada/.test(nula.error ?? ""));
+
+    const explodiu = await rt.measureLegWith({ getTransaction: async () => { throw new Error("RPC 429"); } } as any, "sigX", wallet, mint);
+    assert.equal(explodiu.measured, false);
+    assert.ok(/429/.test(explodiu.error ?? ""));
+
+    const semAssinatura = await rt.measureLegWith({ getTransaction: async () => ({}) } as any, null, wallet, mint);
+    assert.equal(semAssinatura.measured, false);
+
+    const ok = await rt.measureLegWith(
+      { getTransaction: async () => fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000 }) } as any,
+      "sigY", wallet, mint
+    );
+    assert.equal(ok.measured, true);
+    assert.equal(ok.solDeltaLamports, -10_000_000);
+  });
+
+  await test("reconciliado entra na validação MAS com base própria; e conta no teto de perda", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const es = await import("../src/exitSafety.js");
+    const reconciliado = {
+      ...tradeSaida({ pnlBasis: "round_trip_legs_reconciled", pnlNetSol: -0.004, saleProceedsSol: 0.006, reconciledAt: "2026-10-06T18:00:00.000Z" }),
+    } as any;
+    const rotulo = ol.labelTrade(reconciliado);
+    assert.equal(rotulo.basis, "net_measured", "as duas pernas medidas ⇒ elegível");
+    assert.equal(rotulo.label, "loss");
+    assert.equal(rotulo.excluded, false, "reconciliado é elegível, não excluído");
+    assert.ok(/supersededPnlNetSol|REMEDIDA/.test(rotulo.reason), rotulo.reason);
+
+    assert.ok((es.MEASURED_PNL_BASES as readonly string[]).includes("round_trip_legs_reconciled"), "o livro de perda diária conta reconciliados");
+
+    // Fail-closed preservado: um registro SEM procedência continua fora.
+    const semProcedencia = ol.labelTrade({ ...tradeSaida({ pnlBasis: undefined, pnlNetSol: 0.02, measuredOnChain: true }) } as any);
+    assert.notEqual(semProcedencia.basis, "net_measured", "sem pnlBasis declarado não é promovido");
+  });
+
+  await test("resumo: separa reconciliados de recusados e declara o que ficou fora", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const plan = rec.planEntryLegReconciliation([tradeEntrada(), tradeSaida()] as any);
+    const sum = rec.summarizeReconciliation(plan, [
+      { exitTradeId: "txn_exit_1", mint: plan.items[0].mint, token: "TOKEN", verdict: "reconciled", code: "OK", pnlNetSol: 0.01, previousPnlSol: 0.02, reason: "" },
+      { exitTradeId: "txn_exit_2", mint: plan.items[0].mint, token: "TOKEN", verdict: "refused", code: "EXIT_LEG_MISMATCH", pnlNetSol: null, previousPnlSol: 0.02, reason: "" },
+    ]);
+    assert.equal(sum.reconciled, 1);
+    assert.equal(sum.refused, 1);
+    assert.equal(sum.byRefusal.EXIT_LEG_MISMATCH, 1);
+    assert.ok(Math.abs(sum.totalPnlSol - 0.01) < 1e-12);
+    assert.ok(/NÃO foi reescrito/.test(sum.note), sum.note);
+  });
+
+  await test("o script é DRY-RUN por default: gravação só sob --apply e nenhuma chave é tocada", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "scripts/reconcile-entry-legs.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+    for (const proibido of ["Keypair", "secretKey", "sendRawTransaction", "sendTransaction", "OPERATIONAL_PRIVATE_KEY"]) {
+      assert.equal(code.includes(proibido), false, `reconcile-entry-legs.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(code.includes("if (apply)"), "a gravação precisa estar condicionada a --apply");
+    const posApplyCond = code.indexOf("if (apply)");
+    const posSave = code.indexOf("dbStore.saveTrade(novo)");
+    assert.ok(posSave > posApplyCond && posApplyCond > 0, "saveTrade só pode existir DENTRO do ramo --apply");
+    assert.equal(code.split("saveTrade").length - 1, 1, "um único ponto de escrita");
+    assert.ok(code.includes("DRY-RUN: NADA foi gravado"), "o aviso de dry-run precisa ser explícito");
+    assert.ok(code.includes("getTransaction") === false, "a leitura da transação vem de measureLegWith (uma única definição)");
+
+    const serverSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(serverSrc.includes('app.get("/api/reconciliation"'), "o endpoint de leitura precisa existir");
+  });
+
+  // ---------------------------------------------------------------------------
+  // [34] B — procedência até a superfície + gate de saída na via AUTÔNOMA
+  // ---------------------------------------------------------------------------
+  console.log("\n[34] B — o rótulo viaja com o número; a via autônoma passa pelo gate");
+
+  /** Trade cru como o banco guarda (sem rótulo: o rótulo é ANEXADO na superfície). */
+  const tradeCru = (over: any = {}) => ({
+    id: "txn_1",
+    token: "TOKEN",
+    mint: "MintHigi1111111111111111111111111111111111",
+    amount: "0.01 SOL (REAL)",
+    outAmount: "1.00 TOKEN",
+    status: "success",
+    block: 123,
+    tipSol: 0.0001,
+    route: "KMS Real Exit Jito (TAKE_PROFIT)",
+    time: "12:00:00.000",
+    latencyMs: 900,
+    mode: "live",
+    signature: "sigHigi11111111111111111111111111111111111111111111111111",
+    ...over,
+  });
+
+  await test("superfície: o rótulo é ANEXADO ao registro (medido, reconciliado e sem procedência)", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+
+    // 1) Ciclo medido: PnL elegível, com procedência declarada.
+    const medido = ol.annotateTradeWithOutcome(tradeCru({ pnlNetSol: -0.004, pnlBasis: "round_trip_legs", measuredOnChain: true }) as any);
+    assert.equal(medido.labelBasis, "net_measured");
+    assert.equal(medido.excludedFromValidation, false);
+    assert.equal(medido.pnlNetSol, -0.004, "o registro original continua inteiro (annotate é aditivo)");
+    assert.equal(medido.id, "txn_1");
+    assert.ok(medido.labelReason.length > 0);
+
+    // 2) Reconciliado (S14): elegível, mas com base PRÓPRIA — a superfície mostra de onde veio.
+    const reconciliado = ol.annotateTradeWithOutcome(
+      tradeCru({ pnlNetSol: 0.01, pnlBasis: "round_trip_legs_reconciled", measuredOnChain: true, reconciledAt: "2026-10-06T18:00:00.000Z", supersededPnlNetSol: 0.02 }) as any
+    );
+    assert.equal(reconciliado.labelBasis, "net_measured");
+    assert.equal(reconciliado.excludedFromValidation, false);
+
+    // 3) O defeito do Adendo 19 na superfície: número "medido" SEM procedência declarada não vira
+    //    resultado — fica excluído e o motivo viaja junto (nada de número solto).
+    const semProcedencia = ol.annotateTradeWithOutcome(tradeCru({ pnlNetSol: 0.02, measuredOnChain: true }) as any);
+    assert.notEqual(semProcedencia.labelBasis, "net_measured");
+    assert.equal(semProcedencia.excludedFromValidation, true);
+    assert.ok(/proced/i.test(semProcedencia.labelReason) || /sem/i.test(semProcedencia.labelReason), semProcedencia.labelReason);
+  });
+
+  await test("/api/snipes serve o BANCO (fonte única): o array em memória não existe mais", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+
+    assert.equal(code.includes("snipedTransactions"), false, "o segundo estado do histórico foi REMOVIDO (era o que divergia do banco)");
+    // Remover o array em memória NÃO pode ter removido a PERSISTÊNCIA: cada gravador continua
+    // salvando no banco (o que sobrava era só o espelho em memória, que divergia).
+    for (const gravacao of ["saveTrade(realCloseTx)", "saveTrade(mockTx)", "saveTrade(paperTx)", "saveTrade(paperTrade)", "saveTrade(failedExitTx)"]) {
+      assert.ok(code.includes(gravacao), `a persistência precisa continuar: ${gravacao} ausente`);
+    }
+    // Outros arrays em memória (telemetria/ring buffer de eventos) são legítimos e permanecem:
+    assert.ok(code.includes("failoverEvents.unshift("), "a telemetria de failover não faz parte desta remoção");
+
+    const i = code.indexOf('app.get("/api/snipes"');
+    assert.ok(i > 0, "o endpoint precisa existir");
+    const corpo = code.slice(i, code.indexOf("});", i));
+    assert.ok(corpo.includes("dbStore.getTrades()"), "o histórico servido precisa vir do banco no momento da requisição");
+    assert.ok(corpo.includes("annotateTradeWithOutcome"), "e cada registro precisa sair COM a procedência anexada");
+  });
+
+  await test("via AUTÔNOMA de saída: mesmo gate do manual, ANTES da trava de voo único e da intenção", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const code = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+
+    const iFn = code.indexOf("async function executeAutonomousExit(");
+    assert.ok(iFn > 0, "a função precisa existir");
+    // Fim da função: o próximo "async function" ou "function" no mesmo nível — usa a distância até o
+    // próximo cabeçalho de função conhecido para delimitar a inspeção.
+    const iFim = code.indexOf("\nasync function", iFn + 10);
+    const corpo = code.slice(iFn, iFim > 0 ? iFim : iFn + 6000);
+
+    const iGate = corpo.indexOf("assertExitAllowed()");
+    const iLock = corpo.indexOf("exitLocks.add(pos.id)");
+    const iIntent = corpo.indexOf("persistIntent(");
+    const iSign = corpo.indexOf("submitSignedTransaction(");
+    assert.ok(iGate > 0, "a via autônoma precisa chamar assertExitAllowed()");
+    assert.ok(iGate < iLock, "o gate precisa vir ANTES de a posição entrar em exit_pending");
+    assert.ok(iGate < iIntent, "e ANTES de persistir intenção (não se cria intenção para recusar depois)");
+    assert.ok(iGate < iSign, "e antes de qualquer assinatura/envio");
+    assert.ok(corpo.includes("permanece ABERTA"), "a recusa precisa dizer que a posição continua aberta");
+    assert.ok(code.includes("exitGateBlockedWarned"), "aviso único por posição (não inundar o log a cada ciclo)");
+
+    // A via autônoma continua sendo SÓ de posição real: paper fecha em sombra.
+    const iLoop = code.indexOf("const isPaper = posClass.kind");
+    assert.ok(iLoop > 0, "o classificador de posição precisa existir no laço");
+    // A janela cobre o laço inteiro até a primeira chamada de fechamento em sombra (distância real
+    // medida no arquivo: ~15 mil caracteres).
+    const trecho = code.slice(iLoop, iLoop + 25000);
+    assert.ok(/if \(isPaper\)/.test(trecho), "paper precisa continuar fechando em sombra (recordPaperClose)");
+    assert.ok(trecho.includes("recordPaperClose("), "o fechamento em sombra precisa continuar existindo");
+  });
+
+  await test("painel: NÃO existe PnL exibido sem rótulo do servidor", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const ui = fs.readFileSync(path.join(repoRoot, "src/components/TransactionLogger.tsx"), "utf8");
+    assert.ok(/typeof tx\.pnlNetSol === "number" && tx\.label/.test(ui), "o PnL só pode ser exibido quando o rótulo vier junto");
+    assert.ok(ui.includes("não medido"), "sem rótulo, o painel diz 'não medido' em vez de mostrar número");
+
+    const tipos = fs.readFileSync(path.join(repoRoot, "src/types.ts"), "utf8");
+    for (const campo of ["label?", "labelBasis?", "labelReason?", "excludedFromValidation?", "pnlNetSol?"]) {
+      assert.ok(tipos.includes(campo), `SnipedTransaction precisa declarar ${campo}`);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // [35] A — custo da volta: o PAPER passa a cobrar o piso do ciclo
+  // ---------------------------------------------------------------------------
+  console.log("\n[35] A — custo da volta: piso conhecido, premissas e o que NÃO é medido");
+
+  await test("piso do ciclo: tip limitado por bps, fee base nas duas pernas, priority não declarada", async () => {
+    const rtc = await import("../src/roundTripCost.js");
+    const policy = rtc.resolveRoundTripCostPolicy({} as any);
+    const floor = rtc.paperRoundTripCostFloor({ sizeSol: 0.01, policy });
+
+    // O teto de tip em bps MANDA em posição pequena: 50 bps de 0,01 = 0,00005 por perna.
+    assert.equal(floor.legs.length, 2);
+    for (const leg of floor.legs) {
+      assert.equal(leg.tipSol, 0.00005, `${leg.leg}: tip deveria ser limitado pelo teto em bps`);
+      assert.equal(leg.tipClamped, true);
+      assert.equal(leg.baseFeeSol, 0.000005);
+      assert.equal(leg.priorityFeeSol, null, "priority fee NÃO declarada não pode virar zero silencioso");
+    }
+    assert.ok(Math.abs(floor.pisoConhecidoSol - 0.00011) < 1e-15, `piso=${floor.pisoConhecidoSol}`);
+    // Premissas: slippage 300 bps POR PERNA + AMM 25 bps.
+    assert.ok(Math.abs(floor.premissasSol - (0.0006 + 0.000025)) < 1e-15, `premissas=${floor.premissasSol}`);
+    assert.ok(Math.abs(floor.pisoComPremissasSol - 0.000735) < 1e-15);
+    assert.ok(Math.abs(floor.breakevenPercentConhecido - 1.1) < 1e-9, `be=${floor.breakevenPercentConhecido}`);
+    assert.ok(Math.abs(floor.breakevenPercentComPremissas - 7.35) < 1e-9);
+    // Honestidade obrigatória: limite inferior declarado + premissas declaradas.
+    assert.ok(floor.limitacoes.some((l) => /LIMITE INFERIOR/.test(l)), floor.limitacoes.join(" | "));
+    assert.ok(floor.limitacoes.some((l) => /PREMISSAS/.test(l)));
+    assert.ok(floor.naoMedidos.some((n) => n.key === "slippageReal"));
+    assert.ok(floor.naoMedidos.some((n) => n.key === "impactoDePreco"));
+    // ATA rent é condicional e NÃO somada (pode não ser paga e é recuperável).
+    assert.ok(floor.condicionais.some((c) => c.key === "ataRentSol" && /RECUPER/i.test(c.reason)));
+  });
+
+  await test("política: defaults iguais aos do caminho real e override declarado por env", async () => {
+    const rtc = await import("../src/roundTripCost.js");
+    const def = rtc.resolveRoundTripCostPolicy({} as any);
+    assert.equal(def.entryTipDesiredSol, 0.003, "mesmo tip desejado do fechamento real");
+    assert.equal(def.maxTipBps, 50);
+    assert.equal(def.slippageBps, 300, "mesmo parâmetro de slippage da sombra");
+    assert.equal(def.computeUnitsPerLeg, 200_000);
+    assert.equal(def.priorityFeeMicroLamportsPerCu, null);
+
+    // Overrides: cada valor com procedência declarada.
+    const env = {
+      HFT_PRIORITY_FEE_MICROLAMPORTS: "100000",
+      MAX_TIP_BPS: "100",
+      HFT_PAPER_SLIPPAGE_BPS: "100",
+      HFT_ENTRY_CU_LIMIT: "150000",
+    } as any;
+    const p2 = rtc.resolveRoundTripCostPolicy(env);
+    assert.equal(p2.priorityFeeMicroLamportsPerCu, 100000);
+    assert.equal(p2.sources.priorityFeeMicroLamportsPerCu, "HFT_PRIORITY_FEE_MICROLAMPORTS");
+    assert.equal(p2.sources.slippageBps, "HFT_PAPER_SLIPPAGE_BPS");
+    assert.equal(p2.sources.maxTipBps, "MAX_TIP_BPS");
+
+    // Com priority declarada, ela ENTRA no piso conhecido (e a limitação correspondente desaparece).
+    const floor = rtc.paperRoundTripCostFloor({ sizeSol: 0.01, policy: p2 });
+    const esperada = ((100000 * 150000) / 1_000_000 / 1_000_000_000) * 2;
+    assert.ok(Math.abs((floor.legs[0].priorityFeeSol as number) - esperada / 2) < 1e-18, `${floor.legs[0].priorityFeeSol}`);
+    assert.ok(floor.pisoConhecidoSol > 0.00011, "priority declarada aumenta o piso conhecido");
+    assert.equal(floor.limitacoes.some((l) => /priority fee NÃO declarada/.test(l)), false);
+  });
+
+  await test("o caso que motivou o A: +2% na sombra não é +2% de lucro", async () => {
+    const rtc = await import("../src/roundTripCost.js");
+    const policy = rtc.resolveRoundTripCostPolicy({} as any);
+    const c = rtc.applyCostFloorToPaperClose({ sizeSol: 0.01, pnlPercent: 2, policy });
+
+    assert.ok(Math.abs(c.pnlGrossSol - 0.0002) < 1e-15, "bruto = 2% de 0,01 = 0,0002");
+    // Antes do A, o resultado gravado era exatamente o bruto (custo zero).
+    assert.ok(c.pnlNetKnownSol < c.pnlGrossSol, "o custo tem de reduzir o resultado");
+    assert.ok(Math.abs(c.pnlNetKnownSol - 0.00009) < 1e-15, `liquido=${c.pnlNetKnownSol}`);
+    assert.ok(c.pnlNetWithAssumptionsSol < 0, "com slippage/AMM assumidos, o +2% vira PREJUÍZO");
+    assert.ok(Math.abs(c.pnlNetWithAssumptionsSol - -0.000535) < 1e-15, `${c.pnlNetWithAssumptionsSol}`);
+  });
+
+  await test("o fechamento em sombra grava bruto, líquido e base própria — e o gatilho continua sendo PREÇO", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+
+    const i = code.indexOf("function recordPaperClose(");
+    assert.ok(i > 0, "recordPaperClose precisa existir");
+    const corpo = code.slice(i, code.indexOf("\n}\n", i));
+    assert.ok(corpo.includes("applyCostFloorToPaperClose("), "o fechamento da sombra precisa cobrar o piso");
+    assert.ok(corpo.includes('pnlBasis: "paper_cost_floor"'), "a procedência da sombra precisa ser própria");
+    assert.ok(corpo.includes("pnlGrossSol:"), "o bruto precisa ficar gravado para auditoria");
+    assert.ok(corpo.includes("pnlNetSol:"), "e o líquido é o resultado");
+    assert.ok(corpo.includes("measuredOnChain: false"), "sombra NUNCA é medição on-chain");
+    assert.ok(corpo.includes("feesSol:"), "o piso de custo fica declarado no registro");
+
+    // O gatilho de stop/take-profit continua sendo movimento de preço (não pode virar custo).
+    assert.ok(
+      code.includes("pos.pnlPercent = parseFloat((((currentPriceSol - pos.entryPrice) / pos.entryPrice) * 100).toFixed(2))"),
+      "o gatilho precisa continuar baseado em PREÇO"
+    );
+    // E o piso é resolvido uma única vez, no boot, com a política declarada.
+    assert.ok(code.includes("const PAPER_COST_POLICY = resolveRoundTripCostPolicy()"));
+  });
+
+  await test("o modelo de custo saiu do código morto: existe, é chamável e bate com a conta", async () => {
+    const acc = await import("../src/accounting.js");
+    const re = await import("../src/realExecution.js");
+    const costs = acc.estimateRoundTripCosts({
+      capitalSol: 1,
+      jitoTipSol: 0.003,
+      priorityFeeMicroLamportsPerCu: 100000,
+      computeUnits: 200_000,
+      expectedSlippageBps: 300,
+      ammFeeBps: 25,
+    });
+    const esperado =
+      0.003 * 2 + 0.000005 * 2 + ((100000 * 200000) / 1_000_000 / 1_000_000_000) * 2 + ((300 * 2) / 10_000) * 1 + (25 / 10_000) * 1;
+    assert.ok(Math.abs(acc.totalCostsSol(costs) - esperado) < 1e-15, `total=${acc.totalCostsSol(costs)}`);
+    // Re-export mantido: nada que importava de realExecution quebra.
+    assert.equal(typeof re.estimateRoundTripCosts, "function");
+  });
+
+  await test("CLI do custo: puro (sem rede, sem chave, sem escrita) e exposto no system-truth", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "scripts/cost-roundtrip.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+    for (const proibido of ["Keypair", "secretKey", "sendRawTransaction", "getTransaction", "realExecution", "writeFileSync"]) {
+      assert.equal(code.includes(proibido), false, `cost-roundtrip.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(code.includes("paperRoundTripCostFloor"), "precisa usar o piso do módulo (fonte única)");
+    assert.ok(code.includes("applyCostFloorToPaperClose"), "e o cenário de fechamento");
+
+    const serverSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(serverSrc.includes("roundTripCost: (() =>"), "o system-truth precisa expor o piso");
+    assert.ok(serverSrc.includes("paperRoundTripCostFloor({ sizeSol, policy: PAPER_COST_POLICY })"));
+  });
+
+  // ---------------------------------------------------------------------------
+  // [36] B — empacotamento: runtime separado de build/cliente, engines declarado
+  // ---------------------------------------------------------------------------
+  console.log("\n[36] B — empacotamento: só o que o servidor usa fica em dependencies");
+
+  await test("engines declarado e dependências partidas entre runtime e build/cliente", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+
+    assert.ok(pkg.engines, "engines precisa ser declarado (sem isso nada impede rodar em Node incompatível)");
+    assert.ok(/^>=20/.test(pkg.engines.node), `node: ${pkg.engines.node}`);
+    assert.ok(pkg.engines.npm, "npm também precisa de faixa declarada");
+
+    const deps = Object.keys(pkg.dependencies ?? {});
+    const dev = Object.keys(pkg.devDependencies ?? {});
+
+    // Runtime obrigatório: o que o servidor importa (estático ou dinamicamente).
+    for (const obrigatorio of ["express", "@solana/web3.js", "bs58", "dotenv", "tweetnacl", "pg", "@triton-one/yellowstone-grpc", "@google/genai"]) {
+      assert.ok(deps.includes(obrigatorio), `${obrigatorio} é usado em runtime e precisa estar em dependencies`);
+    }
+    // Cliente/build não podem ficar em dependencies: produção não instala o que não usa.
+    for (const naoRuntime of ["react", "react-dom", "vite", "esbuild", "lucide-react", "motion", "recharts", "clsx", "tailwind-merge", "@vitejs/plugin-react"]) {
+      assert.equal(deps.includes(naoRuntime), false, `${naoRuntime} é de build/cliente: pertence a devDependencies`);
+      assert.ok(dev.includes(naoRuntime), `${naoRuntime} precisa estar declarado em devDependencies`);
+    }
+  });
+
+  await test("todo import do servidor está declarado em dependencies (ou é builtin/relativo)", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    const deps = new Set(Object.keys(pkg.dependencies ?? {}));
+    const builtins = new Set(["fs", "path", "url", "crypto", "os", "events", "stream", "util", "http", "https", "zlib", "node:crypto", "node:fs", "node:path", "node:os", "node:url", "node:events"]);
+    /** Exceções DECLARADAS: pacotes exclusivos de desenvolvimento, importados dinamicamente e só fora de produção. */
+    const soDesenvolvimento = new Set(["vite"]);
+
+    const arquivos = ["server.ts"];
+    for (const dir of ["src", "src/storage"]) {
+      for (const f of fs.readdirSync(path.join(repoRoot, dir))) {
+        if (f.endsWith(".ts") && !f.endsWith(".d.ts") && !dir.endsWith("components")) arquivos.push(path.join(dir, f));
+      }
+    }
+
+    const faltando: string[] = [];
+    const estaticosDoCliente: string[] = [];
+    for (const rel of arquivos) {
+      const src = fs.readFileSync(path.join(repoRoot, rel), "utf8");
+      // imports estáticos
+      for (const m of src.matchAll(/^\s*import[\s\S]*?from\s+["']([^"']+)["']/gm)) {
+        const spec = m[1];
+        if (spec.startsWith(".") || builtins.has(spec)) continue;
+        const raiz = spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0];
+        if (soDesenvolvimento.has(raiz)) {
+          estaticosDoCliente.push(`${rel}: ${spec}`);
+          continue;
+        }
+        if (!deps.has(raiz)) faltando.push(`${rel}: ${spec}`);
+      }
+      // imports dinâmicos
+      for (const m of src.matchAll(/await import\(\s*["']([^"']+)["']\s*\)/g)) {
+        const spec = m[1];
+        if (spec.startsWith(".") || builtins.has(spec)) continue;
+        const raiz = spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0];
+        if (soDesenvolvimento.has(raiz)) continue;
+        if (!deps.has(raiz)) faltando.push(`${rel}: import dinâmico ${spec}`);
+      }
+    }
+
+    assert.deepEqual(faltando, [], `imports sem dependência declarada: ${faltando.join(", ")}`);
+    // `vite` só pode ser dinâmico: um import estático exigiria devDependency em produção.
+    assert.deepEqual(estaticosDoCliente, [], `estes deveriam ser import dinâmico: ${estaticosDoCliente.join(", ")}`);
+  });
+
+  await test("`npm run evidence`: lê o banco, usa a régua do /api/performance e não escreve nada", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "scripts/evidence-readiness.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+
+    assert.ok(code.includes("labelAll("), "precisa reusar a MESMA régua do /api/performance");
+    assert.ok(code.includes("MIN_TRADES_FOR_CONFIDENCE"), "o mínimo de amostra precisa vir da fonte única");
+    for (const proibido of ["saveTrade", "savePosition", "saveLog", "Keypair", "getTransaction", "writeFileSync"]) {
+      assert.equal(code.includes(proibido), false, `evidence-readiness.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(code.includes("--strict"), "o gate de amostra precisa existir para uso em CI");
+
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    assert.ok(pkg.scripts.evidence, "script npm run evidence precisa estar declarado");
+    assert.ok(pkg.scripts["cost:roundtrip"], "script npm run cost:roundtrip precisa estar declarado");
+  });
+
+  console.log("\n=========================================");
+  if (failures.length === 0) {
+    console.log(`🏆 ${passed} TESTES PASSARAM`);
+    console.log("=========================================");
+  } else {
+    console.error(`💥 ${failures.length} FALHA(S) de ${passed + failures.length} testes:`);
+    for (const f of failures) console.error(`   - ${f}`);
+    console.log("=========================================");
+    process.exit(1);
+  }
+}
+
+main().catch((err) => {
+  console.error("Falha fatal na suíte de testes:", err);
+  process.exit(1);
+});

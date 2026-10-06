@@ -12,10 +12,28 @@ export interface RpcNode {
   url?: string;
   blockhashCacheAge?: number;
   reconnectionCount?: number;
+  /**
+   * Procedência dos números deste nó. `unavailable` = nenhuma medição de RTT válida
+   * (URL placeholder ou todas as sondagens falharam) — a UI NÃO pode exibir latência,
+   * porque não existe. `partial` = há medição real, mas campos não observáveis via RPC
+   * (ex.: `load`) ficam zerados de propósito.
+   */
+  metricsSource?: 'real' | 'partial' | 'unavailable';
+  shredStream?: 'active' | 'inactive';
 }
 
 export interface SnipedTransaction {
   id: string;
+  /**
+   * B — PROCEDÊNCIA DO RESULTADO, anexada pelo servidor (`annotateTradeWithOutcome`) em
+   * `GET /api/snipes`. Sem estes campos a tabela mostra um PnL sem dizer se ele é medido, de qual
+   * perna veio, ou se está fora da validação estatística.
+   */
+  label?: string;
+  labelBasis?: string;
+  labelReason?: string;
+  excludedFromValidation?: boolean;
+  pnlNetSol?: number;
   token: string;
   mint: string;
   amount: string;

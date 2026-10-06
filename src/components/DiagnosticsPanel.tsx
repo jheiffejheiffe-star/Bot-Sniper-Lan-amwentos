@@ -12,12 +12,24 @@ interface DiagnosticItem {
 export function DiagnosticsPanel() {
   const [activeSubTab, setActiveSubTab] = useState<"infra" | "profiler">("infra");
   const [coLocationActive, setCoLocationActive] = useState(false);
+  /**
+   * AUDITORIA DE INFRAESTRUTURA — CADA ITEM É UMA VERIFICAÇÃO REAL.
+   *
+   * A versão anterior "auditava" uma lista de textos fixos ("drift física do PTPv2 no rack LD4
+   * ... [OK, <1ns]", "canal ShredStream ... [OK, 1.1ms]") e marcava tudo como ATIVO,
+   * independentemente do estado do sistema. Aquilo não era diagnóstico: era animação com
+   * aparência de laudo técnico — e um operador podia acreditar que tinha co-location e clock
+   * sincronizado por nanossegundo.
+   *
+   * Agora cada item corresponde a um dado LIDO do backend agora. Sem resposta, o estado é
+   * OFFLINE/ALERTA com o motivo — nunca "ATIVO" por padrão.
+   */
   const [items, setItems] = useState<DiagnosticItem[]>([
-    { id: "grpc", name: "Yellowstone Geyser gRPC Stream", desc: "Streaming contínuo de blocos Solana < 15ms via pipeline de fibra Equinix NY4", status: 'passed' },
-    { id: "sandbox", name: "Simulador de Honeypot Local (Pre-Flight)", desc: "Fork local atômico simula compra/venda de contrato antes do envio da transação", status: 'passed' },
-    { id: "aes", name: "Criptografia AES-256 (RAM-Only)", desc: "Chave privada criptografada em RAM isolada; descriptografada apenas em microssegundos de assinatura", status: 'passed' },
-    { id: "ptp", name: "Sincronização de Relógio PTP Hardware", desc: "Sincronismo de clock com validador líder Solana < 1µs de jitter", status: 'passed' },
-    { id: "jito", name: "Jito Block Engine Pipeline", desc: "Conexão de feixe privado Jito para blindagem completa contra MEV frontrunning", status: 'passed' }
+    { id: "rpc", name: "RPC conectado e medido", desc: "Verifica se algum nó RPC respondeu e qual a latência p95 MEDIDA", status: 'pending' },
+    { id: "deteccao", name: "Detecção de lançamentos (logsSubscribe WSS)", desc: "Verifica se o WebSocket está aberto e se há eventos chegando", status: 'pending' },
+    { id: "blockhash", name: "Blockhash real disponível para assinar", desc: "Sem blockhash real, NENHUMA transação é assinada — o cache informa o motivo", status: 'pending' },
+    { id: "orcamento", name: "Perfil de cota coerente com o endpoint", desc: "HFT_RPC_PROFILE tem de bater com o endpoint conectado (senão: 429 ou teto baixo demais)", status: 'pending' },
+    { id: "chave", name: "Custódia da chave operacional", desc: "Estado do cofre: chave presente, cifrada em RAM e se está em modo efêmero", status: 'pending' },
   ]);
   const [running, setRunning] = useState(false);
   const [sandboxLog, setSandboxLog] = useState<string>("");
@@ -38,39 +50,116 @@ export function DiagnosticsPanel() {
     return () => clearInterval(interval);
   }, []);
 
+  /**
+   * Executa as verificações contra o backend. `fetchJson` devolve `null` quando a chamada falha —
+   * e aí o item vira OFFLINE com o motivo, em vez de "ATIVO".
+   */
   const runDiagnostics = async () => {
     setRunning(true);
-    setSandboxLog("Iniciando varredura geral de infraestrutura HFT...");
-    // Reset statuses to pending
-    setItems((prev) => prev.map(item => ({ ...item, status: 'pending' })));
+    setItems((prev) => prev.map((item) => ({ ...item, status: 'pending' })));
 
-    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    const fetchJson = async (url: string): Promise<any | null> => {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    };
 
-    const logs = coLocationActive ? [
-      "Testando canal ShredStream co-localizado... [OK, 1.1ms]",
-      "Injetando bytecode em sandbox local Bare Metal VM... [OK, Sem travas, 0.6ms]",
-      "Verificando integridade da chave AES-256 RAM-Only... [OK, Protegida]",
-      "Medindo drift física do PTPv2 no rack LD4... [OK, <1ns]",
-      "Iniciando handshakes Jito Block Engine Fibra Direta... [OK, Canal Elite ativo]"
-    ] : [
-      "Testando latência de ingestão Geyser gRPC... [OK, 8.4ms]",
-      "Injetando bytecode em sandbox local evm-compat... [OK, Sem travas]",
-      "Verificando integridade da chave AES-256 em RAM... [OK, Protegida]",
-      "Medindo drift do PTP contra servidores Helius/Triton... [OK, 0.2µs]",
-      "Iniciando handshakes Jito Block Engine... [OK, Bundle ativo]"
-    ];
+    const setStatus = (id: string, status: DiagnosticItem["status"]) =>
+      setItems((prev) => prev.map((i) => (i.id === id ? { ...i, status } : i)));
 
-    for (let i = 0; i < items.length; i++) {
-      setSandboxLog(logs[i]);
-      await sleep(600);
-      setItems((prev) => {
-        const copy = [...prev];
-        copy[i].status = 'passed';
-        return copy;
-      });
+    const registrar = (id: string, msg: string, status: DiagnosticItem["status"]) => {
+      setSandboxLog(`[${id}] ${msg}`);
+      setStatus(id, status);
+    };
+
+    // 1. RPC: existe nó medido?
+    {
+      setSandboxLog("[rpc] consultando /api/rpc-nodes...");
+      const nodes = await fetchJson("/api/rpc-nodes");
+      const medidos = Array.isArray(nodes?.nodes)
+        ? nodes.nodes.filter((n: any) => n?.metricsSource !== "unavailable" && typeof n?.latency === "number" && n.latency > 0)
+        : [];
+      if (medidos.length > 0) {
+        const melhor = medidos.reduce((a: any, b: any) => (b.latency < a.latency ? b : a));
+        registrar("rpc", `${medidos.length} nó(s) medido(s); menor p95 = ${melhor.latency} ms (${melhor.name})`, "passed");
+      } else {
+        // `metricsSource: unavailable` = sem amostra. Sem amostra não existe latência para exibir.
+        registrar("rpc", "nenhum nó RPC respondeu neste processo — latência NÃO medida", "failed");
+      }
     }
-    setSandboxLog(coLocationActive ? "Varredura concluída! Latência física sub-5ms e canal ShredStream 100% integrados." : "Todas as rotas HFT validadas com sucesso no Tier-1.");
+
+    // 2. Detecção
+    {
+      setSandboxLog("[deteccao] consultando /api/health...");
+      const health = await fetchJson("/api/health");
+      const det = health?.detection;
+      if (!det) {
+        registrar("deteccao", "backend não respondeu em /api/health", "failed");
+      } else if (det.socketOpen && !det.degraded) {
+        registrar("deteccao", `WSS aberto; ${det.eventCount ?? 0} evento(s) de lançamento recebido(s)`, "passed");
+      } else if (det.socketOpen) {
+        registrar("deteccao", `WSS aberto, mas DEGRADADO; ${det.eventCount ?? 0} evento(s) até agora`, "warning");
+      } else {
+        registrar("deteccao", "socket WSS NÃO conectado: nenhum lançamento será detectado", "failed");
+      }
+    }
+
+    // 3. Blockhash
+    {
+      setSandboxLog("[blockhash] consultando /api/rpc-infra/blockhash...");
+      const bh = await fetchJson("/api/rpc-infra/blockhash");
+      if (bh?.usable === true) {
+        registrar("blockhash", `blockhash válido (idade ${bh.ageMs ?? "?"} ms) — pronto para assinar`, "passed");
+      } else {
+        registrar("blockhash", `sem blockhash utilizável: ${bh?.lastError ?? "RPC indisponível"}`, "failed");
+      }
+    }
+
+    // 4. Coerência de perfil de cota
+    {
+      setSandboxLog("[orcamento] consultando coerência de perfil...");
+      const health = await fetchJson("/api/health");
+      const coh = health?.rpcCoherence;
+      if (!coh) {
+        registrar("orcamento", "coerência de perfil não exposta pelo backend", "warning");
+      } else if (coh.coherent) {
+        registrar("orcamento", `perfil "${coh.declaredProfile}" coerente com o endpoint`, "passed");
+      } else {
+        const pior = (coh.issues ?? []).find((i: any) => i.severity === "mismatch");
+        registrar("orcamento", `INCOERENTE: ${pior?.message ?? "perfil não bate com o endpoint"}`, "failed");
+      }
+    }
+
+    // 5. Custódia da chave
+    {
+      setSandboxLog("[chave] consultando /api/operational-security/state...");
+      const seg = await fetchJson("/api/operational-security/state");
+      const cust = seg?.keyCustody;
+      if (!cust) {
+        registrar("chave", "estado de custódia não exposto pelo backend", "warning");
+      } else if (cust.ephemeral === true || /efêmer|ephemeral/i.test(String(cust.mode ?? ""))) {
+        registrar("chave", `chave EFÊMERA (${cust.mode ?? "modo desconhecido"}): não use com capital real`, "warning");
+      } else if (cust.present === false) {
+        registrar("chave", "nenhuma chave operacional presente", "failed");
+      } else {
+        registrar("chave", `carteira operacional presente (${cust.mode ?? "modo não informado"})`, "passed");
+      }
+    }
+
+    setSandboxLog("Auditoria concluída. Estados refletem o que o backend respondeu AGORA — não há valor decorativo.");
     setRunning(false);
+  };
+
+  /** Rótulos neutros: a verificação real roda ao apertar o botão. */
+  const dynamicDescFor = (item: DiagnosticItem): string => {
+    if (item.status === "passed") return item.desc;
+    if (item.status === "failed") return `${item.desc} — verificação FALHOU na última execução.`;
+    if (item.status === "warning") return `${item.desc} — verificação com ALERTA na última execução.`;
+    return item.desc;
   };
 
   return (
@@ -138,22 +227,19 @@ export function DiagnosticsPanel() {
             </button>
           </div>
 
+          {/* Declaração x medição: co-location é fato FÍSICO do host que este painel não mede. */}
+          <div className="mb-3 p-2 bg-slate-950 border border-slate-850 rounded text-[10px] font-mono text-slate-400">
+            Co-location (declarado pelo operador):{" "}
+            <b className={coLocationActive ? "text-cyan-400" : "text-slate-300"}>
+              {coLocationActive ? "ATIVO" : "inativo"}
+            </b>{" "}
+            — este painel NÃO mede a posição física do servidor; a declaração serve para o
+            operador registrar o que contratou, não como evidência de latência.
+          </div>
+
           <div className="space-y-3">
             {items.map((item) => {
-              let dynamicDesc = item.desc;
-              if (item.id === "grpc") {
-                dynamicDesc = coLocationActive 
-                  ? "ShredStream Co-located Jito Feed direto dos validadores líder < 1.2ms (Equinix LD4)" 
-                  : "Streaming contínuo de blocos Solana < 15ms via pipeline de fibra Equinix NY4";
-              } else if (item.id === "ptp") {
-                dynamicDesc = coLocationActive
-                  ? "Sincronismo físico PTPv2 sub-nanossegundo no rack Equinix LD4 direto na placa de rede"
-                  : "Sincronização de Relógio PTP Hardware contra servidores Helius/Triton < 1µs de jitter";
-              } else if (item.id === "jito") {
-                dynamicDesc = coLocationActive
-                  ? "Fibra Dedicada Ponto-a-Ponto direta com o Jito Block Engine (Latência zero de rede externa)"
-                  : "Conexão de feixe privado Jito para blindagem completa contra MEV frontrunning";
-              }
+              const dynamicDesc = dynamicDescFor(item);
 
               return (
                 <div
@@ -162,8 +248,8 @@ export function DiagnosticsPanel() {
                 >
                   <div className="min-w-0 flex-1">
                     <span className="font-display font-bold text-xs text-slate-200 flex items-center gap-1.5">
-                      {item.id === "aes" && <Key className="w-3.5 h-3.5 text-cyan-400" />}
-                      {item.id === "sandbox" && <ShieldCheck className="w-3.5 h-3.5 text-purple-400" />}
+                      {item.id === "chave" && <Key className="w-3.5 h-3.5 text-cyan-400" />}
+                      {item.id === "orcamento" && <ShieldCheck className="w-3.5 h-3.5 text-purple-400" />}
                       {item.name}
                     </span>
                     <span className="block text-[10px] text-slate-400 font-mono mt-1 leading-relaxed">{dynamicDesc}</span>

@@ -1,0 +1,28 @@
+# Dependências
+node_modules/
+
+# Segredos — NUNCA commitar
+.env
+.env.local
+.env.*.local
+
+# Build
+dist/
+server.js
+*.tsbuildinfo
+
+# Banco operacional e logs (dados de runtime; contêm histórico de operações)
+# ATENÇÃO: o banco atual do repositório contém histórico FABRICADO pela versão
+# anterior do código (ver AUDIT.md). Recomenda-se quarentená-lo.
+hft_operational_db.json
+hft_operational_db.json.bak
+# Inventários de quarentena: dado operacional (não pertence ao repositório)
+hft_operational_db.quarantine.*.json
+logs/
+*.log
+
+# Sistema
+.DS_Store
+
+# Dados de execução do replay (séries de preço/avaliações reais; crescem indefinidamente)
+data/

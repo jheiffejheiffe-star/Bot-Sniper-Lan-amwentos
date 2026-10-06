@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import type { ExecutionIntentRecord } from "./executionIntent.js";
 
 const isServer = typeof window === "undefined";
 
@@ -9,7 +10,12 @@ export interface DBTrade {
   mint: string;
   amount: string;
   outAmount: string;
-  status: "success" | "failed" | "blacklisted";
+  /**
+   * "paper" e "shadow" NUNCA podem ser contados como execução real em relatório de PnL.
+   * Sem esta distinção, somar trades de sombra com trades reais produz um número que não
+   * corresponde a dinheiro nenhum.
+   */
+  status: "success" | "failed" | "blacklisted" | "paper" | "shadow";
   block: number;
   tipSol: number;
   route: string;
@@ -17,6 +23,92 @@ export interface DBTrade {
   latencyMs: number;
   isAntiRugSaved?: boolean;
   savedAmountSol?: string;
+  /**
+   * "live" = execução real on-chain; "paper" = sombra/simulação (NUNCA é PnL real).
+   * Sem este campo não há como distinguir resultado real de simulado no relatório —
+   * e confundir os dois é o erro que mais destrói capital em bots.
+   */
+  mode?: "live" | "paper";
+  /** Assinatura on-chain real. `null` em paper trades (nunca preenchida com texto). */
+  signature?: string | null;
+  /**
+   * S14 — a perna declarada pelo GRAVADOR no momento da execução. `classifyAttemptKind` já deduzia
+   * pelo texto da rota; o campo explícito elimina a dedução no que for gravado a partir de agora
+   * (e é o que permite, depois, saber qual transação remedir).
+   */
+  leg?: "entry" | "exit";
+  /** PnL líquido medido por delta de saldo (SOL). Ausente quando não medido. */
+  /**
+   * PROCEDÊNCIA DO PnL (S11). `pnlNetSol` sozinho não diz se o número é o lucro do CICLO (entrada +
+   * saída) ou apenas a receita da venda — e a diferença é o tamanho da posição em toda operação.
+   * Este campo viaja com o resultado para que o rótulo (S9) possa exigir as duas pernas.
+   */
+  pnlBasis?:
+    | "round_trip_legs"
+    | "round_trip_legs_window_conflict"
+    | "round_trip_legs_reconciled"
+    | "exit_leg_only"
+    /** A — sombra: resultado LÍQUIDO com o piso de custo do ciclo descontado (`src/roundTripCost.ts`). */
+    | "paper_cost_floor"
+    | "incomplete";
+  /**
+   * A — resultado BRUTO do movimento de preço, antes do custo. Guardado junto do líquido para que a
+   * diferença (quanto do "ganho" era custo) seja auditável em vez de desaparecer na aritmética.
+   */
+  pnlGrossSol?: number;
+  /**
+   * S14 — RECONCILIAÇÃO. Assinatura da perna de ENTRADA remedida da cadeia, quando o ciclo foi
+   * fechado depois (histórico pré-S11). Sem este campo, "de onde veio a perna" ficaria invisível.
+   */
+  entryLegSignature?: string | null;
+  /** Quando a reconciliação foi aplicada (ISO). Presença ⇒ o ciclo foi fechado por releitura. */
+  reconciledAt?: string;
+  /** O que exatamente foi feito e por quê (inclui a divergência conferida contra o registro). */
+  reconciliationNote?: string;
+  /**
+   * Número ANTERIOR preservado quando a reconciliação substituiu um valor: em registros pré-S11
+   * este era o ΔSOL da VENDA gravado como "PnL" — receita, não lucro. Nunca apagado: é a prova
+   * do defeito corrigido (Adendo 19) e não pode voltar a ser lido como resultado.
+   */
+  supersededPnlNetSol?: number;
+  /**
+   * RECEITA DA VENDA em SOL (só a perna de saída medida). Não é PnL e nunca entra na validação:
+   * existe para diagnóstico e para fechar o laço quando a perna de entrada for recuperada depois.
+   */
+  saleProceedsSol?: number;
+  /** Divergência entre a janela de saldos e a soma das pernas, em SOL (auditoria). */
+  windowConflictSol?: number;
+  /** Ver a observação em `pnlBasis`: procedência viaja junto com o número. */
+  pnlNetSol?: number;
+  /** Fee de rede paga (SOL). */
+  feesSol?: number;
+  /** true somente quando o resultado foi derivado de saldos on-chain confirmados. */
+  measuredOnChain?: boolean;
+}
+
+/**
+ * Economia de UMA transação (perna do ciclo), medida nos saldos da própria transação.
+ *
+ * Fica gravada na POSIÇÃO (campo `entryLeg`) no momento da confirmação da compra: sem isso, a saída
+ * não teria como saber quanto custou a entrada e todo "PnL" voltaria a ser a receita da venda.
+ * Campo opcional porque posições abertas antes desta versão não têm a perna gravada — nesse caso o
+ * ciclo é declarado NÃO MEDIDO em vez de estimado.
+ */
+export interface LegRecord {
+  signature: string | null;
+  measured: boolean;
+  /** Δ SOL da carteira nesta transação, em lamports. */
+  solDeltaLamports: number | null;
+  /** Saldo da carteira antes/depois desta transação (lamports) — permitem a conferência de janela. */
+  preLamports: number | null;
+  postLamports: number | null;
+  feeLamports: number | null;
+  tokenDeltaRaw: string | null;
+  slot: number | null;
+  onChainError: string | null;
+  error: string | null;
+  /** Quando a medição foi feita (ISO). */
+  measuredAt: string;
 }
 
 export interface DBPosition {
@@ -37,6 +129,77 @@ export interface DBPosition {
   timeClosed?: string;
   slippageBps?: number;
   maxSlippageBps?: number;
+  /** "paper" = posição sombra; o gerenciador NÃO tenta liquidar on-chain. */
+  mode?: "live" | "paper";
+  /** Origem do último preço usado (para auditar decisões de SL/TP). */
+  priceSource?: string;
+  /** Contador de tentativas de saída que falharam (posição continua aberta). */
+  exitAttempts?: number;
+  lastExitError?: string;
+  lastExitAttemptAt?: string;
+  lastPriceAlertAt?: number;
+  priceTelemetry?: { status: string; lastAttemptAt: string };
+  /**
+   * Última discordância entre FONTES INDEPENDENTES de preço para este token
+   * (`src/priceQuality.ts`). Gravado na posição porque log em memória some e o pós-mortem
+   * precisa responder "o stop que vendeu por engano foi calculado sobre preço confiável?".
+   */
+  priceDivergence?: {
+    observedAt: string;
+    /** Diferença relativa (0,05 = 5%) e o mesmo em pontos-base. */
+    pct: number;
+    bps: number;
+    severity: string;
+    reference: { source: string; priceSol: number; ageMs: number };
+    candidate: { source: string; priceSol: number };
+  };
+  /**
+   * Como o preço de ENTRADA foi confirmado (`src/entryQuality.ts`): quantas fontes independentes
+   * responderam, quanto concordavam e se a entrada foi aceita com ou sem verificação. Fica na
+   * posição porque é o que permite ao replay separar o resultado da ESTRATÉGIA do resultado de
+   * uma entrada com preço duvidoso — e porque log em memória não sobrevive ao restart.
+   */
+  entryPriceVerification?: {
+    status: string;
+    sources: string[];
+    divergenceBps: number | null;
+    severity: string | null;
+    accepted: boolean;
+    reason: string;
+    checkedAt: string;
+  };
+  /** Pico de liquidez observado pelo bot (base do alerta de queda). */
+  liquidityUsdPeak?: number;
+  /** Última liquidez observada (USD) — pode ser `null` quando a fonte não informa. */
+  liquidityUsdLast?: number | null;
+  /**
+   * Alerta de queda de liquidez (remoção de LP). É ALERTA: nenhuma venda é disparada por ele
+   * nas versões atuais — ver o comentário no laço de gestão (`server.ts`).
+   */
+  liquidityAlert?: {
+    observedAt: string;
+    peakUsd: number;
+    currentUsd: number;
+    dropPct: number;
+    severity: string;
+  };
+  /**
+   * Resultado da última reconciliação posição × cadeia (`src/positionDesync.ts`).
+   * Gravado para que a divergência seja AUDITÁVEL depois do ciclo que a detectou —
+   * log em memória some, o banco fica.
+   */
+  desyncState?: "in_sync" | "phantom_position" | "untracked_exposure" | "closed_but_holding" | "too_young" | "unknown";
+  desyncReason?: string;
+  desyncCheckedAt?: string;
+  /** Quantas confirmações independentes de fantasma já foram obtidas (histerese). */
+  phantomConfirmations?: number;
+  /** Intenção de execução que originou/gerencia esta posição (rastreabilidade). */
+  executionIntentId?: string | null;
+  /**
+   * PERNA DE ENTRADA medida on-chain (S11). É o que permite calcular o PnL do CICLO na saída.
+   * Ausente em posições abertas antes desta versão: nelas o ciclo é declarado não medido.
+   */
+  entryLeg?: LegRecord | null;
 }
 
 export interface DBOperationalState {
@@ -59,7 +222,17 @@ export interface DBLog {
   id: string;
   timestamp: string;
   level: "INFO" | "WARN" | "ERROR" | "CRITICAL" | "SUCCESS";
-  component: "RPC_INFRA" | "RISK_ENGINE" | "JITO_BUNDLE" | "SECURITY_SHIELD" | "MEMPOOL_SCANNER" | "SYSTEM";
+  component:
+    | "RPC_INFRA"
+    | "RISK_ENGINE"
+    | "JITO_BUNDLE"
+    | "SECURITY_SHIELD"
+    | "MEMPOOL_SCANNER"
+    /** Entradas em shadow: cotação + transação simulada (nunca assinada/enviada). */
+    | "SHADOW_ENTRY"
+    /** Entrada REAL (S6): assinatura, envio e confirmação. Não confundir com shadow/paper. */
+    | "REAL_ENTRY"
+    | "SYSTEM";
   message: string;
   correlationId?: string;
   metadata?: any;
@@ -69,12 +242,18 @@ export interface DBLog {
 class TransactionalStore {
   private dbPath: string = "";
   private logCounter: number = 0;
+  /** Contadores REAIS de persistência (substituem as constantes de "saúde"). */
+  private commitsAttempted: number = 0;
+  private commitFailures: number = 0;
+  private lastCommitDurationsMs: number[] = [];
   private data: {
     trades: DBTrade[];
     positions: DBPosition[];
     state: DBOperationalState;
     settings: DBSettings;
     logs: DBLog[];
+    /** Intenções de execução (idempotência). NUNCA contêm bytes assinados. */
+    intents: ExecutionIntentRecord[];
     schemaVersion: number;
     transactionCount: number;
   };
@@ -99,7 +278,8 @@ class TransactionalStore {
         pm2State: "online"
       },
       logs: [],
-      schemaVersion: 4,
+      intents: [],
+      schemaVersion: 5,
       transactionCount: 0
     };
 
@@ -151,7 +331,7 @@ class TransactionalStore {
         console.warn("[Database Engine] Primary database file missing or corrupted. Attempting recovery from backup...");
         parsed = tryParseFile(backupPath);
         if (parsed) {
-          console.log("[Database Engine] SUCCESSFUL AUTO-RECOVERY: Restored database from last valid backup.");
+          console.error("[Database Engine] SUCCESSFUL AUTO-RECOVERY: Restored database from last valid backup.");
           try {
             // Restore primary from backup safely
             const jsonStr = JSON.stringify(parsed, null, 2);
@@ -166,7 +346,7 @@ class TransactionalStore {
       }
 
       if (!parsed) {
-        console.log("[Database Engine] No valid database or backup found. Creating fresh atomic operational state on disk.");
+        console.error("[Database Engine] No valid database or backup found. Creating fresh atomic operational state on disk.");
         this.commit(this.data);
         return;
       }
@@ -193,8 +373,19 @@ class TransactionalStore {
         console.log("[Database Migration] Completed upgrade to Schema v4. Structured Logging tables initialized.");
       }
       
+      if (parsed.schemaVersion < 5) {
+        console.log(`[Database Migration] Outdated schema version ${parsed.schemaVersion} detected. Upgrading to Schema v5...`);
+        // Intenções de execução: array vazio é o estado correto de um banco que nunca
+        // registrou intenção. Nada é inferido/retro-preenchido — inventar intenção para
+        // histórico antigo criaria rastreabilidade falsa.
+        parsed.intents = Array.isArray(parsed.intents) ? parsed.intents : [];
+        parsed.schemaVersion = 5;
+        this.commit(parsed);
+        console.log("[Database Migration] Completed upgrade to Schema v5. Execution intents table initialized.");
+      }
+
       this.data = parsed;
-      console.log(`[Database Engine] Loaded state from disk successfully. Version: v${this.data.schemaVersion}. Transaction commits: ${this.data.transactionCount}`);
+      console.error(`[Database Engine] Loaded state from disk successfully. Version: v${this.data.schemaVersion}. Transaction commits: ${this.data.transactionCount}`);
     } catch (err: any) {
       console.error("[Database Engine] Load / Migration failed. Running fallback memory mode.", err.message);
     }
@@ -202,6 +393,9 @@ class TransactionalStore {
 
   private commit(newData: typeof this.data) {
     if (!isServer) return;
+
+    const startedAt = Date.now();
+    this.commitsAttempted++;
 
     try {
       newData.transactionCount++;
@@ -238,8 +432,36 @@ class TransactionalStore {
 
       // Atomic rename
       fs.renameSync(tmpPath, this.dbPath);
+
+      this.lastCommitDurationsMs.push(Date.now() - startedAt);
+      if (this.lastCommitDurationsMs.length > 50) this.lastCommitDurationsMs.shift();
     } catch (err: any) {
+      this.commitFailures++;
       console.error("[Database Commit Error] Disk write aborted, rolled back to state cache.", err.message);
+    }
+  }
+
+  /** Sink de espelho (S10). Opcional: sem ele, o comportamento é exatamente o anterior. */
+  private writeThrough: WriteThroughSink | null = null;
+
+  public setWriteThrough(sink: WriteThroughSink): void {
+    this.writeThrough = sink;
+  }
+
+  public hasWriteThrough(): boolean {
+    return this.writeThrough !== null;
+  }
+
+  /**
+   * Chama o sink sem deixar exceção subir. Um espelho com defeito não pode impedir a gravação local
+   * — a operação não pode depender do banco de terceiro para registrar o que fez.
+   */
+  private mirror(fn: (sink: WriteThroughSink) => void): void {
+    if (!this.writeThrough) return;
+    try {
+      fn(this.writeThrough);
+    } catch (err: any) {
+      console.error("[Database Engine] Falha ao espelhar registro (a gravação local foi mantida):", err?.message ?? err);
     }
   }
 
@@ -259,6 +481,7 @@ class TransactionalStore {
       }
     }
     this.commit(this.data);
+    this.mirror((sink) => sink.mirrorTrade?.(trade));
   }
 
   // Positions Repository
@@ -274,6 +497,7 @@ class TransactionalStore {
       this.data.positions.unshift(pos);
     }
     this.commit(this.data);
+    this.mirror((sink) => sink.mirrorPosition?.(pos));
   }
 
   public deletePosition(id: string): void {
@@ -308,6 +532,44 @@ class TransactionalStore {
     this.commit(this.data);
   }
 
+  // Execution Intents Repository (idempotência de ação econômica)
+  public getIntents(): ExecutionIntentRecord[] {
+    if (!this.data.intents) this.data.intents = [];
+    return this.data.intents;
+  }
+
+  /**
+   * Grava/atualiza uma intenção. Persistir ANTES de assinar é o que dá sentido ao
+   * registro: uma intenção que só existe depois do envio não serve para impedir o
+   * segundo envio.
+   */
+  public saveIntent(intent: ExecutionIntentRecord): void {
+    if (!this.data.intents) this.data.intents = [];
+    const idx = this.data.intents.findIndex((i) => i.id === intent.id);
+    if (idx !== -1) {
+      this.data.intents[idx] = intent;
+    } else {
+      this.data.intents.unshift(intent);
+      // Retenção: as 200 mais recentes. Histórico de intenções é auditoria, não estado
+      // ativo — mas as NÃO TERMINAIS nunca são descartadas (ver compactIntents).
+      if (this.data.intents.length > 200) {
+        const terminal = this.data.intents.filter((i) => i.state === "confirmed" || i.state === "failed" || i.state === "expired");
+        const nonTerminal = this.data.intents.filter((i) => i.state !== "confirmed" && i.state !== "failed" && i.state !== "expired");
+        this.data.intents = [...nonTerminal, ...terminal.slice(0, Math.max(0, 200 - nonTerminal.length))];
+      }
+    }
+    this.commit(this.data);
+    // Intenção espelhada é o que permite a auditoria pós-restart cruzar estado local × banco.
+    this.mirror((sink) => sink.mirrorIntent?.(intent));
+  }
+
+  /** Intenções não terminais (as que impedem uma segunda ação na mesma posição/lado). */
+  public getActiveIntents(): ExecutionIntentRecord[] {
+    return this.getIntents().filter(
+      (i) => i.state !== "confirmed" && i.state !== "failed" && i.state !== "expired"
+    );
+  }
+
   // Structured Logging Repository
   public getLogs(): DBLog[] {
     return this.data.logs || [];
@@ -326,13 +588,22 @@ class TransactionalStore {
       this.data.logs.pop();
     }
     this.commit(this.data);
+    this.mirror((sink) => sink.mirrorLog?.(newLog));
     return newLog;
   }
 
-  public rotateLogs(retentionDays: number = 7, maxSizeKb: number = 2000): { rotatedCount: number; bytesSaved: number; currentSizeKb: number } {
+  public rotateLogs(retentionDays: number = 7, maxSizeKb: number = 2000): {
+    rotatedCount: number;
+    bytesSaved: number;
+    currentSizeKb: number;
+    bytesAreEstimated: boolean;
+    appliedPolicy: string;
+  } {
     if (!this.data.logs) this.data.logs = [];
     const initialCount = this.data.logs.length;
-    // We rotate by trimming the array to the most recent 15 elements to simulate purging
+    // AVISO: isto é rotação por CONTAGEM, não por retenção de tempo/tamanho.
+    // Os parâmetros retentionDays/maxSizeKb são aceitos mas NÃO aplicados — reportamos isso
+    // no retorno (appliedPolicy) para que a UI não afirme uma política que não existe.
     const keptCount = Math.min(initialCount, 15);
     const removedCount = initialCount - keptCount;
     this.data.logs = this.data.logs.slice(0, keptCount);
@@ -350,8 +621,12 @@ class TransactionalStore {
     
     return {
       rotatedCount: removedCount,
-      bytesSaved: removedCount * 180, // Estimated bytes
-      currentSizeKb: Math.round((this.data.logs.length * 180) / 1024 * 100) / 100
+      // bytesSaved/currentSizeKb são ESTIMATIVAS (180 bytes/log). Marcado explicitamente
+      // para não serem lidos como medição precisa.
+      bytesSaved: removedCount * 180,
+      currentSizeKb: Math.round((this.data.logs.length * 180) / 1024 * 100) / 100,
+      bytesAreEstimated: true,
+      appliedPolicy: `contagem (máx. 15 entradas); retentionDays=${retentionDays} e maxSizeKb=${maxSizeKb} NÃO aplicados`,
     };
   }
 
@@ -363,12 +638,45 @@ class TransactionalStore {
       tradesCount: this.data.trades.length,
       positionsCount: this.data.positions.length,
       logsCount: (this.data.logs || []).length,
+      intentsCount: (this.data.intents || []).length,
+      activeIntentsCount: this.getActiveIntents().length,
       path: this.dbPath,
-      health: "EXCELLENT",
-      writeLatencyMs: 0.12 // sub-millisecond local write cache
+      // MÉTRICAS REAIS (auditoria): "EXCELLENT" e 0.12ms eram constantes hardcoded exibidas
+      // como se fossem medição. health agora deriva da razão de commits com falha; a latência
+      // de escrita é a média das últimas operações observadas.
+      health: this.commitsAttempted === 0
+        ? "UNKNOWN"
+        : this.commitFailures / this.commitsAttempted > 0.05
+          ? "DEGRADED"
+          : this.commitFailures > 0
+            ? "WARN"
+            : "OK",
+      commitsAttempted: this.commitsAttempted,
+      commitFailures: this.commitFailures,
+      writeLatencyMs: this.lastCommitDurationsMs.length
+        ? Math.round((this.lastCommitDurationsMs.reduce((a, b) => a + b, 0) / this.lastCommitDurationsMs.length) * 100) / 100
+        : null,
+      logsRetentionNote:
+        "Rotação por contagem (não por dias/KB): mantém as 15 entradas mais recentes. " +
+        "Os parâmetros retentionDays/maxSizeKb são aceitos por compatibilidade e NÃO são aplicados.",
     };
   }
 }
 
 // Instantiate Singleton Database client
+/**
+ * ESPELHO DE ESCRITA (S10). O JSON continua sendo a fonte operacional (decisões não mudam), e o
+ * Postgres recebe os MESMOS registros por este sink — o adaptador decide o que fazer e nunca lança.
+ *
+ * Por que um sink em vez de trocar a implementação: trocar o armazenamento operacional de uma vez
+ * colocaria em risco o caminho de decisão que já está funcionando. Com o sink, o banco é ADITIVO:
+ * se ele não responde, o bot continua operando com o JSON e o health declara a degradação.
+ */
+export interface WriteThroughSink {
+  mirrorTrade?(trade: DBTrade): void;
+  mirrorPosition?(position: DBPosition): void;
+  mirrorIntent?(intent: ExecutionIntentRecord): void;
+  mirrorLog?(log: DBLog): void;
+}
+
 export const dbStore = new TransactionalStore();

@@ -13,7 +13,7 @@ interface LogItem {
   id: string;
   timestamp: string;
   level: "INFO" | "WARN" | "ERROR" | "CRITICAL" | "SUCCESS";
-  component: "RPC_INFRA" | "RISK_ENGINE" | "JITO_BUNDLE" | "SECURITY_SHIELD" | "MEMPOOL_SCANNER" | "SYSTEM";
+  component: "RPC_INFRA" | "RISK_ENGINE" | "JITO_BUNDLE" | "SECURITY_SHIELD" | "MEMPOOL_SCANNER" | "SHADOW_ENTRY" | "SYSTEM";
   message: string;
   correlationId?: string;
   metadata?: any;
@@ -241,6 +241,7 @@ export function ObservabilityCenter() {
       case "JITO_BUNDLE": return "text-[10px] font-mono text-emerald-400 bg-emerald-950/30 border border-emerald-900/50 px-1.5 py-0.5 rounded";
       case "SECURITY_SHIELD": return "text-[10px] font-mono text-blue-400 bg-blue-950/30 border border-blue-900/50 px-1.5 py-0.5 rounded";
       case "MEMPOOL_SCANNER": return "text-[10px] font-mono text-cyan-400 bg-cyan-950/30 border border-cyan-900/50 px-1.5 py-0.5 rounded";
+      case "SHADOW_ENTRY": return "text-[10px] font-mono text-violet-300 bg-violet-950/30 border border-violet-900/50 px-1.5 py-0.5 rounded";
       default: return "text-[10px] font-mono text-slate-400 bg-slate-950 border border-slate-850 px-1.5 py-0.5 rounded";
     }
   };
@@ -530,6 +531,7 @@ export function ObservabilityCenter() {
               <option value="JITO_BUNDLE">JITO BUNDLE</option>
               <option value="SECURITY_SHIELD">SECURITY SHIELD</option>
               <option value="MEMPOOL_SCANNER">MEMPOOL SCANNER</option>
+              <option value="SHADOW_ENTRY">SHADOW ENTRY</option>
               <option value="SYSTEM">SYSTEM</option>
             </select>
           </div>
