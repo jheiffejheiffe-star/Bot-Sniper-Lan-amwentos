@@ -284,6 +284,33 @@ dono, expiração) e a garantia vigente. Um claim com `expired: true` é normal 
 próximo processo o retoma automaticamente. **Nunca** libere claim de outro dono — a liberação é por
 `claim_id`, e é isso que impede dois processos no mesmo mint.
 
+### 5.4 Saída fail-closed e teto de perda (S12)
+
+O caminho que decide o prejuízo é a SAÍDA. Três invariantes valem nos **dois** caminhos de venda
+(fechamento manual e saída autônoma):
+
+1. **Quantidade vem da cadeia.** Leitura do saldo com retry + backoff; se não puder ser lida
+   (`EXIT_ABORTED_BALANCE_UNREADABLE`) ou for zero (`EXIT_ABORTED_ZERO_ONCHAIN_BALANCE`), a saída
+   ABORTA: nenhuma ordem é construída, nada é estimado e a posição continua aberta. Antes disso, um
+   saldo zero/ilegível virava `sizeSol / entryPrice` — e a ordem ia para a rede com essa quantidade.
+2. **Fechamento só com prova de resíduo.** A posição só sai do banco quando a carteira comprova que
+   não tem mais o token (tolerância declarada em `HFT_RESIDUAL_DUST_RAW`, para Token-2022 com
+   transfer fee). Resíduo acima da tolerância ⇒ continua aberta e o resto é vendido no próximo
+   ciclo; leitura falhou ⇒ continua aberta (não se apaga o que não se viu).
+3. **Posição não-provada não assina.** `mode: live` **e** evidência on-chain de entrada são
+   pré-requisito para gerir como real. Posição herdada sem `mode` é `unverified`: não assina saída,
+   não é apagada e continua contando para EXPOSIÇÃO (lado conservador).
+
+**Freios por resultado (ENFORÇADOS desde o S12):** `MAX_DAILY_LOSS_SOL` soma **só** PnL de ciclo
+medido (as duas pernas) com data legível — ganho não abate perda e medido sem data fica declarado
+fora da soma; ao atingir o teto, o kill switch é acionado (entradas param, saídas continuam).
+`MAX_OPEN_POSITIONS` limita posições reais abertas. **Os dois estavam no `.env.example` e nunca
+eram lidos pelo código** — config morta.
+
+**O que isto NÃO é:** nenhuma configuração garante lucro. `GET /api/system-truth` → `exitSafety`
+traz `limits` (declarado × não declarado, um por um), `dailyLoss` (com o motivo e a lacuna
+declarada) e `notGuaranteed`.
+
 ## 6. Problemas comuns e o que eles NÃO significam
 
 | Sintoma | Provável causa | NÃO conclua |
@@ -347,3 +374,8 @@ próximo processo o retoma automaticamente. **Nunca** libere claim de outro dono
    aritmética provada por teste, mas **não exercitada com dinheiro real**: exige entrada ligada.
    Posições abertas antes desta versão não têm a perna de entrada e ficam declaradas como não
    medidas.
+8. **Garantia de lucro** — NÃO existe e não pode existir por configuração: cada operação paga base
+   fee, priority fee, tip, spread e slippage, e o ativo pode cair depois da compra. O que o S12
+   garante é o LIMITE da perda (teto diário medido + kill switch + teto de posições) e a AUSÊNCIA
+   de resultado fabricado. Painel que mostre "acerto garantido" está listado como RNG em
+   `/api/system-truth`. Nada foi validado estatisticamente ainda (item 6).

@@ -279,3 +279,12 @@ guarda decisões de operação, então trate a credencial como chave de operaç�
 - não substitui backup do arquivo JSON;
 - não é guarda NA CADEIA: uma entrada feita por outra ferramenta, fora do bot, continua invisível;
 - não autoriza entrada real. `HFT_REAL_ENTRY_ENABLED=0` segue sendo o default.
+
+### S12 — saída fail-closed e teto de perda (custo zero)
+
+O S12 não adiciona nenhuma dependência, serviço ou chamada paga: ele **usa a leitura de saldo que a
+saída já fazia** (`getParsedTokenAccountsByOwner`, já coberta pela cota de leitura do plano
+gratuito) com retry limitado e um teto de perda diária. A verificação de resíduo acrescenta UMA
+leitura por fechamento (com retry só em caso de falha) — no pior caso, 3 leituras. Não há provedor
+novo, não há tier pago, e o teto de perda não depende de nenhum dado externo: é aritmética sobre as
+pernas já medidas.

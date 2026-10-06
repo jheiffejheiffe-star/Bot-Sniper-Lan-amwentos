@@ -2199,3 +2199,56 @@ diretamente — não grava `measuredOnChain` e não entra em `/api/performance`;
 S6 não tem `pnlNetSol` (vira `entry_leg`); `realEntry.fillMeasured` mede o FILL da entrada (tokens
 recebidos), que é outra afirmação, legítima e documentada. Nenhum outro ponto promove número parcial
 a medido. Evidência: `lint` 0 · **274/274** · `build` ok.
+
+
+---
+
+## Adendo 20 — S12: saída fail-closed e teto de perda (o que é garantível)
+
+**Origem:** pedido de "configurar para só ganhar, nunca perder". Não existe configuração que faça
+isso — e prometer o contrário seria o defeito mais grave de todos. O que existe é limitar a perda e
+proibir resultado fabricado. Este adendo registra a auditoria do *checklist* de terceiros que
+apontou a classe de defeito correta (mesmo vindo de outro código), os dois pontos que estavam
+**abertos aqui** e a correção.
+
+### 1. Defeitos encontrados NESTE código (herança do scaffold `b6df555`)
+
+| # | Defeito | Onde (antes) | Consequência real |
+|---|---|---|---|
+| 1 | **Quantidade de venda ESTIMADA** quando a leitura de saldo falhava ou voltava zero: `qtyFloat = sizeSol / entryPrice` + `Math.floor(...)` e SEGUIA para cotar/assinar | `server.ts` (fechamento manual e saída autônoma) — idêntico em `b6df555` | ordem montada sobre número inventado; se o saldo real fosse 0, a "venda" era de um ativo inexistente |
+| 2 | **Posição fechada/apagada sem prova de resíduo** | `server.ts` (`pos.status="closed"` + `deletePosition`) | resíduo de token virava exposição sem stop, sem alvo e sem registro (invisível ao radar) |
+| 3 | **Posição sem `mode` gerenciada como REAL** (`p.mode !== "paper"`) | `server.ts` (loop de gestão, `collectRealEntryState`) | herança de scaffold entrava no caminho que assina e consumia o canário |
+| 4 | **`MAX_DAILY_LOSS_SOL` e `MAX_OPEN_POSITIONS` eram config MORTA** | `.env.example` × código (0 ocorrências) | o operador acreditava estar limitado sem estar — pior do que não ter o campo |
+
+### 2. Correção (S12, `src/exitSafety.ts` + `server.ts`)
+
+1. `readMintBalanceFailClosed`: retry com backoff; **zero contas é FATO**, falha total é "não
+   consegui ver" (`ok:false`) — nunca convertido em zero.
+2. `decideExitFromBalance`: sem prova ⇒ `EXIT_ABORTED_BALANCE_UNREADABLE` / `..._ZERO_ONCHAIN_BALANCE`
+   e a saída ABORTA antes de assinar, com a intenção encerrada como `failed` (sem travar a próxima).
+   O aborto é registrado como estado a reconciliar, **não** como falha de execução: no scaffold,
+   3 abortos derrubavam o circuit breaker e o kill switch parava o bot inteiro.
+3. `decideCloseFromResidual`: `closed` + `deletePosition` só com resíduo ≤ tolerância declarada.
+4. `classifyManagedPosition`: `paper` | `live` (com evidência) | `unverified`; `unverified` não
+   assina, não é apagada e **continua contando para exposição**.
+5. Livro de perda diária: soma **apenas** `round_trip_legs*` com data legível (`closedAtIso` gravado
+   agora); ganho não abate perda; medido sem data é declarado e **fica fora** da soma; ao atingir
+   `MAX_DAILY_LOSS_SOL` ⇒ kill switch + entradas bloqueadas, saídas liberadas.
+6. `MAX_OPEN_POSITIONS` passa a ser lido no caminho de entrada real.
+7. `/api/system-truth` → `exitSafety`: `limits` (declarado × `null`), `dailyLoss`, classificação e
+   `notGuaranteed`.
+
+### 3. Verificação
+
+`npm run lint` 0 · `npm run test` **284/284** (grupo `[31]`, 10 testes novos) · `npm run build` ok.
+O teste de fonte falha se a estimativa voltar (`rawAmount = Math.floor(qtyFloat`, `Using local
+calculation`) ou se um dos quatro pontos de verificação desaparecer.
+
+### 4. Limitações declaradas
+
+- **Nada aqui foi exercitado com dinheiro real.** Os caminhos LIVE exigem as três declarações do S6.
+- Perda medida sem data legível **não entra** no teto: o limite diário é um **piso verificado**, não
+  prova de que nada mais foi perdido (a `note` do estado diz isso).
+- Tip/priority fee continuam embutidos no ΔSOL e não decomponíveis (Adendo 19).
+- **Lucro não é garantido por configuração nenhuma.** O invariante é: nada é construído sobre
+  número adivinhado, nada é apagado sem prova e nenhum resultado é fabricado.
