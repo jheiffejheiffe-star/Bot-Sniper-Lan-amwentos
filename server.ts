@@ -228,7 +228,8 @@ import {
   executeWithDecryptedKeypair
 } from "./src/security.js";
 import { dbStore, type LegRecord } from "./src/persistence.js";
-import { computeRoundTrip, parseTransactionLeg, unmeasuredLeg } from "./src/roundTrip.js";
+import { computeRoundTrip, measureLegWith, parseTransactionLeg } from "./src/roundTrip.js";
+import { planEntryLegReconciliation, resolveReconcileToleranceSol } from "./src/entryLegReconciliation.js";
 import {
   classifyManagedPosition,
   createDailyLossLedger,
@@ -2070,6 +2071,45 @@ app.get("/api/system-truth", (_req, res) => {
   });
 });
 
+/**
+ * S14 — RECONCILIAÇÃO DA PERNA DE ENTRADA (leitura PURA: nenhuma rede, nenhuma escrita).
+ *
+ * Responde "quanto do meu histórico ainda NÃO fecha o ciclo, e por quê?" — a pergunta que decide se
+ * a validação estatística (S9) tem amostra. Cada registro fora da fila aparece com o motivo; nada é
+ * silenciado: NO_ENTRY_SIGNATURE (não há compra no histórico), AMBIGUOUS_ENTRY (mais de uma
+ * candidata — escolher seria inventar), ENTRY_AFTER_EXIT (ordem impossível). EXIT_LEG_MISMATCH só
+ * aparece na execução do script, que é quem relê a cadeia.
+ *
+ * A aplicação é do script (`npm run reconcile`): dry-run por default, grava só com `--apply`.
+ */
+app.get("/api/reconciliation", (_req, res) => {
+  const plan = planEntryLegReconciliation(dbStore.getTrades());
+  res.json({
+    toleranceSol: resolveReconcileToleranceSol(),
+    counts: plan.counts,
+    eligible: plan.items.slice(0, 20),
+    eligibleTruncated: plan.items.length > 20,
+    skipped: plan.skipped.slice(0, 20),
+    skippedTruncated: plan.skipped.length > 20,
+    note: plan.note,
+    howToRun: {
+      dryRun: "npm run reconcile",
+      apply: "npm run reconcile -- --apply",
+      report: "o relatório JSON é gravado em data/reconciliation-<timestamp>.json (também no dry-run)",
+      cost: "2 getTransaction por registro reconciliado (a mesma leitura que o S11 usa); --limit para lotes",
+      wallet: "usa --wallet <pubkey>, OPERATIONAL_PUBLIC_KEY ou o cofre do processo — nunca a chave privada",
+    },
+    validation: {
+      basesMedidas: ["round_trip_legs", "round_trip_legs_window_conflict", "round_trip_legs_reconciled"],
+      note:
+        "registros reconciliados entram como `net_measured` (as duas pernas medidas), mas SEMPRE com " +
+        "`pnlBasis: round_trip_legs_reconciled`: o subconjunto é rastreável e separável do que foi " +
+        "medido em tempo real. O valor anterior (receita da venda gravada como PnL pré-S11) fica " +
+        "preservado em `supersededPnlNetSol` — nunca apagado.",
+    },
+  });
+});
+
 app.get("/api/positions", (req, res) => {
   const includeQuarantined = String(req.query.include ?? "") === "quarantined";
   const positions = dbStore.getPositions();
@@ -2444,6 +2484,7 @@ app.post("/api/positions/close", async (req, res) => {
       block: finalSlot,
       tipSol: jitoTip,
       route: `KMS Manual Jito Exit${ciclo.measured ? "" : ` (PnL do ciclo NÃO apurado: ${ciclo.basis})`}`,
+      leg: "exit" as const,
       signature,
       // PnL só quando as DUAS pernas foram medidas. Valor parcial vai em `saleProceedsSol`,
       // com nome próprio, para nunca ser lido como lucro.
@@ -5991,6 +6032,7 @@ async function runRealEntry(params: {
       block: result.slot ?? 0,
       tipSol: result.tipSol ?? 0,
       route: `Jupiter → Jito bundle [${result.routeLabels.join(">") || "rota?"}]${result.confirmedOnChain ? "" : " (SEM confirmação on-chain)"}`,
+      leg: "entry" as const,
       mode: "live" as const,
       signature: result.signature,
     } as any);
@@ -7652,18 +7694,12 @@ async function measureLeg(
   wallet: PublicKey,
   mint: string
 ): Promise<ReturnType<typeof parseTransactionLeg>> {
-  const conn = globalConnection;
-  if (!conn) return unmeasuredLeg(signature, "sem conexão RPC");
-  try {
-    const tx = await conn.getTransaction(signature, {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
-    if (!tx) return unmeasuredLeg(signature, "transação não retornada pelo RPC (histórico indisponível?)");
-    return parseTransactionLeg(wallet.toBase58(), mint, tx);
-  } catch (err: any) {
-    return unmeasuredLeg(signature, err?.message ?? String(err));
-  }
+  /**
+   * S14 — a medição em si vive em `src/roundTrip.ts` (`measureLegWith`) porque o script de
+   * reconciliação precisa medir EXATAMENTE como o caminho ao vivo mede. Aqui fica só a ligação
+   * com a conexão global do processo; o comportamento (e as mensagens de falha) são os mesmos.
+   */
+  return measureLegWith(globalConnection, signature, wallet.toBase58(), mint);
 }
 
 /** Saldo da carteira em lamports (usado SÓ na conferência opcional por janela). */
@@ -8172,6 +8208,7 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       block: finalSlot,
       tipSol: jitoTip,
       route: `KMS Real Exit Jito (${reason})${ciclo.measured ? "" : ` (PnL do ciclo NÃO apurado: ${ciclo.basis})`}`,
+      leg: "exit" as const,
       signature,
       pnlNetSol: ciclo.measured ? (ciclo.pnlNetSol as number) : undefined,
       saleProceedsSol: pernaSaida.measured && pernaSaida.solDeltaLamports !== null ? pernaSaida.solDeltaLamports / 1e9 : undefined,
@@ -8362,6 +8399,7 @@ async function executeAutonomousExit(pos: any, reason: string, pnlPercent: numbe
       block: 0,
       tipSol: 0,
       route: `EXIT FALHOU (${reason}) — ${errorMessage.slice(0, 80)}`,
+      leg: "exit" as const,
       mode: "live" as const,
       signature: null,
       measuredOnChain: false,

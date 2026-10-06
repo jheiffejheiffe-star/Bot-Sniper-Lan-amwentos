@@ -151,6 +151,17 @@ export interface LabelCoverage {
 const EXIT_HINTS = /\bexit\b|venda|sell|saída|saida/i;
 
 /**
+ * Rotas de ENTRADA. A ordem importa: a saída é testada ANTES, porque `EXIT FALHOU`/`KMS Real Exit`
+ * também poderiam conter "Jupiter" em algum rótulo.
+ *
+ * `jupiter → jito bundle` é o formato EXATO com que `server.ts` registra uma compra real
+ * (`route: \`Jupiter → Jito bundle [${...}]\``) — verificado no gravador, não é palpite. Isto
+ * existe para o HISTÓRICO (gravado antes de haver campo explícito de perna) poder ser reconciliado;
+ * registros novos já saem com `leg: "entry" | "exit"`, que tem precedência.
+ */
+const ENTRY_HINTS = /jupiter\s*(→|->|=>)\s*jito|\bentrada\b|\bentry\b|\bbuy\b/i;
+
+/**
  * Determina se o registro é entrada ou saída. Ordem: campo explícito → texto da rota → desconhecido.
  * IMPORTANTE: "desconhecido" é um resultado legítimo e NÃO bloqueia o rótulo quando o PnL medido
  * existe — só impede afirmar QUE tipo de tentativa foi.
@@ -161,7 +172,7 @@ export function classifyAttemptKind(trade: Partial<DBTrade>): { kind: AttemptKin
   const route = String(trade.route ?? "");
   if (route !== "") {
     if (EXIT_HINTS.test(route)) return { kind: "exit", source: "texto" };
-    if (/entrada|entry|buy/i.test(route)) return { kind: "entry", source: "texto" };
+    if (ENTRY_HINTS.test(route)) return { kind: "entry", source: "texto" };
   }
   return { kind: "unknown", source: "desconhecido" };
 }
@@ -186,7 +197,12 @@ export function labelTrade(trade: DBTrade): LabeledOutcome {
    * desconhecida nunca é promovida.
    */
   const pnlBasis = typeof (trade as any).pnlBasis === "string" ? ((trade as any).pnlBasis as string) : null;
-  const duasPernas = pnlBasis === "round_trip_legs" || pnlBasis === "round_trip_legs_window_conflict";
+  const duasPernas =
+    pnlBasis === "round_trip_legs" ||
+    pnlBasis === "round_trip_legs_window_conflict" ||
+    // S14: ciclo fechado por RECONCILIAÇÃO também tem as DUAS pernas medidas (a de entrada foi
+    // remedida da cadeia depois). Elegível, com procedência declarada — separável em relatório.
+    pnlBasis === "round_trip_legs_reconciled";
   const umaPerna = measured && !duasPernas;
   if (measured) provenance.push(`measuredOnChain=true${pnlBasis ? ` (pnlBasis=${pnlBasis})` : " (procedência NÃO declarada)"}`);
   if (pnl !== null) provenance.push("pnlNetSol");
@@ -226,7 +242,8 @@ export function labelTrade(trade: DBTrade): LabeledOutcome {
       pnlPercent: null,
       reason:
         `PnL líquido do CICLO medido on-chain (ΔSOL da entrada + ΔSOL da saída, com tip/priority/base ` +
-        `fee embutidos${pnlBasis === "round_trip_legs_window_conflict" ? "; ATENÇÃO: a janela de saldos divergiu da soma das pernas — houve outra movimentação de SOL na carteira" : ""}): ` +
+        `fee embutidos${pnlBasis === "round_trip_legs_window_conflict" ? "; ATENÇÃO: a janela de saldos divergiu da soma das pernas — houve outra movimentação de SOL na carteira" : ""}` +
+        `${pnlBasis === "round_trip_legs_reconciled" ? " (S14: a perna de ENTRADA foi REMEDIDA da cadeia depois — mesma transação, releitura; o valor anterior está em supersededPnlNetSol)" : ""}): ` +
         `${pnl >= 0 ? "+" : ""}${pnl.toFixed(9)} SOL`,
       excluded: false,
       exclusionReason: null,

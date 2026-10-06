@@ -334,6 +334,44 @@ eram lidos pelo código** — config morta.
 traz `limits` (declarado × não declarado, um por um), `dailyLoss` (com o motivo e a lacuna
 declarada) e `notGuaranteed`.
 
+### 5.5 Reconciliação do histórico (S14): fechar o ciclo sem inventar vínculo
+
+Todo registro de saída anterior ao S11 — e todo registro que o S11 marcou como `exit_leg_only` —
+tem `pnlBasis` ausente e por isso **não é amostra**: o rótulo (S9) não pode chamá-lo de
+`net_measured`. Pior: no registro pré-S11, `pnlNetSol` guarda o **ΔSOL da VENDA**, que é receita e
+não lucro (Adendo 19). A reconciliação existe para fechar esse ciclo **com prova**, nunca por
+dedução:
+
+```bash
+npm run reconcile                 # DRY-RUN (default): mede, relata e NÃO grava
+npm run reconcile -- --apply      # grava os reconciliados
+npm run reconcile -- --limit 5    # lotes (2 getTransaction por registro)
+npm run reconcile -- --json       # máquina (jq)
+```
+
+O que o script faz: para cada saída em perna única, localiza **a** entrada do mesmo mint com
+assinatura e slot ≤ saída, relê **as duas transações** da cadeia (`getTransaction`) e grava o PnL do
+ciclo. O que ele se recusa a fazer:
+
+| Situação | Resultado |
+|---|---|
+| >1 entrada candidata | `AMBIGUOUS_ENTRY` — escolher a "mais provável" seria inventar o vínculo |
+| Entrada ausente no histórico | `NO_ENTRY_SIGNATURE` — ciclo segue NÃO medido (declarado) |
+| Releitura da saída ≠ valor registrado (> `HFT_RECONCILE_TOLERANCE_SOL`) | `EXIT_LEG_MISMATCH` — recusa |
+| Perna não medida (RPC fora/transação sem histórico) | `ENTRY_LEG_UNMEASURED` / `EXIT_LEG_UNMEASURED` |
+
+Garantias: o número antigo é **preservado** em `supersededPnlNetSol` (nunca apagado); o novo entra
+com procedência própria (`pnlBasis: "round_trip_legs_reconciled"`, contando como duas pernas e
+entrando no teto de perda diária); **nada é assinado, enviado, ou precisa de chave privada** — só
+`--wallet`/`OPERATIONAL_PUBLIC_KEY` para saber qual saldo procurar dentro da transação. O plano pode
+ser visto sem medir nada em `GET /api/reconciliation`. O relatório sai em
+`data/reconciliation-<timestamp>.json` (fora do git, também no dry-run) e o banco é gravado só no
+ramo `--apply`.
+
+**Perspectiva honesta:** reconciliar não valida estratégia. Transforma registros existentes em
+amostra legível — a conclusão de `/api/performance` continua sendo `sem_dados` até haver ≥100
+desfechos medidos (item 6 do §8).
+
 ## 6. Problemas comuns e o que eles NÃO significam
 
 | Sintoma | Provável causa | NÃO conclua |
@@ -391,6 +429,7 @@ declarada) e `notGuaranteed`.
 6. **Validação estatística (S9)** — o cálculo existe e é honesto, mas **não há amostra**: sem ≥100
    desfechos com PnL líquido medido on-chain, `/api/performance` conclui `sem_dados` ou
    `amostra_insuficiente`. Nenhum resultado deste projeto foi validado estatisticamente ainda.
+   O S14 (§5.5) ataca a causa disso: recupera o ciclo do histórico em vez de fabricar rótulo.
 7. **PnL do ciclo (S11)** — a contabilidade agora exige as DUAS pernas medidas
    (`ΔSOL(entrada) + ΔSOL(saída)`); a versão anterior gravava o ΔSOL da venda como PnL "medido", o
    que inflava todo resultado pelo valor da entrada (ver `AUDIT.md` Adendo 19). Correção de

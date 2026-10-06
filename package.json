@@ -21,7 +21,8 @@
     "free:check": "tsx scripts/free-check.ts",
     "storage:migrate": "tsx scripts/storage-migrate.ts",
     "storage:check": "tsx scripts/storage-migrate.ts --check",
-    "storage:selftest": "tsx scripts/storage-selftest.ts"
+    "storage:selftest": "tsx scripts/storage-selftest.ts",
+    "reconcile": "tsx scripts/reconcile-entry-legs.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

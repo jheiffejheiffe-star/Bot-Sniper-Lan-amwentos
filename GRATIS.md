@@ -297,3 +297,24 @@ pequena (Helius Free: 1 envio/s). Ele existe para o caso em que a alternativa é
 preso** porque o block engine aplicou rate limit. Na prática: com um provider gratuito, conte com
 *uma* tentativa de saída por vez, e a corrida Jito+staked (paga) é o upgrade que muda a taxa de
 landing — não o fallback.
+
+### S14 — reconciliação do histórico: custo em créditos de leitura
+
+A reconciliação (`npm run reconcile`, §5.5 do `OPERACAO.md`) é **a única parte do projeto que gasta
+cota para OLHAR PARA TRÁS**: cada registro reconciliado custa **2 `getTransaction`** (entrada +
+saída) — a mesma chamada que o S11 já faz na confirmação. Não há provedor novo, não há tier pago e
+nada é enviado à rede.
+
+Na aritmética do plano:
+
+- No Helius Free (1M créditos/mês), `getTransaction` custa 1 crédito cada: **100 desfechos
+  reconciliados = 200 créditos** — 0,02% do plano. O teto que morde continua sendo o de **10 req/s**:
+  o script é sequencial (2 requisições por item), então não há rajada.
+- Use `--limit` para reconciliar em lotes e **sempre comece pelo dry-run** (default): ele mede e
+  relata por 2 créditos por item sem gravar nada.
+- O que **não** é gasto: nenhuma transação é assinada ou enviada, nenhum priority fee, nenhum tip.
+- O relatório é gravado em `data/` (fora do git), então reconciliar não infla o repositório.
+
+**Limite honesto:** reconciliar transforma registro antigo em amostra legível — não transforma
+histórico ruim em estratégia validada. Se o histórico for pequeno demais, o resultado honesto
+continua sendo "sem dados suficientes".

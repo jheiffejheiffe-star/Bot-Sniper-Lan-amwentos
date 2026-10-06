@@ -303,7 +303,12 @@ export function classifyManagedPosition(pos: ManageablePositionLike): { kind: Ma
 /* -------------------------------------------------------------------------- */
 
 /** Bases de PnL em que as DUAS pernas foram medidas (ver src/outcomeLabels.ts, S11). */
-export const MEASURED_PNL_BASES = Object.freeze(["round_trip_legs", "round_trip_legs_window_conflict"]);
+export const MEASURED_PNL_BASES = Object.freeze([
+  "round_trip_legs",
+  "round_trip_legs_window_conflict",
+  // S14: ciclo fechado por reconciliação tem as duas pernas medidas — a perda dele conta no teto.
+  "round_trip_legs_reconciled",
+]);
 
 export function isMeasuredPnlBasis(basis: unknown): boolean {
   return typeof basis === "string" && (MEASURED_PNL_BASES as readonly string[]).includes(basis);

@@ -6444,6 +6444,241 @@ async function main(): Promise<void> {
     );
   });
 
+  // ---------------------------------------------------------------------------
+  // [33] S14 — RECONCILIAÇÃO DA PERNA DE ENTRADA
+  // ---------------------------------------------------------------------------
+  console.log("\n[33] S14 — reconciliação: fechar o ciclo do histórico SEM inventar vínculo");
+
+  /** Trades realistas do histórico: a saída sem ciclo e a entrada do mesmo mint. */
+  const tradeSaida = (over: any = {}) => ({
+    id: "txn_exit_1",
+    token: "TOKEN",
+    mint: "MintReconcile111111111111111111111111111111",
+    amount: "1.00 TOKEN",
+    outAmount: "0.02 SOL",
+    status: "success",
+    block: 200,
+    tipSol: 0.0002,
+    route: "KMS Real Exit Jito",
+    time: "12:00:00.000",
+    latencyMs: 1500,
+    mode: "live",
+    signature: "sigSaida1111111111111111111111111111111111111111111111111111",
+    measuredOnChain: true,
+    pnlSol: undefined,
+    // Registro PRÉ-S11: o pnlNetSol gravado era o ΔSOL da VENDA (receita), e pnlBasis não existia.
+    pnlNetSol: 0.02,
+    ...over,
+  });
+  const tradeEntrada = (over: any = {}) => ({
+    id: "live_ent1",
+    token: "TOKEN",
+    mint: "MintReconcile111111111111111111111111111111",
+    amount: "0.01 SOL (REAL)",
+    outAmount: "1000000000 unidades do mint",
+    status: "confirmed",
+    block: 100,
+    tipSol: 0.0001,
+    route: "Jupiter → Jito bundle",
+    time: "11:59:00.000",
+    latencyMs: 900,
+    mode: "live",
+    signature: "sigEntrada111111111111111111111111111111111111111111111111111",
+    ...over,
+  });
+
+  await test("plano: saída em perna única + UMA entrada localizada ⇒ elegível", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const plan = rec.planEntryLegReconciliation([tradeEntrada(), tradeSaida()] as any);
+    assert.equal(plan.items.length, 1, JSON.stringify(plan.skipped));
+    const item = plan.items[0];
+    assert.equal(item.exitTradeId, "txn_exit_1");
+    assert.equal(item.entryTradeId, "live_ent1");
+    assert.equal(item.entrySignature, "sigEntrada111111111111111111111111111111111111111111111111111");
+    assert.ok(Math.abs((item.recordedSaleProceedsSol as number) - 0.02) < 1e-12, "o registrado (receita da venda) é preservado no plano");
+    assert.equal(item.originalBasis, null, "registro pré-S11 não tem pnlBasis");
+    assert.equal(plan.counts.eligible, 1);
+    assert.ok(/não é reinterpretar histórico/.test(plan.note), plan.note);
+  });
+
+  await test("plano: DUAS entradas candidatas ⇒ AMBIGUOUS_ENTRY (nunca escolhe a 'mais provável')", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const plan = rec.planEntryLegReconciliation([
+      tradeEntrada(),
+      tradeEntrada({ id: "live_ent2", block: 150, signature: "sigEntrada22222222222222222222222222222222222222222222222222" }),
+      tradeSaida(),
+    ] as any);
+    assert.equal(plan.items.length, 0);
+    assert.equal(plan.counts.byCode.AMBIGUOUS_ENTRY, 1);
+    assert.ok(/inventar/.test(plan.skipped[0].reason), plan.skipped[0].reason);
+  });
+
+  await test("plano: sem entrada; entrada depois da saída; já reconciliado; paper", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+
+    const semEntrada = rec.planEntryLegReconciliation([tradeSaida()] as any);
+    assert.equal(semEntrada.counts.byCode.NO_ENTRY_SIGNATURE, 1);
+
+    const depois = rec.planEntryLegReconciliation([tradeEntrada({ block: 300 }), tradeSaida()] as any);
+    assert.equal(depois.items.length, 0);
+    assert.equal(depois.counts.byCode.NO_ENTRY_SIGNATURE, 1, "entrada posterior à saída não pode servir");
+
+    const jaFeito = rec.planEntryLegReconciliation([
+      tradeEntrada(),
+      tradeSaida({ pnlBasis: "round_trip_legs", pnlNetSol: 0.01 }),
+    ] as any);
+    assert.equal(jaFeito.counts.byCode.ALREADY_RECONCILED, 1);
+
+    const paper = rec.planEntryLegReconciliation([tradeEntrada(), tradeSaida({ mode: "paper", pnlNetSol: undefined, saleProceedsSol: 0.02 })] as any);
+    assert.equal(paper.counts.byCode.NOT_LIVE, 1, "paper nunca entra na validação");
+  });
+
+  await test("decisão: perna não medida recusa com o motivo; divergência contra o registro recusa", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const rt = await import("../src/roundTrip.js");
+    const mint = "MintReconcile111111111111111111111111111111";
+    const wallet = "CarteiraReconcile11111111111111111111111111";
+    const perna = (pre: number, post: number, err: any = null) =>
+      rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre, post, err }));
+
+    const entrada = perna(1_000_000_000, 990_000_000);
+    const saida = perna(990_000_000, 1_010_000_000);
+
+    const semEntrada = rec.decideEntryLegReconciliation({ entryLeg: rt.unmeasuredLeg("s", "RPC fora"), exitLeg: saida });
+    assert.equal((semEntrada as any).code, "ENTRY_LEG_UNMEASURED");
+
+    const semSaida = rec.decideEntryLegReconciliation({ entryLeg: entrada, exitLeg: rt.unmeasuredLeg("s", "sem histórico") });
+    assert.equal((semSaida as any).code, "EXIT_LEG_UNMEASURED");
+
+    // Registro diz 0,02 SOL de venda; a releitura diz 0,02 — dentro da tolerância ⇒ reconcilia.
+    const ok = rec.decideEntryLegReconciliation({ entryLeg: entrada, exitLeg: saida, recordedLegacyPnlSol: 0.02 });
+    assert.equal((ok as any).action, "reconcile");
+    assert.ok(Math.abs(((ok as any).cycle.pnlNetSol as number) - 0.01) < 1e-12, `pnl=${(ok as any).cycle.pnlNetSol}`);
+    assert.equal((ok as any).cycle.measured, true);
+
+    // Divergência grande ⇒ RECUSA (outra movimentação mexeu no saldo).
+    const divergente = rec.decideEntryLegReconciliation({ entryLeg: entrada, exitLeg: saida, recordedLegacyPnlSol: 0.5 });
+    assert.equal((divergente as any).code, "EXIT_LEG_MISMATCH");
+    assert.ok(/NÃO é promovido/.test((divergente as any).reason), (divergente as any).reason);
+  });
+
+  await test("escrita: o número anterior é PRESERVADO e a procedência própria é gravada", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const rt = await import("../src/roundTrip.js");
+    const mint = "MintReconcile111111111111111111111111111111";
+    const wallet = "CarteiraReconcile11111111111111111111111111";
+    const perna = (pre: number, post: number) => rt.parseTransactionLeg(wallet, mint, fakeTx({ wallet, mint, pre, post }));
+    const entrada = perna(1_000_000_000, 990_000_000);
+    const saida = perna(990_000_000, 1_010_000_000);
+    const decisao: any = rec.decideEntryLegReconciliation({ entryLeg: entrada, exitLeg: saida, recordedLegacyPnlSol: 0.02 });
+    assert.equal(decisao.action, "reconcile");
+
+    const original = tradeSaida();
+    const novo = rec.buildReconciledTrade(original as any, {
+      entryLeg: entrada,
+      exitLeg: saida,
+      cycle: decisao.cycle,
+      reconciledAt: "2026-10-06T18:00:00.000Z",
+      mismatchSol: decisao.mismatchSol,
+      expectedExitProceedsSol: decisao.expectedExitProceedsSol,
+    });
+
+    assert.equal((novo as any).pnlBasis, "round_trip_legs_reconciled", "procedência PRÓPRIA do reconciliado");
+    assert.ok(Math.abs(((novo as any).pnlNetSol as number) - 0.01) < 1e-12, `pnl=${(novo as any).pnlNetSol}`);
+    assert.equal((novo as any).supersededPnlNetSol, 0.02, "o valor antigo (receita da venda) fica preservado");
+    assert.equal((novo as any).entryLegSignature, entrada.signature);
+    assert.equal((novo as any).reconciledAt, "2026-10-06T18:00:00.000Z");
+    assert.ok(/NÃO é lucro/.test((novo as any).reconciliationNote), (novo as any).reconciliationNote);
+    assert.ok(/reli[dt]a da cadeia/.test((novo as any).reconciliationNote), (novo as any).reconciliationNote);
+    // Nada do registro original foi apagado.
+    assert.equal((novo as any).id, original.id);
+    assert.equal((novo as any).signature, original.signature);
+    assert.equal((novo as any).time, original.time);
+    assert.equal((novo as any).block, original.block);
+    assert.equal((novo as any).mode, "live");
+  });
+
+  await test("medir perna com conexão falsa: sem conexão/null/erro ⇒ NÃO medido, com motivo", async () => {
+    const rt = await import("../src/roundTrip.js");
+    const mint = "MintReconcile111111111111111111111111111111";
+    const wallet = "CarteiraReconcile11111111111111111111111111";
+
+    const semConexao = await rt.measureLegWith(null, "sigX", wallet, mint);
+    assert.equal(semConexao.measured, false);
+    assert.ok(/sem conexão RPC/.test(semConexao.error ?? ""));
+    assert.equal(semConexao.solDeltaLamports, null, "não medido NUNCA vira zero");
+
+    const nula = await rt.measureLegWith({ getTransaction: async () => null } as any, "sigX", wallet, mint);
+    assert.equal(nula.measured, false);
+    assert.ok(/não retornada/.test(nula.error ?? ""));
+
+    const explodiu = await rt.measureLegWith({ getTransaction: async () => { throw new Error("RPC 429"); } } as any, "sigX", wallet, mint);
+    assert.equal(explodiu.measured, false);
+    assert.ok(/429/.test(explodiu.error ?? ""));
+
+    const semAssinatura = await rt.measureLegWith({ getTransaction: async () => ({}) } as any, null, wallet, mint);
+    assert.equal(semAssinatura.measured, false);
+
+    const ok = await rt.measureLegWith(
+      { getTransaction: async () => fakeTx({ wallet, mint, pre: 1_000_000_000, post: 990_000_000 }) } as any,
+      "sigY", wallet, mint
+    );
+    assert.equal(ok.measured, true);
+    assert.equal(ok.solDeltaLamports, -10_000_000);
+  });
+
+  await test("reconciliado entra na validação MAS com base própria; e conta no teto de perda", async () => {
+    const ol = await import("../src/outcomeLabels.js");
+    const es = await import("../src/exitSafety.js");
+    const reconciliado = {
+      ...tradeSaida({ pnlBasis: "round_trip_legs_reconciled", pnlNetSol: -0.004, saleProceedsSol: 0.006, reconciledAt: "2026-10-06T18:00:00.000Z" }),
+    } as any;
+    const rotulo = ol.labelTrade(reconciliado);
+    assert.equal(rotulo.basis, "net_measured", "as duas pernas medidas ⇒ elegível");
+    assert.equal(rotulo.label, "loss");
+    assert.equal(rotulo.excluded, false, "reconciliado é elegível, não excluído");
+    assert.ok(/supersededPnlNetSol|REMEDIDA/.test(rotulo.reason), rotulo.reason);
+
+    assert.ok((es.MEASURED_PNL_BASES as readonly string[]).includes("round_trip_legs_reconciled"), "o livro de perda diária conta reconciliados");
+
+    // Fail-closed preservado: um registro SEM procedência continua fora.
+    const semProcedencia = ol.labelTrade({ ...tradeSaida({ pnlBasis: undefined, pnlNetSol: 0.02, measuredOnChain: true }) } as any);
+    assert.notEqual(semProcedencia.basis, "net_measured", "sem pnlBasis declarado não é promovido");
+  });
+
+  await test("resumo: separa reconciliados de recusados e declara o que ficou fora", async () => {
+    const rec = await import("../src/entryLegReconciliation.js");
+    const plan = rec.planEntryLegReconciliation([tradeEntrada(), tradeSaida()] as any);
+    const sum = rec.summarizeReconciliation(plan, [
+      { exitTradeId: "txn_exit_1", mint: plan.items[0].mint, token: "TOKEN", verdict: "reconciled", code: "OK", pnlNetSol: 0.01, previousPnlSol: 0.02, reason: "" },
+      { exitTradeId: "txn_exit_2", mint: plan.items[0].mint, token: "TOKEN", verdict: "refused", code: "EXIT_LEG_MISMATCH", pnlNetSol: null, previousPnlSol: 0.02, reason: "" },
+    ]);
+    assert.equal(sum.reconciled, 1);
+    assert.equal(sum.refused, 1);
+    assert.equal(sum.byRefusal.EXIT_LEG_MISMATCH, 1);
+    assert.ok(Math.abs(sum.totalPnlSol - 0.01) < 1e-12);
+    assert.ok(/NÃO foi reescrito/.test(sum.note), sum.note);
+  });
+
+  await test("o script é DRY-RUN por default: gravação só sob --apply e nenhuma chave é tocada", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "scripts/reconcile-entry-legs.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+    for (const proibido of ["Keypair", "secretKey", "sendRawTransaction", "sendTransaction", "OPERATIONAL_PRIVATE_KEY"]) {
+      assert.equal(code.includes(proibido), false, `reconcile-entry-legs.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(code.includes("if (apply)"), "a gravação precisa estar condicionada a --apply");
+    const posApplyCond = code.indexOf("if (apply)");
+    const posSave = code.indexOf("dbStore.saveTrade(novo)");
+    assert.ok(posSave > posApplyCond && posApplyCond > 0, "saveTrade só pode existir DENTRO do ramo --apply");
+    assert.equal(code.split("saveTrade").length - 1, 1, "um único ponto de escrita");
+    assert.ok(code.includes("DRY-RUN: NADA foi gravado"), "o aviso de dry-run precisa ser explícito");
+    assert.ok(code.includes("getTransaction") === false, "a leitura da transação vem de measureLegWith (uma única definição)");
+
+    const serverSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(serverSrc.includes('app.get("/api/reconciliation"'), "o endpoint de leitura precisa existir");
+  });
+
   console.log("\n=========================================");
   if (failures.length === 0) {
     console.log(`🏆 ${passed} TESTES PASSARAM`);

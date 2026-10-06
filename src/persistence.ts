@@ -31,13 +31,39 @@ export interface DBTrade {
   mode?: "live" | "paper";
   /** Assinatura on-chain real. `null` em paper trades (nunca preenchida com texto). */
   signature?: string | null;
+  /**
+   * S14 — a perna declarada pelo GRAVADOR no momento da execução. `classifyAttemptKind` já deduzia
+   * pelo texto da rota; o campo explícito elimina a dedução no que for gravado a partir de agora
+   * (e é o que permite, depois, saber qual transação remedir).
+   */
+  leg?: "entry" | "exit";
   /** PnL líquido medido por delta de saldo (SOL). Ausente quando não medido. */
   /**
    * PROCEDÊNCIA DO PnL (S11). `pnlNetSol` sozinho não diz se o número é o lucro do CICLO (entrada +
    * saída) ou apenas a receita da venda — e a diferença é o tamanho da posição em toda operação.
    * Este campo viaja com o resultado para que o rótulo (S9) possa exigir as duas pernas.
    */
-  pnlBasis?: "round_trip_legs" | "round_trip_legs_window_conflict" | "exit_leg_only" | "incomplete";
+  pnlBasis?:
+    | "round_trip_legs"
+    | "round_trip_legs_window_conflict"
+    | "round_trip_legs_reconciled"
+    | "exit_leg_only"
+    | "incomplete";
+  /**
+   * S14 — RECONCILIAÇÃO. Assinatura da perna de ENTRADA remedida da cadeia, quando o ciclo foi
+   * fechado depois (histórico pré-S11). Sem este campo, "de onde veio a perna" ficaria invisível.
+   */
+  entryLegSignature?: string | null;
+  /** Quando a reconciliação foi aplicada (ISO). Presença ⇒ o ciclo foi fechado por releitura. */
+  reconciledAt?: string;
+  /** O que exatamente foi feito e por quê (inclui a divergência conferida contra o registro). */
+  reconciliationNote?: string;
+  /**
+   * Número ANTERIOR preservado quando a reconciliação substituiu um valor: em registros pré-S11
+   * este era o ΔSOL da VENDA gravado como "PnL" — receita, não lucro. Nunca apagado: é a prova
+   * do defeito corrigido (Adendo 19) e não pode voltar a ser lido como resultado.
+   */
+  supersededPnlNetSol?: number;
   /**
    * RECEITA DA VENDA em SOL (só a perna de saída medida). Não é PnL e nunca entra na validação:
    * existe para diagnóstico e para fechar o laço quando a perna de entrada for recuperada depois.

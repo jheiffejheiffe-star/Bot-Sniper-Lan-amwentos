@@ -113,6 +113,12 @@ export interface TransactionLegEconomics {
 export type RoundTripBasis =
   /** As duas pernas medidas: o número é o lucro/prejuízo real do ciclo. */
   | "round_trip_legs"
+  /**
+   * S14 — ciclo fechado por RECONCILIAÇÃO: as duas pernas foram medidas on-chain, mas a de
+   * entrada só foi remedida DEPOIS (a partir da assinatura gravada). Mesma medição, procedência
+   * diferente — por isso o valor próprio: relatórios podem separar o subconjunto reconciliado.
+   */
+  | "round_trip_legs_reconciled"
   /** As duas pernas medidas, mas a janela de saldo não fecha — houve outra movimentação de SOL. */
   | "round_trip_legs_window_conflict"
   /** Só a saída foi medida: isto é RECEITA DA VENDA, não lucro do ciclo. Excluído da validação. */
@@ -170,6 +176,45 @@ const ZERO_COSTS: CostBreakdown = {
 };
 
 /** Perna não medida, com motivo. Nunca devolve zero "por padrão". */
+/**
+ * Conexão MÍNIMA necessária para medir uma perna (tipagem estrutural: este módulo não importa
+ * `@solana/web3.js` e continua puro — quem passa a conexão é o chamador: servidor ou script).
+ */
+export interface LegFetchConnection {
+  getTransaction(
+    signature: string,
+    options: { commitment: "confirmed"; maxSupportedTransactionVersion: number }
+  ): Promise<any>;
+}
+
+/**
+ * S14 — mede UMA perna relendo a transação da cadeia. Extraído do servidor para que o script de
+ * reconciliação meça EXATAMENTE como o caminho ao vivo mede (uma única definição de "o que é
+ * medir uma perna"). Fail-closed: sem conexão, sem assinatura, transação ausente ou erro do RPC
+ * ⇒ `unmeasuredLeg` com o motivo — nunca número estimado.
+ */
+export async function measureLegWith(
+  conn: LegFetchConnection | null,
+  signature: string | null,
+  walletBase58: string,
+  mint: string
+): Promise<TransactionLegEconomics> {
+  if (!conn) return unmeasuredLeg(signature, "sem conexão RPC");
+  if (typeof signature !== "string" || signature.trim() === "") {
+    return unmeasuredLeg(signature, "assinatura ausente: não há transação a medir");
+  }
+  try {
+    const tx = await conn.getTransaction(signature, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (!tx) return unmeasuredLeg(signature, "transação não retornada pelo RPC (histórico indisponível?)");
+    return parseTransactionLeg(walletBase58, mint, tx);
+  } catch (err: any) {
+    return unmeasuredLeg(signature, err?.message ?? String(err));
+  }
+}
+
 export function unmeasuredLeg(signature: string | null, error: string): TransactionLegEconomics {
   return {
     signature,

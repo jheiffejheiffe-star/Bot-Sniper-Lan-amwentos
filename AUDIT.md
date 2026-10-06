@@ -2300,3 +2300,65 @@ Teste de fonte falha se: algum dos 3 pontos perder a entrega, a corrida deixar d
 - **Não há caminho com stake na corrida** sem `HFT_STAKED_SENDER_URL` do provedor do operador.
 - `skipPreflight: true` no fallback assume simulação prévia (entrada) ou inutilidade do pré-flight
   após confirmação (saída).
+
+---
+
+## Adendo 22 — S14: reconciliação da perna de entrada (fechar o histórico sem inventar vínculo) (2026-10-06)
+
+### 1. Problema observado
+
+O S11 fez o PnL passar a ser do **ciclo** (ΔSOL da entrada + ΔSOL da saída). Mas todo o histórico
+anterior — e tudo que o S11 marca como `exit_leg_only` por não ter a compra medida — continua com
+`pnlBasis` ausente: o rótulo (S9) não consegue chamá-los de `net_measured`, e a validação
+estatística fica sem amostra. O registro pré-S11 é pior do que inútil: `pnlNetSol` guarda o **ΔSOL
+da VENDA** (receita), que lido como resultado superestima o ganho em ~100% do tamanho da posição
+(defeito do Adendo 19, já corrigido no caminho de escrita — não no número já gravado).
+
+### 2. O que foi feito
+
+1. `src/roundTrip.ts`: `measureLegWith(conn, signature, wallet, mint)` — a medição de perna
+   compartilhada com o servidor (uma única definição; o servidor agora delega). `RoundTripBasis`
+   ganhou `round_trip_legs_reconciled`.
+2. `src/entryLegReconciliation.ts` **(novo, puro)**: `planEntryLegReconciliation` (quem PODE ser
+   medido, com o motivo declarado de cada exclusão), `decideEntryLegReconciliation` (fail-closed:
+   confere a **releitura** da saída contra o valor registrado, ± `HFT_RECONCILE_TOLERANCE_SOL`) e
+   `buildReconciledTrade` (grava o ciclo medido com procedência própria e **preserva** o número
+   anterior em `supersededPnlNetSol`).
+3. `src/persistence.ts`: `entryLegSignature`, `reconciledAt`, `reconciliationNote`,
+   `supersededPnlNetSol` e `leg: "entry" | "exit"` (perna declarada pelo gravador).
+4. `src/outcomeLabels.ts`: base reconciliada conta como duas pernas; e o reconhecimento da rota de
+   **entrada** real do repositório (`Jupiter → Jito bundle [...]` — formato verificado no gravador,
+   sem o qual nenhum registro do histórico seria elegível).
+5. `src/exitSafety.ts`: `round_trip_legs_reconciled` entra em `MEASURED_PNL_BASES` (o teto de perda
+   diária conta o valor reconciliado como medido).
+6. `scripts/reconcile-entry-legs.ts` + `npm run reconcile`: **dry-run por default**, `--apply` para
+   gravar, `--json`, `--limit`, `--wallet`. Relê a cadeia (`getTransaction`) e nunca assina, nunca
+   envia, nunca lê chave privada. Relatório em `data/reconciliation-<timestamp>.json` (fora do git).
+7. `GET /api/reconciliation`: leitura pura do plano (sem rede), com contagens por motivo.
+
+### 3. Invariante central
+
+Medir hoje uma transação do passado é medir a **mesma** transação: o ΔSOL de uma transação
+confirmada é imutável. O que **não** é imutável é a afirmação "esta compra é a compra desta venda" —
+por isso, em ambiguidade (`AMBIGUOUS_ENTRY`), a reconciliação **recusa**: escolher a candidata "mais
+provável" seria inventar o vínculo. O resultado sempre sai rotulado
+`pnlBasis: "round_trip_legs_reconciled"` — separável do que foi medido em tempo real — e o número
+antigo fica preservado, não apagado.
+
+### 4. Verificação
+
+`npm run lint` 0 · `npm run test` **298/298** (grupo `[33]`, 9 testes novos) · `npm run build` ok.
+Os testes de fonte falham se o script ganhar capacidade de assinar/enviar, se houver mais de um
+ponto de escrita no banco fora do ramo `--apply`, ou se o dry-run deixar de ser o default.
+
+### 5. Limitações declaradas
+
+- **Nada foi reconciliado com dados reais ainda**: depende de existir histórico no banco do operador
+  (o `data/` local está no `.gitignore` e não foi para o repositório).
+- Custo: **2 `getTransaction` por registro** — a cota de leitura de plano gratuito é pequena; use
+  `--limit` para reconciliar em lotes.
+- O script precisa da carteira operacional (`--wallet`, `OPERATIONAL_PUBLIC_KEY` ou o cofre já
+  inicializado no processo do servidor) para localizar o saldo DENTRO da transação.
+- Reconciliar **não** valida a estratégia: apenas transforma registros existentes em amostra
+  legível. Sem ≥100 desfechos `net_measured`, a conclusão estatística continua sendo "não há
+  evidência suficiente".
