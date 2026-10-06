@@ -1987,6 +1987,20 @@ app.get("/api/system-truth", (_req, res) => {
     simulatedEndpoints,
     exitSafety: exitSafetySnapshot,
     /**
+     * S13 — PLANO DE ENTREGA no painel de veracidade. Responde, sem precisar abrir o
+     * /api/real-entry: por quais caminhos a transação assinada SAI, e o que acontece se o
+     * block engine recusar. Sem isto, "envio paralelo" era uma configuração invisível.
+     */
+    delivery: {
+      plan: SUBMISSION_PLAN,
+      rpcFallback: RPC_FALLBACK,
+      lastRace: lastParallelSend,
+      note:
+        "`race` = todos os transportes ao mesmo tempo (primeiro aceite vence; perdedores seguem). " +
+        "`jito_with_fallback` = Jito primeiro e, na recusa, os MESMOS bytes pelo RPC. " +
+        "`aceito` NUNCA significa executado: a execução exige confirmação e slot observados.",
+    },
+    /**
      * Estado da entrada real — a pergunta "este bot pode gastar agora?" precisa de resposta
      * direta aqui, no painel de veracidade, e não só em /api/real-entry.
      */
