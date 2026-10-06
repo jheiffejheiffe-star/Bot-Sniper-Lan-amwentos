@@ -34,7 +34,12 @@ import { BASE_FEE_LAMPORTS, clampTipSol, type CostBreakdown, emptyCosts } from "
 import { assertCanSign, type OperationPurpose } from "./runtimeMode.js";
 import { SeenLaunchSignatures, resolveSendOptions, type SendOptionsInput } from "./hotPath.js";
 
-dotenv.config();
+/**
+ * `quiet: true` — o banner "injected env (N) from .env" (dotenv v17) ia para STDOUT e contaminava
+ * qualquer saída de máquina (`npm run reconcile -- --json | jq`). Diagnóstico de carregamento de
+ * arquivo não é dado: quem quiser ver, olha o próprio .env.
+ */
+dotenv.config({ quiet: true });
 
 /**
  * NOTA DE AUDITORIA (2026-10-02)

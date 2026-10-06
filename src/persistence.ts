@@ -324,7 +324,7 @@ class TransactionalStore {
         console.warn("[Database Engine] Primary database file missing or corrupted. Attempting recovery from backup...");
         parsed = tryParseFile(backupPath);
         if (parsed) {
-          console.log("[Database Engine] SUCCESSFUL AUTO-RECOVERY: Restored database from last valid backup.");
+          console.error("[Database Engine] SUCCESSFUL AUTO-RECOVERY: Restored database from last valid backup.");
           try {
             // Restore primary from backup safely
             const jsonStr = JSON.stringify(parsed, null, 2);
@@ -339,7 +339,7 @@ class TransactionalStore {
       }
 
       if (!parsed) {
-        console.log("[Database Engine] No valid database or backup found. Creating fresh atomic operational state on disk.");
+        console.error("[Database Engine] No valid database or backup found. Creating fresh atomic operational state on disk.");
         this.commit(this.data);
         return;
       }
@@ -378,7 +378,7 @@ class TransactionalStore {
       }
 
       this.data = parsed;
-      console.log(`[Database Engine] Loaded state from disk successfully. Version: v${this.data.schemaVersion}. Transaction commits: ${this.data.transactionCount}`);
+      console.error(`[Database Engine] Loaded state from disk successfully. Version: v${this.data.schemaVersion}. Transaction commits: ${this.data.transactionCount}`);
     } catch (err: any) {
       console.error("[Database Engine] Load / Migration failed. Running fallback memory mode.", err.message);
     }
