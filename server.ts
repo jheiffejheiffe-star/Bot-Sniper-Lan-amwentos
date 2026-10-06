@@ -229,6 +229,7 @@ import {
 } from "./src/security.js";
 import { dbStore, type LegRecord } from "./src/persistence.js";
 import { computeRoundTrip, measureLegWith, parseTransactionLeg } from "./src/roundTrip.js";
+import { applyCostFloorToPaperClose, paperRoundTripCostFloor, resolveRoundTripCostPolicy } from "./src/roundTripCost.js";
 import { planEntryLegReconciliation, resolveReconcileToleranceSol } from "./src/entryLegReconciliation.js";
 import {
   classifyManagedPosition,
@@ -1016,6 +1017,20 @@ const invalidPositionWarned = new Set<string>();
 const blockedIntentWarned = new Set<string>();
 /** B: gate de saída recusando — 1 aviso por posição, para não inundar o log a cada ciclo. */
 const exitGateBlockedWarned = new Set<string>();
+
+/**
+ * A — POLÍTICA DE CUSTO DA VOLTA (resolvida UMA vez, no boot). É a mesma política declarada do
+ * caminho real onde ela existe (tip desejado 0,003 SOL com teto `MAX_TIP_BPS`); o que é premissa
+ * aparece como premissa e o que não foi declarado aparece como LIMITE INFERIOR.
+ */
+const PAPER_COST_POLICY = resolveRoundTripCostPolicy();
+console.log(
+  `[Boot][Env] Custo da volta em PAPER (A): tip desejado ${PAPER_COST_POLICY.entryTipDesiredSol} SOL entrada / ` +
+    `${PAPER_COST_POLICY.exitTipDesiredSol} SOL saída, teto ${PAPER_COST_POLICY.maxTipBps} bps | ` +
+    `priority fee: ${PAPER_COST_POLICY.priorityFeeMicroLamportsPerCu === null ? "NÃO declarada → piso é LIMITE INFERIOR" : `${PAPER_COST_POLICY.priorityFeeMicroLamportsPerCu} µL/CU`} | ` +
+    `premissas: slippage ${PAPER_COST_POLICY.slippageBps} bps/perna, AMM ${PAPER_COST_POLICY.ammFeeBps} bps. ` +
+    `O resultado da sombra passa a descontar esse piso (base paper_cost_floor).`
+);
 
 /**
  * ORÁCULO DE TIP (S3).
@@ -1998,6 +2013,29 @@ app.get("/api/system-truth", (_req, res) => {
      * /api/real-entry: por quais caminhos a transação assinada SAI, e o que acontece se o
      * block engine recusar. Sem isto, "envio paralelo" era uma configuração invisível.
      */
+    /**
+     * A — CUSTO DA VOLTA. Piso de custo do ciclo (entrada+saída) para o tamanho canário, calculado
+     * com a MESMA política declarada do caminho real. É um LIMITE INFERIOR declarado: o que não é
+     * conhecido (priority fee sem declaração, slippage real, impacto) aparece em `naoMedidos`/
+     * `limitacoes` em vez de virar número. Nenhuma rede é tocada aqui.
+     */
+    roundTripCost: (() => {
+      const sizeSol = Number(process.env.HFT_CANARY_MAX_SOL ?? 0.01) || 0.01;
+      const floor = paperRoundTripCostFloor({ sizeSol, policy: PAPER_COST_POLICY });
+      return {
+        sizeSol,
+        policy: PAPER_COST_POLICY,
+        pisoConhecidoSol: floor.pisoConhecidoSol,
+        pisoComPremissasSol: floor.pisoComPremissasSol,
+        breakevenPercentConhecido: floor.breakevenPercentConhecido,
+        breakevenPercentComPremissas: floor.breakevenPercentComPremissas,
+        legs: floor.legs,
+        condicionais: floor.condicionais,
+        naoMedidos: floor.naoMedidos,
+        limitacoes: floor.limitacoes,
+        note: floor.note,
+      };
+    })(),
     delivery: {
       plan: SUBMISSION_PLAN,
       rpcFallback: RPC_FALLBACK,
@@ -6768,22 +6806,46 @@ async function reconcileStuckExits(): Promise<void> {
  */
 function recordPaperClose(pos: any, reason: string, pnlPercent: number): void {
   const exitPrice = pos.currentPrice || pos.entryPrice;
-  const pnlSol = (pos.sizeSol * pnlPercent) / 100;
+
+  /**
+   * A — CUSTO DA VOLTA NA SOMBRA. Antes: `pnlSol = sizeSol * pnlPercent / 100`, ou seja, só o
+   * movimento de PREÇO. O ciclo real paga fee base nas duas pernas, tip do Jito (teto `MAX_TIP_BPS`)
+   * e priority fee; com teto de tip de 50 bps o só tip das duas pernas custa ~1% do capital — um
+   * "+2%" na sombra podia ser prejuízo real. O piso agora é descontado e ficam gravados os DOIS
+   * números (bruto e líquido) com a base declarada `paper_cost_floor`.
+   *
+   * O GATILHO não muda: stop/take-profit/trailing continuam disparando por movimento de preço
+   * (`pos.pnlPercent`). Conflacionar preço com custo faria o stop disparar por fee.
+   */
+  const custoDeVolta = applyCostFloorToPaperClose({ sizeSol: pos.sizeSol, pnlPercent, policy: PAPER_COST_POLICY });
+  const pnlSol = custoDeVolta.pnlNetKnownSol;
+  const pnlBrutoSol = custoDeVolta.pnlGrossSol;
 
   const paperTrade = {
     id: `paper_close_${pos.id}_${Date.now()}`,
     token: pos.token,
     mint: pos.mint,
     amount: `${pos.sizeSol} SOL (PAPER)`,
-    outAmount: `${pnlSol >= 0 ? "+" : ""}${pnlSol.toFixed(4)} SOL (shadow, não realizado)`,
+    outAmount:
+      `${pnlSol >= 0 ? "+" : ""}${pnlSol.toFixed(6)} SOL líquidos de custo ` +
+      `(bruto ${pnlBrutoSol >= 0 ? "+" : ""}${pnlBrutoSol.toFixed(6)}; piso de custo ${custoDeVolta.floor.pisoConhecidoSol.toFixed(6)} SOL)`,
     time: new Date().toTimeString().split(" ")[0] + "." + String(Date.now() % 1000).padStart(3, "0"),
     latencyMs: 0,
     status: "paper" as const,
     block: 0,
-    tipSol: 0,
+    tipSol: custoDeVolta.floor.legs.reduce((acc, l) => acc + l.tipSol, 0),
     route: `PAPER/shadow close (${reason}) @ ${Number(exitPrice).toPrecision(6)} SOL`,
     mode: "paper" as const,
     signature: null,
+    /**
+     * Procedência declarada: é um resultado de SOMBRA, com o piso de custo descontado — NUNCA
+     * confundível com `round_trip_legs*` (medido nas transações reais).
+     */
+    pnlBasis: "paper_cost_floor" as const,
+    pnlNetSol: pnlSol,
+    pnlGrossSol: pnlBrutoSol,
+    measuredOnChain: false,
+    feesSol: custoDeVolta.floor.pisoConhecidoSol,
   };
 
   dbStore.saveTrade(paperTrade);
@@ -6813,10 +6875,12 @@ function recordPaperClose(pos: any, reason: string, pnlPercent: number): void {
     level: "INFO",
     component: "RISK_ENGINE",
     message:
-      `[PAPER/SHADOW] Posição simulada de $${pos.token} encerrada por ${reason} com PnL ` +
-      `${pnlPercent.toFixed(2)}% (${pnlSol.toFixed(4)} SOL nocionais). Nenhuma transação foi ` +
-      `enviada on-chain. Este resultado NÃO é PnL real e não deve ser usado como métrica de ` +
-      `desempenho de capital.`,
+      `[PAPER/SHADOW] Posição simulada de $${pos.token} encerrada por ${reason} com PnL de preço ` +
+      `${pnlPercent.toFixed(2)}%: ${pnlBrutoSol.toFixed(6)} SOL brutos − ` +
+      `${custoDeVolta.floor.pisoConhecidoSol.toFixed(6)} SOL de piso de custo do ciclo (limite inferior: ` +
+      `${custoDeVolta.floor.limitacoes.length} limitação(ões) declarada(s)) = ${pnlSol.toFixed(6)} SOL. ` +
+      `Nenhuma transação foi enviada on-chain. Este resultado NÃO é PnL real e não deve ser usado ` +
+      `como métrica de desempenho de capital.`,
     correlationId: `corr_paper_${pos.id}_${Date.now()}`,
   });
 }

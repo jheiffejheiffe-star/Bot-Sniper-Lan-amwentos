@@ -48,7 +48,14 @@ export interface DBTrade {
     | "round_trip_legs_window_conflict"
     | "round_trip_legs_reconciled"
     | "exit_leg_only"
+    /** A — sombra: resultado LÍQUIDO com o piso de custo do ciclo descontado (`src/roundTripCost.ts`). */
+    | "paper_cost_floor"
     | "incomplete";
+  /**
+   * A — resultado BRUTO do movimento de preço, antes do custo. Guardado junto do líquido para que a
+   * diferença (quanto do "ganho" era custo) seja auditável em vez de desaparecer na aritmética.
+   */
+  pnlGrossSol?: number;
   /**
    * S14 — RECONCILIAÇÃO. Assinatura da perna de ENTRADA remedida da cadeia, quando o ciclo foi
    * fechado depois (histórico pré-S11). Sem este campo, "de onde veio a perna" ficaria invisível.

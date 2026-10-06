@@ -318,3 +318,11 @@ Na aritmética do plano:
 **Limite honesto:** reconciliar transforma registro antigo em amostra legível — não transforma
 histórico ruim em estratégia validada. Se o histórico for pequeno demais, o resultado honesto
 continua sendo "sem dados suficientes".
+
+### A / B — custo da volta e empacotamento: custo zero por construção
+
+`npm run cost:roundtrip` e `npm run evidence` são **aritmética local**: nenhuma chamada de rede,
+nenhum crédito de RPC consumido, nenhuma assinatura, nenhuma chave lida. Podem rodar em qualquer
+máquina, quantas vezes quiser. O gate de custo do PAPER (`paper_cost_floor`) também não gasta nada: é
+o mesmo cálculo, aplicado no momento do fechamento em sombra. O empacotamento (B) reduz o que a
+produção instala — `npm ci --omit=dev` deixa de baixar React/Vite/esbuild, que são só de build.

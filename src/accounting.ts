@@ -297,4 +297,32 @@ export function computeStrategyMetrics(records: TradeOutcomeRecord[]): StrategyM
  * Com 30 operações e win rate de 60%, o intervalo de confiança de 95% ainda cobre ~40%,
  * ou seja: indistinguível de moeda justa com custos. Números abaixo são um piso, não uma garantia.
  */
+/**
+ * Estima o custo round-trip de uma operação ANTES de executá-la.
+ * Use para decidir se a oportunidade vale a pena: se o break-even estimado é maior
+ * que o TP configurado, a estratégia está matematicamente condenada.
+ *
+ * A (2026-10-06): esta função morava em `src/realExecution.ts` e NÃO ERA CHAMADA POR NINGUÉM —
+ * um modelo de custo desligado. Ela vive aqui (mesmo módulo de `CostBreakdown`, sem I/O) para
+ * poder ser usada pelo caminho PAPER (`src/roundTripCost.ts`) e por script, sem carregar a
+ * cadeia de execução real. `realExecution.ts` a re-exporta para não quebrar nenhum import.
+ */
+export function estimateRoundTripCosts(params: {
+  capitalSol: number;
+  jitoTipSol: number;
+  priorityFeeMicroLamportsPerCu: number;
+  computeUnits: number;
+  expectedSlippageBps: number;
+  ammFeeBps?: number;
+}): CostBreakdown {
+  const costs = emptyCosts();
+  costs.jitoTipSol = params.jitoTipSol * 2; // entrada + saída
+  costs.baseFeeSol = (BASE_FEE_LAMPORTS * 2) / 1_000_000_000;
+  costs.priorityFeeSol =
+    ((params.priorityFeeMicroLamportsPerCu * params.computeUnits) / 1_000_000 / 1_000_000_000) * 2;
+  costs.slippageCostSol = ((params.expectedSlippageBps * 2) / 10_000) * params.capitalSol;
+  costs.ammFeeSol = ((params.ammFeeBps ?? 25) / 10_000) * params.capitalSol;
+  return costs;
+}
+
 export const MIN_TRADES_FOR_CONFIDENCE = 100;

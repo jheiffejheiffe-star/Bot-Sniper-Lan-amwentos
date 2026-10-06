@@ -389,6 +389,52 @@ ser lido como resultado.
 amostra legível — a conclusão de `/api/performance` continua sendo `sem_dados` até haver ≥100
 desfechos medidos (item 6 do §8).
 
+### 5.6 Custo da volta (A): quanto o ciclo custa ANTES de o preço se mover
+
+O PAPER calculava o resultado como `sizeSol × movimento% ` — só PREÇO, custo zero. No papel, "+2%" em
+0,01 SOL aparecia como +0,0002 SOL, ignorando fee base nas duas pernas, tip do Jito (com teto
+`MAX_TIP_BPS`) e priority fee. Agora a sombra desconta o **piso de custo do ciclo** e grava os dois
+números (`pnlGrossSol` bruto e `pnlNetSol` líquido) com a base própria `paper_cost_floor`.
+
+```bash
+npm run cost:roundtrip                          # varredura de tamanhos + política com procedência
+npm run cost:roundtrip -- --size 0.01 --pnl-percent 2
+npm run cost:roundtrip -- --priority-microlamports 100000   # tira o piso de "limite inferior"
+```
+
+Números medidos neste repositório (política default, priority fee **não declarada**):
+
+| Tamanho | Piso conhecido | % do capital | Piso com premissas | % do capital |
+|---|---|---|---|---|
+| 0,01 SOL | 0,000110000 SOL | **1,100%** | 0,000735000 SOL | **7,350%** |
+| 0,10 SOL | 0,001010000 SOL | 1,010% | 0,007260000 SOL | 7,260% |
+| 1,00 SOL | 0,006010000 SOL | 0,601% | 0,068510000 SOL | 6,851% |
+
+Leitura honesta: **o piso é ~1% mesmo nos tamanhos pequenos**, porque o teto de tip (50 bps por perna)
+manda — 0,003 SOL desejado é limitado a 50 bps até ~0,6 SOL de posição. Um **+2%** na sombra em
+0,01 SOL: +0,0002 bruto → **+0,00009** líquido do piso conhecido → **−0,000535** com as premissas de
+slippage/AMM. Ou seja: um "ganho" de 2% no papel é, na melhor das hipóteses, um empate.
+
+**Três separações que o número respeita:** (1) **conhecido** — fee base e tips, que são política
+declarada; (2) **premissa** — slippage e fee de AMM, que exigem execução real e aparecem como
+premissa; (3) **não medido** — slippage real, impacto, priority fee paga, latência: cada um listado
+com o motivo. **Sem `HFT_PRIORITY_FEE_MICROLAMPORTS` o piso é declaradamente um LIMITE INFERIOR.**
+O gatilho de stop/take-profit **não** mudou: continua sendo movimento de preço (conflacionar preço
+com custo faria o stop disparar por fee). `GET /api/system-truth → roundTripCost` mostra tudo isso.
+
+### 5.7 Prontidão da evidência (B): quantos desfechos medidos existem
+
+```bash
+npm run evidence            # quantos net_measured, quantos faltam para 100, e por que o resto está fora
+npm run evidence -- --json
+npm run evidence -- --strict   # exit 1 enquanto faltar amostra (gate para CI)
+```
+
+O número **não** vem do total de registros: medidos, perna única (receita), sombra e tentativas
+falhadas convivem no mesmo banco e somar tudo infla a confiança. O script aplica a MESMA régua do
+`/api/performance` (`labelAll`) e diz o que fazer para aumentar a amostra: `npm run reconcile` fecha
+o ciclo do histórico real; o resto exige execução real.
+
 ## 6. Problemas comuns e o que eles NÃO significam
 
 | Sintoma | Provável causa | NÃO conclua |

@@ -30,7 +30,7 @@ import {
   type InflightStatusEntry,
   type JitoStatusQueryResult,
 } from "./jitoStatus.js";
-import { BASE_FEE_LAMPORTS, clampTipSol, type CostBreakdown, emptyCosts } from "./accounting.js";
+import { clampTipSol } from "./accounting.js";
 import { assertCanSign, type OperationPurpose } from "./runtimeMode.js";
 import { SeenLaunchSignatures, resolveSendOptions, type SendOptionsInput } from "./hotPath.js";
 
@@ -1510,20 +1510,4 @@ export class ConfirmationMonitor {
  * Use para decidir se a oportunidade vale a pena: se o break-even estimado é maior
  * que o TP configurado, a estratégia está matematicamente condenada.
  */
-export function estimateRoundTripCosts(params: {
-  capitalSol: number;
-  jitoTipSol: number;
-  priorityFeeMicroLamportsPerCu: number;
-  computeUnits: number;
-  expectedSlippageBps: number;
-  ammFeeBps?: number;
-}): CostBreakdown {
-  const costs = emptyCosts();
-  costs.jitoTipSol = params.jitoTipSol * 2; // entrada + saída
-  costs.baseFeeSol = (BASE_FEE_LAMPORTS * 2) / 1_000_000_000;
-  costs.priorityFeeSol =
-    ((params.priorityFeeMicroLamportsPerCu * params.computeUnits) / 1_000_000 / 1_000_000_000) * 2;
-  costs.slippageCostSol = ((params.expectedSlippageBps * 2) / 10_000) * params.capitalSol;
-  costs.ammFeeSol = ((params.ammFeeBps ?? 25) / 10_000) * params.capitalSol;
-  return costs;
-}
+export { estimateRoundTripCosts } from "./accounting.js";

@@ -88,6 +88,13 @@ export type OutcomeBasis =
   | "single_leg_measured"
   /** Estimativa por preço de mercado (não inclui tip, priority fee, base fee nem rent). */
   | "price_estimated"
+  /**
+   * A — SOMBRA (paper): número SIMULADO, com o piso de custo do ciclo descontado
+   * (`src/roundTripCost.ts`). Tem base PRÓPRIA e não é `net_measured`: a validação filtra por
+   * `basis === "net_measured" && !excluded`, mas quem olhar só a base não pode confundir simulação
+   * com medição on-chain — e a superfície (`/api/snipes`) expõe `labelBasis` ao operador.
+   */
+  | "paper_simulated"
   /** Sem número de resultado: só o custo/estado é conhecido. */
   | "none";
 
@@ -283,10 +290,14 @@ export function labelTrade(trade: DBTrade): LabeledOutcome {
     return {
       ...base,
       label: pnl > BREAKEVEN_EPSILON_SOL ? "win" : pnl < -BREAKEVEN_EPSILON_SOL ? "loss" : "breakeven",
-      basis: "net_measured",
+      // Base PRÓPRIA: era `net_measured` — a MESMA base da validação estatística.
+      basis: "paper_simulated",
       pnlNetSol: pnl,
       pnlPercent: null,
-      reason: "resultado de PAPER: medido no simulador, não é dinheiro — NUNCA entra na validação",
+      reason:
+        "resultado de SOMBRA (simulador), com o piso de custo do ciclo descontado; não é dinheiro e " +
+        "NUNCA entra na validação" +
+        (pnlBasis === "paper_cost_floor" ? " — base paper_cost_floor (A)" : ""),
       excluded: true,
       exclusionReason: "modo paper",
       provenance: [...provenance, "mode=paper"],

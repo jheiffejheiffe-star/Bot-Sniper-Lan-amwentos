@@ -2413,3 +2413,92 @@ exibir PnL sem rótulo.
   já era assim. Nada foi exercitado com dinheiro real.
 - O painel é o scaffold do projeto: a coluna nova mostra o que o servidor servir, e o resto do
   dashboard continua como declarado em `/api/system-truth` (painéis com RNG).
+
+---
+
+## Adendo 24 — A: custo da volta em PAPER · B: empacotamento e prontidão de evidência (2026-10-06)
+
+### 1. Problema observado (A)
+
+`recordPaperClose` calculava o resultado da sombra como `sizeSol * pnlPercent / 100` e `pnlPercent`
+vinha de `(currentPriceSol - pos.entryPrice) / pos.entryPrice` — **puro movimento de preço, custo
+zero**. O ciclo real paga fee base nas duas pernas, tip do Jito (limitado a `MAX_TIP_BPS` = 50 bps
+por perna) e priority fee. Com teto de 50 bps por perna, **só o tip do ciclo custa ~1% do capital**:
+um "+2%" na sombra podia ser prejuízo real, e a sombra era a única fonte de números do projeto.
+
+Agravante encontrado na auditoria: o modelo de custo **já existia** (`estimateRoundTripCosts`, com
+tip×2, fee base×2, priority×2, slippage e AMM) e tinha **0 pontos de chamada** — código morto. Um
+modelo de custo desligado é pior do que não ter modelo: dá a impressão de que o custo é contabilizado.
+
+### 2. O que foi feito (A)
+
+1. `src/accounting.ts` recebeu `estimateRoundTripCosts` (movido de `src/realExecution.ts`, que agora
+   o **re-exporta** — nenhum import quebra) para poder ser usado pelo caminho PAPER e por script sem
+   carregar a cadeia de execução real.
+2. `src/roundTripCost.ts` **(novo, puro)**: `resolveRoundTripCostPolicy` (cada valor com a sua
+   procedência: env declarado × default do caminho real × premissa), `paperRoundTripCostFloor`
+   (piso conhecido × premissas × não medidos, com `limitacoes` explícitas) e
+   `applyCostFloorToPaperClose`.
+3. `recordPaperClose` passou a descontar o piso e gravar `pnlGrossSol` (bruto), `pnlNetSol`
+   (líquido), `feesSol` (piso) e `pnlBasis: "paper_cost_floor"`. **O gatilho de stop/take-profit não
+   mudou**: continua sendo movimento de preço — conflacionar preço com custo faria o stop disparar
+   por fee.
+4. `labelTrade`: a sombra ganhou **base própria** (`paper_simulated`). Antes devolvia
+   `basis: "net_measured"` — a MESMA base da validação estatística — com `excluded: true`. Um leitor
+   que filtrasse apenas por `basis` contaria simulação como medição, e a superfície `/api/snipes`
+   (que expõe `labelBasis` desde o B anterior) mostraria "net_measured" num resultado de simulador.
+5. `scripts/cost-roundtrip.ts` + `npm run cost:roundtrip` (varredura de tamanhos, cenário de
+   fechamento, `--json`) e `GET /api/system-truth → roundTripCost`.
+
+### 3. Números medidos (política default, priority fee NÃO declarada)
+
+| Tamanho | Piso conhecido | % | Piso com premissas | % |
+|---|---|---|---|---|
+| 0,01 SOL | 0,000110000 | 1,100% | 0,000735000 | 7,350% |
+| 0,10 SOL | 0,001010000 | 1,010% | 0,007260000 | 7,260% |
+| 1,00 SOL | 0,006010000 | 0,601% | 0,068510000 | 6,851% |
+
+**+2% em 0,01 SOL:** bruto +0,0002 → líquido do piso conhecido **+0,00009** → com as premissas de
+slippage/AMM **−0,000535 (prejuízo)**. O piso é ~1% do capital mesmo em posição pequena porque o
+teto de tip (50 bps/perna) manda até ~0,6 SOL.
+
+Três separações obrigatórias: **conhecido** (fee base, tips — política declarada), **premissa**
+(slippage, AMM), **não medido** (slippage real, impacto, priority fee paga, latência — cada um com o
+motivo). Sem `HFT_PRIORITY_FEE_MICROLAMPORTS` o piso é declaradamente **LIMITE INFERIOR**.
+
+### 4. Problema observado (B)
+
+`package.json` declarava em `dependencies` tudo o que era de **build/cliente** (React, Vite,
+esbuild, Recharts, plugins) junto do runtime do servidor, e **não** declarava `engines` — nada
+impedia subir o bot num Node incompatível. Produção instalava dezenas de pacotes que o servidor não
+usa (o `dist/server.cjs` é bundlado; o cliente é servido de `dist/`).
+
+### 5. O que foi feito (B)
+
+1. **Separação runtime × build/cliente**: 16 pacotes movidos para `devDependencies`, mantendo em
+   `dependencies` o que o servidor realmente importa (`express`, `@solana/web3.js`, `bs58`, `dotenv`,
+   `tweetnacl`, `pg`, `@triton-one/yellowstone-grpc`, `@google/genai`); lockfile sincronizado.
+2. **`engines`**: `node >= 20.9.0`, `npm >= 10`.
+3. `scripts/evidence-readiness.ts` + `npm run evidence [-- --strict|--json]`: quantos desfechos
+   `net_measured` existem, quantos **faltam** para 100, e o histograma do que está fora por motivo —
+   reusando `labelAll` (a mesma régua do `/api/performance`) e `MIN_TRADES_FOR_CONFIDENCE`. Não
+   escreve, não mede, não chama rede; `--strict` serve de gate em CI.
+4. Teste de fonte que **falha se** algum import do servidor não estiver em `dependencies`, se um
+   pacote de cliente voltar para `dependencies`, se `vite` virar import estático, ou se o
+   `engines`/scripts sumirem.
+
+### 6. Verificação
+
+`npm run lint` 0 · `npm run test` **311/311** (grupos `[35]` 6 e `[36]` 3) · `npm run build` ok ·
+`npm ci --omit=dev` + `node dist/server.cjs` **sobe e responde** (a prova de que a produção não
+precisa de devDependencies). CLI e evidence rodados de verdade neste repositório; os números da
+tabela acima são a saída do `npm run cost:roundtrip`.
+
+### 7. Limitações declaradas
+
+- **O piso não é previsão de resultado**: slippage e impacto reais só existem com execução real
+  (S11 lê das transações). Sem `HFT_PRIORITY_FEE_MICROLAMPORTS`, o piso é limite inferior.
+- **A amostra continua em 0**: `npm run evidence` em banco vazio responde `SEM AMOSTRA` — nada foi
+  validado estatisticamente, e nenhuma configuração garante lucro.
+- `HFT_PAPER_AMM_FEE_BPS` (25 bps) e o rent de ATA (0,00203928 SOL, recuperável) são **premissas**
+  declaradas, não medições.

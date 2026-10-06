@@ -5298,6 +5298,10 @@ async function main(): Promise<void> {
     assert.equal(paper.label, "win", "paper tem rótulo (é diagnóstico útil)");
     assert.equal(paper.excluded, true, "…mas NUNCA entra na validação");
     assert.equal(paper.exclusionReason, "modo paper");
+    // A: a base da sombra é PRÓPRIA. Antes era `net_measured` — a mesma base da validação —, o que
+    // fazia a superfície mostrar "net_measured" num resultado simulado.
+    assert.equal(paper.basis, "paper_simulated");
+    assert.notEqual(paper.basis, "net_measured");
 
     const falhou = ol.labelTrade({ ...base, status: "failed", mode: "live", route: "Jito Exit falhou" } as any);
     assert.equal(falhou.label, "failed_attempt");
@@ -6791,6 +6795,228 @@ async function main(): Promise<void> {
     for (const campo of ["label?", "labelBasis?", "labelReason?", "excludedFromValidation?", "pnlNetSol?"]) {
       assert.ok(tipos.includes(campo), `SnipedTransaction precisa declarar ${campo}`);
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // [35] A — custo da volta: o PAPER passa a cobrar o piso do ciclo
+  // ---------------------------------------------------------------------------
+  console.log("\n[35] A — custo da volta: piso conhecido, premissas e o que NÃO é medido");
+
+  await test("piso do ciclo: tip limitado por bps, fee base nas duas pernas, priority não declarada", async () => {
+    const rtc = await import("../src/roundTripCost.js");
+    const policy = rtc.resolveRoundTripCostPolicy({} as any);
+    const floor = rtc.paperRoundTripCostFloor({ sizeSol: 0.01, policy });
+
+    // O teto de tip em bps MANDA em posição pequena: 50 bps de 0,01 = 0,00005 por perna.
+    assert.equal(floor.legs.length, 2);
+    for (const leg of floor.legs) {
+      assert.equal(leg.tipSol, 0.00005, `${leg.leg}: tip deveria ser limitado pelo teto em bps`);
+      assert.equal(leg.tipClamped, true);
+      assert.equal(leg.baseFeeSol, 0.000005);
+      assert.equal(leg.priorityFeeSol, null, "priority fee NÃO declarada não pode virar zero silencioso");
+    }
+    assert.ok(Math.abs(floor.pisoConhecidoSol - 0.00011) < 1e-15, `piso=${floor.pisoConhecidoSol}`);
+    // Premissas: slippage 300 bps POR PERNA + AMM 25 bps.
+    assert.ok(Math.abs(floor.premissasSol - (0.0006 + 0.000025)) < 1e-15, `premissas=${floor.premissasSol}`);
+    assert.ok(Math.abs(floor.pisoComPremissasSol - 0.000735) < 1e-15);
+    assert.ok(Math.abs(floor.breakevenPercentConhecido - 1.1) < 1e-9, `be=${floor.breakevenPercentConhecido}`);
+    assert.ok(Math.abs(floor.breakevenPercentComPremissas - 7.35) < 1e-9);
+    // Honestidade obrigatória: limite inferior declarado + premissas declaradas.
+    assert.ok(floor.limitacoes.some((l) => /LIMITE INFERIOR/.test(l)), floor.limitacoes.join(" | "));
+    assert.ok(floor.limitacoes.some((l) => /PREMISSAS/.test(l)));
+    assert.ok(floor.naoMedidos.some((n) => n.key === "slippageReal"));
+    assert.ok(floor.naoMedidos.some((n) => n.key === "impactoDePreco"));
+    // ATA rent é condicional e NÃO somada (pode não ser paga e é recuperável).
+    assert.ok(floor.condicionais.some((c) => c.key === "ataRentSol" && /RECUPER/i.test(c.reason)));
+  });
+
+  await test("política: defaults iguais aos do caminho real e override declarado por env", async () => {
+    const rtc = await import("../src/roundTripCost.js");
+    const def = rtc.resolveRoundTripCostPolicy({} as any);
+    assert.equal(def.entryTipDesiredSol, 0.003, "mesmo tip desejado do fechamento real");
+    assert.equal(def.maxTipBps, 50);
+    assert.equal(def.slippageBps, 300, "mesmo parâmetro de slippage da sombra");
+    assert.equal(def.computeUnitsPerLeg, 200_000);
+    assert.equal(def.priorityFeeMicroLamportsPerCu, null);
+
+    // Overrides: cada valor com procedência declarada.
+    const env = {
+      HFT_PRIORITY_FEE_MICROLAMPORTS: "100000",
+      MAX_TIP_BPS: "100",
+      HFT_PAPER_SLIPPAGE_BPS: "100",
+      HFT_ENTRY_CU_LIMIT: "150000",
+    } as any;
+    const p2 = rtc.resolveRoundTripCostPolicy(env);
+    assert.equal(p2.priorityFeeMicroLamportsPerCu, 100000);
+    assert.equal(p2.sources.priorityFeeMicroLamportsPerCu, "HFT_PRIORITY_FEE_MICROLAMPORTS");
+    assert.equal(p2.sources.slippageBps, "HFT_PAPER_SLIPPAGE_BPS");
+    assert.equal(p2.sources.maxTipBps, "MAX_TIP_BPS");
+
+    // Com priority declarada, ela ENTRA no piso conhecido (e a limitação correspondente desaparece).
+    const floor = rtc.paperRoundTripCostFloor({ sizeSol: 0.01, policy: p2 });
+    const esperada = ((100000 * 150000) / 1_000_000 / 1_000_000_000) * 2;
+    assert.ok(Math.abs((floor.legs[0].priorityFeeSol as number) - esperada / 2) < 1e-18, `${floor.legs[0].priorityFeeSol}`);
+    assert.ok(floor.pisoConhecidoSol > 0.00011, "priority declarada aumenta o piso conhecido");
+    assert.equal(floor.limitacoes.some((l) => /priority fee NÃO declarada/.test(l)), false);
+  });
+
+  await test("o caso que motivou o A: +2% na sombra não é +2% de lucro", async () => {
+    const rtc = await import("../src/roundTripCost.js");
+    const policy = rtc.resolveRoundTripCostPolicy({} as any);
+    const c = rtc.applyCostFloorToPaperClose({ sizeSol: 0.01, pnlPercent: 2, policy });
+
+    assert.ok(Math.abs(c.pnlGrossSol - 0.0002) < 1e-15, "bruto = 2% de 0,01 = 0,0002");
+    // Antes do A, o resultado gravado era exatamente o bruto (custo zero).
+    assert.ok(c.pnlNetKnownSol < c.pnlGrossSol, "o custo tem de reduzir o resultado");
+    assert.ok(Math.abs(c.pnlNetKnownSol - 0.00009) < 1e-15, `liquido=${c.pnlNetKnownSol}`);
+    assert.ok(c.pnlNetWithAssumptionsSol < 0, "com slippage/AMM assumidos, o +2% vira PREJUÍZO");
+    assert.ok(Math.abs(c.pnlNetWithAssumptionsSol - -0.000535) < 1e-15, `${c.pnlNetWithAssumptionsSol}`);
+  });
+
+  await test("o fechamento em sombra grava bruto, líquido e base própria — e o gatilho continua sendo PREÇO", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+
+    const i = code.indexOf("function recordPaperClose(");
+    assert.ok(i > 0, "recordPaperClose precisa existir");
+    const corpo = code.slice(i, code.indexOf("\n}\n", i));
+    assert.ok(corpo.includes("applyCostFloorToPaperClose("), "o fechamento da sombra precisa cobrar o piso");
+    assert.ok(corpo.includes('pnlBasis: "paper_cost_floor"'), "a procedência da sombra precisa ser própria");
+    assert.ok(corpo.includes("pnlGrossSol:"), "o bruto precisa ficar gravado para auditoria");
+    assert.ok(corpo.includes("pnlNetSol:"), "e o líquido é o resultado");
+    assert.ok(corpo.includes("measuredOnChain: false"), "sombra NUNCA é medição on-chain");
+    assert.ok(corpo.includes("feesSol:"), "o piso de custo fica declarado no registro");
+
+    // O gatilho de stop/take-profit continua sendo movimento de preço (não pode virar custo).
+    assert.ok(
+      code.includes("pos.pnlPercent = parseFloat((((currentPriceSol - pos.entryPrice) / pos.entryPrice) * 100).toFixed(2))"),
+      "o gatilho precisa continuar baseado em PREÇO"
+    );
+    // E o piso é resolvido uma única vez, no boot, com a política declarada.
+    assert.ok(code.includes("const PAPER_COST_POLICY = resolveRoundTripCostPolicy()"));
+  });
+
+  await test("o modelo de custo saiu do código morto: existe, é chamável e bate com a conta", async () => {
+    const acc = await import("../src/accounting.js");
+    const re = await import("../src/realExecution.js");
+    const costs = acc.estimateRoundTripCosts({
+      capitalSol: 1,
+      jitoTipSol: 0.003,
+      priorityFeeMicroLamportsPerCu: 100000,
+      computeUnits: 200_000,
+      expectedSlippageBps: 300,
+      ammFeeBps: 25,
+    });
+    const esperado =
+      0.003 * 2 + 0.000005 * 2 + ((100000 * 200000) / 1_000_000 / 1_000_000_000) * 2 + ((300 * 2) / 10_000) * 1 + (25 / 10_000) * 1;
+    assert.ok(Math.abs(acc.totalCostsSol(costs) - esperado) < 1e-15, `total=${acc.totalCostsSol(costs)}`);
+    // Re-export mantido: nada que importava de realExecution quebra.
+    assert.equal(typeof re.estimateRoundTripCosts, "function");
+  });
+
+  await test("CLI do custo: puro (sem rede, sem chave, sem escrita) e exposto no system-truth", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "scripts/cost-roundtrip.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+    for (const proibido of ["Keypair", "secretKey", "sendRawTransaction", "getTransaction", "realExecution", "writeFileSync"]) {
+      assert.equal(code.includes(proibido), false, `cost-roundtrip.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(code.includes("paperRoundTripCostFloor"), "precisa usar o piso do módulo (fonte única)");
+    assert.ok(code.includes("applyCostFloorToPaperClose"), "e o cenário de fechamento");
+
+    const serverSrc = codigoSemComentarios(fs.readFileSync(path.join(repoRoot, "server.ts"), "utf8"));
+    assert.ok(serverSrc.includes("roundTripCost: (() =>"), "o system-truth precisa expor o piso");
+    assert.ok(serverSrc.includes("paperRoundTripCostFloor({ sizeSol, policy: PAPER_COST_POLICY })"));
+  });
+
+  // ---------------------------------------------------------------------------
+  // [36] B — empacotamento: runtime separado de build/cliente, engines declarado
+  // ---------------------------------------------------------------------------
+  console.log("\n[36] B — empacotamento: só o que o servidor usa fica em dependencies");
+
+  await test("engines declarado e dependências partidas entre runtime e build/cliente", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+
+    assert.ok(pkg.engines, "engines precisa ser declarado (sem isso nada impede rodar em Node incompatível)");
+    assert.ok(/^>=20/.test(pkg.engines.node), `node: ${pkg.engines.node}`);
+    assert.ok(pkg.engines.npm, "npm também precisa de faixa declarada");
+
+    const deps = Object.keys(pkg.dependencies ?? {});
+    const dev = Object.keys(pkg.devDependencies ?? {});
+
+    // Runtime obrigatório: o que o servidor importa (estático ou dinamicamente).
+    for (const obrigatorio of ["express", "@solana/web3.js", "bs58", "dotenv", "tweetnacl", "pg", "@triton-one/yellowstone-grpc", "@google/genai"]) {
+      assert.ok(deps.includes(obrigatorio), `${obrigatorio} é usado em runtime e precisa estar em dependencies`);
+    }
+    // Cliente/build não podem ficar em dependencies: produção não instala o que não usa.
+    for (const naoRuntime of ["react", "react-dom", "vite", "esbuild", "lucide-react", "motion", "recharts", "clsx", "tailwind-merge", "@vitejs/plugin-react"]) {
+      assert.equal(deps.includes(naoRuntime), false, `${naoRuntime} é de build/cliente: pertence a devDependencies`);
+      assert.ok(dev.includes(naoRuntime), `${naoRuntime} precisa estar declarado em devDependencies`);
+    }
+  });
+
+  await test("todo import do servidor está declarado em dependencies (ou é builtin/relativo)", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    const deps = new Set(Object.keys(pkg.dependencies ?? {}));
+    const builtins = new Set(["fs", "path", "url", "crypto", "os", "events", "stream", "util", "http", "https", "zlib", "node:crypto", "node:fs", "node:path", "node:os", "node:url", "node:events"]);
+    /** Exceções DECLARADAS: pacotes exclusivos de desenvolvimento, importados dinamicamente e só fora de produção. */
+    const soDesenvolvimento = new Set(["vite"]);
+
+    const arquivos = ["server.ts"];
+    for (const dir of ["src", "src/storage"]) {
+      for (const f of fs.readdirSync(path.join(repoRoot, dir))) {
+        if (f.endsWith(".ts") && !f.endsWith(".d.ts") && !dir.endsWith("components")) arquivos.push(path.join(dir, f));
+      }
+    }
+
+    const faltando: string[] = [];
+    const estaticosDoCliente: string[] = [];
+    for (const rel of arquivos) {
+      const src = fs.readFileSync(path.join(repoRoot, rel), "utf8");
+      // imports estáticos
+      for (const m of src.matchAll(/^\s*import[\s\S]*?from\s+["']([^"']+)["']/gm)) {
+        const spec = m[1];
+        if (spec.startsWith(".") || builtins.has(spec)) continue;
+        const raiz = spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0];
+        if (soDesenvolvimento.has(raiz)) {
+          estaticosDoCliente.push(`${rel}: ${spec}`);
+          continue;
+        }
+        if (!deps.has(raiz)) faltando.push(`${rel}: ${spec}`);
+      }
+      // imports dinâmicos
+      for (const m of src.matchAll(/await import\(\s*["']([^"']+)["']\s*\)/g)) {
+        const spec = m[1];
+        if (spec.startsWith(".") || builtins.has(spec)) continue;
+        const raiz = spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0];
+        if (soDesenvolvimento.has(raiz)) continue;
+        if (!deps.has(raiz)) faltando.push(`${rel}: import dinâmico ${spec}`);
+      }
+    }
+
+    assert.deepEqual(faltando, [], `imports sem dependência declarada: ${faltando.join(", ")}`);
+    // `vite` só pode ser dinâmico: um import estático exigiria devDependency em produção.
+    assert.deepEqual(estaticosDoCliente, [], `estes deveriam ser import dinâmico: ${estaticosDoCliente.join(", ")}`);
+  });
+
+  await test("`npm run evidence`: lê o banco, usa a régua do /api/performance e não escreve nada", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const raw = fs.readFileSync(path.join(repoRoot, "scripts/evidence-readiness.ts"), "utf8");
+    const code = codigoSemComentarios(raw);
+
+    assert.ok(code.includes("labelAll("), "precisa reusar a MESMA régua do /api/performance");
+    assert.ok(code.includes("MIN_TRADES_FOR_CONFIDENCE"), "o mínimo de amostra precisa vir da fonte única");
+    for (const proibido of ["saveTrade", "savePosition", "saveLog", "Keypair", "getTransaction", "writeFileSync"]) {
+      assert.equal(code.includes(proibido), false, `evidence-readiness.ts não pode referenciar ${proibido}`);
+    }
+    assert.ok(code.includes("--strict"), "o gate de amostra precisa existir para uso em CI");
+
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    assert.ok(pkg.scripts.evidence, "script npm run evidence precisa estar declarado");
+    assert.ok(pkg.scripts["cost:roundtrip"], "script npm run cost:roundtrip precisa estar declarado");
   });
 
   console.log("\n=========================================");
